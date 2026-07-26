@@ -1,0 +1,17 @@
+# Reference-only clone, not part of this project
+/meetily/
+
+# Node
+node_modules/
+dist/
+npm-debug.log*
+
+# Rust
+/src-tauri/target/
+/src-tauri/gen/
+
+# Tooling / local state
+.claude/
+.tokensave/
+.DS_Store
+*.log
