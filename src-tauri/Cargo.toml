@@ -9,6 +9,11 @@ license = "MIT"
 name = "helppye_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# This feature is used for production builds where `devPath` points to the filesystem.
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
