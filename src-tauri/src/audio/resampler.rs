@@ -61,7 +61,7 @@ mod tests {
         let input: Vec<f32> = (0..100).map(|i| i as f32).collect();
         let out = resample_linear(&input, 48_000, 16_000);
         // ratio is 1/3, so length should shrink roughly proportionally
-        let expected_len = (100.0 * (16_000.0 / 48_000.0)).round() as usize;
+        let expected_len = (100.0_f64 * (16_000.0 / 48_000.0)).round() as usize;
         assert_eq!(out.len(), expected_len);
     }
 
