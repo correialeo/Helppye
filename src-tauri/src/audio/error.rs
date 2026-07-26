@@ -23,6 +23,9 @@ mod tests {
     #[test]
     fn error_messages_include_context() {
         let err = AudioCaptureError::Unsupported("PipeWire capture not implemented".into());
-        assert_eq!(err.to_string(), "unsupported: PipeWire capture not implemented");
+        assert_eq!(
+            err.to_string(),
+            "unsupported: PipeWire capture not implemented"
+        );
     }
 }

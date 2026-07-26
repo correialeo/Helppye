@@ -28,19 +28,36 @@ pub struct AudioFrame {
     pub timestamp_ms: u64,
 }
 
+/// Tagged with `source` on every variant (not just `Frame`/`Started`, which already carry
+/// an `AudioDevice`) so the frontend can route events correctly when microphone and system
+/// output capture run concurrently — two independent capture sessions share this one event
+/// type, and a bare "stopped" or "error" would otherwise be ambiguous about which stopped.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AudioCaptureEvent {
-    Started { device: AudioDevice },
+    Started {
+        device: AudioDevice,
+    },
     Frame(AudioFrame),
-    DeviceDisconnected { device_id: String },
-    Error { message: String },
-    Stopped,
+    DeviceDisconnected {
+        source: AudioSource,
+        device_id: String,
+    },
+    Error {
+        source: AudioSource,
+        message: String,
+    },
+    Stopped {
+        source: AudioSource,
+    },
 }
 
-impl From<AudioCaptureError> for AudioCaptureEvent {
-    fn from(err: AudioCaptureError) -> Self {
-        AudioCaptureEvent::Error { message: err.to_string() }
+impl AudioCaptureEvent {
+    pub fn error(source: AudioSource, err: AudioCaptureError) -> Self {
+        AudioCaptureEvent::Error {
+            source,
+            message: err.to_string(),
+        }
     }
 }
 
@@ -50,16 +67,21 @@ mod tests {
 
     #[test]
     fn events_serialize_with_a_type_tag_the_frontend_can_match_on() {
-        let event = AudioCaptureEvent::Stopped;
+        let event = AudioCaptureEvent::Stopped {
+            source: AudioSource::Microphone,
+        };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "stopped");
+        assert_eq!(json["source"], "microphone");
     }
 
     #[test]
     fn capture_error_converts_to_a_tagged_error_event() {
-        let event: AudioCaptureEvent = AudioCaptureError::NoDeviceFound.into();
+        let event =
+            AudioCaptureEvent::error(AudioSource::SystemOutput, AudioCaptureError::NoDeviceFound);
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "error");
+        assert_eq!(json["source"], "system_output");
         assert_eq!(json["message"], "no matching audio device found");
     }
 

@@ -25,7 +25,8 @@ impl AudioCaptureProvider for SystemAudioProvider {
         _cancel: CancellationToken,
     ) -> Result<(), AudioCaptureError> {
         Err(AudioCaptureError::Unsupported(
-            "system audio capture on Linux is not implemented yet (planned: native PipeWire)".into(),
+            "system audio capture on Linux is not implemented yet (planned: native PipeWire)"
+                .into(),
         ))
     }
 }

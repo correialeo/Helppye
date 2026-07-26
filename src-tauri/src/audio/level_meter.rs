@@ -26,7 +26,10 @@ mod tests {
     fn full_scale_sine_like_signal_is_near_zero() {
         let samples = vec![1.0, -1.0, 1.0, -1.0];
         let level = rms_dbfs(&samples);
-        assert!(level > -1.0 && level <= 0.0, "expected near 0 dBFS, got {level}");
+        assert!(
+            level > -1.0 && level <= 0.0,
+            "expected near 0 dBFS, got {level}"
+        );
     }
 
     #[test]

@@ -39,11 +39,13 @@ impl AudioCaptureProvider for MicrophoneCaptureProvider {
         std::thread::Builder::new()
             .name("helppye-mic-capture".into())
             .spawn(move || run_capture_thread(config, sender, cancel, ready_tx))
-            .map_err(|e| AudioCaptureError::Internal(format!("failed to spawn capture thread: {e}")))?;
+            .map_err(|e| {
+                AudioCaptureError::Internal(format!("failed to spawn capture thread: {e}"))
+            })?;
 
-        ready_rx
-            .await
-            .map_err(|_| AudioCaptureError::Internal("capture thread exited before signaling readiness".into()))?
+        ready_rx.await.map_err(|_| {
+            AudioCaptureError::Internal("capture thread exited before signaling readiness".into())
+        })?
     }
 }
 
@@ -122,14 +124,20 @@ fn run_capture_thread(
                 if tx.try_send(AudioCaptureEvent::Frame(frame)).is_err() {
                     let n = dropped_frames_cb.fetch_add(1, Ordering::Relaxed) + 1;
                     if n % 50 == 1 {
-                        warn!(dropped_frames = n, "mic capture consumer lagging, dropping frames");
+                        warn!(
+                            dropped_frames = n,
+                            "mic capture consumer lagging, dropping frames"
+                        );
                     }
                 }
             }
         },
         move |err| {
             error!(%err, "cpal input stream error");
-            let _ = err_tx.try_send(AudioCaptureEvent::Error { message: err.to_string() });
+            let _ = err_tx.try_send(AudioCaptureEvent::Error {
+                source: AudioSource::Microphone,
+                message: err.to_string(),
+            });
         },
         None,
     );
@@ -163,6 +171,11 @@ fn run_capture_thread(
     }
 
     drop(stream);
-    debug!(dropped_frames = dropped_frames.load(Ordering::Relaxed), "microphone capture stopped");
-    let _ = sender.try_send(AudioCaptureEvent::Stopped);
+    debug!(
+        dropped_frames = dropped_frames.load(Ordering::Relaxed),
+        "microphone capture stopped"
+    );
+    let _ = sender.try_send(AudioCaptureEvent::Stopped {
+        source: AudioSource::Microphone,
+    });
 }

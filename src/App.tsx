@@ -2,19 +2,21 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+type AudioSourceKind = "microphone" | "system_output";
+
 interface AudioDevice {
   id: string;
   name: string;
-  source: "microphone" | "system_output";
+  source: AudioSourceKind;
   is_default: boolean;
 }
 
 type AudioCaptureEvent =
   | { type: "started"; device: AudioDevice }
-  | { type: "frame"; source: string; samples: number[]; sample_rate: number; channels: number; timestamp_ms: number }
-  | { type: "device_disconnected"; device_id: string }
-  | { type: "error"; message: string }
-  | { type: "stopped" };
+  | { type: "frame"; source: AudioSourceKind; samples: number[]; sample_rate: number; channels: number; timestamp_ms: number }
+  | { type: "device_disconnected"; source: AudioSourceKind; device_id: string }
+  | { type: "error"; source: AudioSourceKind; message: string }
+  | { type: "stopped"; source: AudioSourceKind };
 
 function rmsDbfs(samples: number[]): number {
   if (samples.length === 0) return -Infinity;
@@ -23,7 +25,35 @@ function rmsDbfs(samples: number[]): number {
   return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
 }
 
-export default function App() {
+interface PanelConfig {
+  source: AudioSourceKind;
+  title: string;
+  subtitle: string;
+  listDevicesCommand: string;
+  startCommand: string;
+  stopCommand: string;
+}
+
+const PANELS: PanelConfig[] = [
+  {
+    source: "microphone",
+    title: "Microphone",
+    subtitle: "cpal input capture",
+    listDevicesCommand: "list_audio_devices_command",
+    startCommand: "start_microphone_capture_command",
+    stopCommand: "stop_microphone_capture_command",
+  },
+  {
+    source: "system_output",
+    title: "System output",
+    subtitle: "WASAPI loopback capture (Windows only)",
+    listDevicesCommand: "list_system_audio_devices_command",
+    startCommand: "start_system_audio_capture_command",
+    stopCommand: "stop_system_audio_capture_command",
+  },
+];
+
+function CapturePanel({ config }: { config: PanelConfig }) {
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [capturing, setCapturing] = useState(false);
   const [levelDb, setLevelDb] = useState(-Infinity);
@@ -32,10 +62,10 @@ export default function App() {
   const levelDecayTimer = useRef<number | null>(null);
 
   const refreshDevices = useCallback(() => {
-    invoke<AudioDevice[]>("list_audio_devices_command")
+    invoke<AudioDevice[]>(config.listDevicesCommand)
       .then(setDevices)
       .catch((e) => setError(String(e)));
-  }, []);
+  }, [config.listDevicesCommand]);
 
   useEffect(() => {
     refreshDevices();
@@ -44,13 +74,24 @@ export default function App() {
   useEffect(() => {
     const unlisten = listen<AudioCaptureEvent>("audio://capture-event", (event) => {
       const payload = event.payload;
+      // "started" doesn't carry `source` directly but does carry a device whose own
+      // `source` field identifies which panel it belongs to.
+      const eventSource = payload.type === "started" ? payload.device.source : payload.source;
+      if (eventSource !== config.source) return;
+
       if (payload.type === "frame") {
+        // Throttled by design: the level meter only updates on frame arrival (100ms
+        // frames from CaptureConfig::default), and decays to silence if frames stop.
         setLevelDb(rmsDbfs(payload.samples));
         setFrameCount((n) => n + 1);
         if (levelDecayTimer.current !== null) window.clearTimeout(levelDecayTimer.current);
         levelDecayTimer.current = window.setTimeout(() => setLevelDb(-Infinity), 300);
       } else if (payload.type === "error") {
         setError(payload.message);
+        setCapturing(false);
+      } else if (payload.type === "device_disconnected") {
+        setError(`device disconnected: ${payload.device_id}`);
+        setCapturing(false);
       } else if (payload.type === "stopped") {
         setCapturing(false);
       }
@@ -58,13 +99,13 @@ export default function App() {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [config.source]);
 
   const startCapture = async () => {
     setError(null);
     setFrameCount(0);
     try {
-      await invoke("start_microphone_capture_command");
+      await invoke(config.startCommand);
       setCapturing(true);
     } catch (e) {
       setError(String(e));
@@ -73,7 +114,7 @@ export default function App() {
 
   const stopCapture = async () => {
     try {
-      await invoke("stop_capture_command");
+      await invoke(config.stopCommand);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -84,12 +125,14 @@ export default function App() {
   const levelPercent = Number.isFinite(levelDb) ? Math.min(100, Math.max(0, (levelDb + 60) * (100 / 60))) : 0;
 
   return (
-    <main className="flex h-screen flex-col items-center justify-center gap-4 p-6 text-center">
-      <h1 className="text-2xl font-semibold">Helppye</h1>
-      <p className="text-sm text-neutral-400">Microphone capture test</p>
+    <section className="flex w-full max-w-xs flex-col items-center gap-3 rounded-lg border border-neutral-800 p-4">
+      <div className="text-center">
+        <h2 className="text-base font-semibold">{config.title}</h2>
+        <p className="text-xs text-neutral-500">{config.subtitle}</p>
+      </div>
 
-      <div className="w-full max-w-xs text-left text-xs text-neutral-400">
-        <p className="mb-1 font-medium text-neutral-300">Input devices ({devices.length})</p>
+      <div className="w-full text-left text-xs text-neutral-400">
+        <p className="mb-1 font-medium text-neutral-300">Devices ({devices.length})</p>
         <ul className="max-h-24 overflow-y-auto rounded border border-neutral-700 p-2">
           {devices.map((d) => (
             <li key={d.id}>
@@ -104,12 +147,12 @@ export default function App() {
       <button
         type="button"
         onClick={capturing ? stopCapture : startCapture}
-        className="rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500"
+        className="w-full rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500"
       >
         {capturing ? "Stop capture" : "Start capture"}
       </button>
 
-      <div className="w-full max-w-xs">
+      <div className="w-full">
         <div className="h-3 w-full overflow-hidden rounded bg-neutral-800">
           <div className="h-full bg-emerald-500 transition-all" style={{ width: `${levelPercent}%` }} />
         </div>
@@ -118,7 +161,22 @@ export default function App() {
         </p>
       </div>
 
-      {error && <p className="max-w-xs text-xs text-red-400">{error}</p>}
+      {error && <p className="text-xs text-red-400">{error}</p>}
+    </section>
+  );
+}
+
+export default function App() {
+  return (
+    <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
+      <h1 className="text-2xl font-semibold">Helppye</h1>
+      <p className="text-sm text-neutral-400">Microphone + system audio capture test</p>
+
+      <div className="flex flex-col gap-4 sm:flex-row">
+        {PANELS.map((config) => (
+          <CapturePanel key={config.source} config={config} />
+        ))}
+      </div>
     </main>
   );
 }
