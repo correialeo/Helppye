@@ -34,7 +34,11 @@ impl TranscriptionQueue {
     ) -> Self {
         let (sender, mut receiver) = mpsc::channel::<AudioSegment>(QUEUE_CAPACITY);
 
-        tokio::spawn(async move {
+        // `tokio::spawn` panics here: `spawn` runs synchronously inside Tauri's
+        // `.setup()` hook, outside any Tokio task context. `tauri::async_runtime::spawn`
+        // uses Tauri's own managed runtime instead (same reason `audio::start_capture`
+        // uses it for its forwarding task).
+        tauri::async_runtime::spawn(async move {
             while let Some(segment) = receiver.recv().await {
                 let segment_id = segment.id;
                 let source = segment.source;
