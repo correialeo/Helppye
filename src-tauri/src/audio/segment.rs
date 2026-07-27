@@ -2,12 +2,15 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::Serialize;
+
 use crate::audio::types::AudioSource;
 
 /// Monotonic milliseconds since the owning capture session started — the same clock as
 /// `AudioFrame::timestamp_ms`, never wall-clock time. Only comparable within one capture
 /// session for one source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
 pub struct AudioTimestamp(pub u64);
 
 impl AudioTimestamp {
@@ -21,7 +24,8 @@ static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
 /// Opaque, process-unique identifier for one detected speech segment. Not stable across
 /// restarts and not meaningful across sources — only used to correlate a segment with its
 /// eventual `Transcript`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
 pub struct SegmentId(u64);
 
 impl SegmentId {

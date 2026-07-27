@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use crate::audio::segment::{AudioTimestamp, SegmentId};
 use crate::audio::types::AudioSource;
 
@@ -41,7 +43,7 @@ pub struct ModelConfig {
 /// The text output of transcribing one `AudioSegment`. Carries `segment_id`/`source` so the
 /// frontend can correlate it back to the segment (and thus the right capture panel) even if
 /// transcripts for microphone and system output arrive out of order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Transcript {
     pub segment_id: SegmentId,
     pub source: AudioSource,
@@ -51,4 +53,19 @@ pub struct Transcript {
     pub started_at: AudioTimestamp,
     pub ended_at: AudioTimestamp,
     pub processing_time_ms: u64,
+}
+
+/// Wire event emitted to the frontend for every segment the queue finishes processing —
+/// success or failure, never silently dropped. Tagged the same way as
+/// `audio::types::AudioCaptureEvent` so the frontend can route it to the right capture
+/// panel by `source`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TranscriptEvent {
+    Ready(Transcript),
+    Failed {
+        segment_id: SegmentId,
+        source: AudioSource,
+        message: String,
+    },
 }

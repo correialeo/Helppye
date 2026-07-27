@@ -1,7 +1,15 @@
 mod audio;
 mod transcription;
 
+use std::sync::Arc;
+
+use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
+
+use transcription::provider::TranscriptionProvider;
+use transcription::queue::TranscriptionQueue;
+use transcription::whisper_provider::WhisperCppProvider;
+use transcription::{TranscriptionState, TRANSCRIPTION_EVENT};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -12,7 +20,18 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
-        .manage(audio::AudioState::default())
+        .setup(|app| {
+            let provider: Arc<dyn TranscriptionProvider> = Arc::new(WhisperCppProvider::new());
+            let app_handle = app.handle().clone();
+            let queue = Arc::new(TranscriptionQueue::spawn(provider.clone(), move |event| {
+                if let Err(e) = app_handle.emit(TRANSCRIPTION_EVENT, &event) {
+                    tracing::warn!(%e, "failed to emit transcription event to frontend");
+                }
+            }));
+            app.manage(audio::AudioState::new(queue.clone()));
+            app.manage(TranscriptionState::new(provider, queue));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             audio::list_audio_devices_command,
             audio::list_system_audio_devices_command,
@@ -20,6 +39,8 @@ pub fn run() {
             audio::stop_microphone_capture_command,
             audio::start_system_audio_capture_command,
             audio::stop_system_audio_capture_command,
+            transcription::configure_transcription_command,
+            transcription::transcription_diagnostics_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Helppye application");

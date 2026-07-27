@@ -18,6 +18,19 @@ type AudioCaptureEvent =
   | { type: "error"; source: AudioSourceKind; message: string }
   | { type: "stopped"; source: AudioSourceKind };
 
+type TranscriptEvent =
+  | {
+      type: "ready";
+      segment_id: number;
+      source: AudioSourceKind;
+      text: string;
+      language: string | null;
+      started_at: number;
+      ended_at: number;
+      processing_time_ms: number;
+    }
+  | { type: "failed"; segment_id: number; source: AudioSourceKind; message: string };
+
 function rmsDbfs(samples: number[]): number {
   if (samples.length === 0) return -Infinity;
   const meanSquare = samples.reduce((sum, s) => sum + s * s, 0) / samples.length;
@@ -59,6 +72,8 @@ function CapturePanel({ config }: { config: PanelConfig }) {
   const [levelDb, setLevelDb] = useState(-Infinity);
   const [frameCount, setFrameCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState("");
+  const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const levelDecayTimer = useRef<number | null>(null);
 
   const refreshDevices = useCallback(() => {
@@ -94,6 +109,25 @@ function CapturePanel({ config }: { config: PanelConfig }) {
         setCapturing(false);
       } else if (payload.type === "stopped") {
         setCapturing(false);
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [config.source]);
+
+  useEffect(() => {
+    const unlisten = listen<TranscriptEvent>("transcription://event", (event) => {
+      const payload = event.payload;
+      if (payload.source !== config.source) return;
+
+      if (payload.type === "ready") {
+        setTranscriptError(null);
+        if (payload.text.length > 0) {
+          setTranscript((t) => (t.length > 0 ? `${t} ${payload.text}` : payload.text));
+        }
+      } else {
+        setTranscriptError(payload.message);
       }
     });
     return () => {
@@ -162,6 +196,93 @@ function CapturePanel({ config }: { config: PanelConfig }) {
       </div>
 
       {error && <p className="text-xs text-red-400">{error}</p>}
+
+      <div className="w-full text-left">
+        <p className="mb-1 text-xs font-medium text-neutral-300">Transcrição</p>
+        <p className="max-h-32 min-h-12 overflow-y-auto rounded border border-neutral-700 p-2 text-xs text-neutral-200">
+          {transcript || <span className="text-neutral-500">Aguardando fala...</span>}
+        </p>
+        {transcriptError && <p className="mt-1 text-xs text-red-400">{transcriptError}</p>}
+      </div>
+    </section>
+  );
+}
+
+type LanguageChoice = "pt" | "auto";
+
+function modelNameFromPath(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+function ModelConfigPanel() {
+  const [modelPath, setModelPath] = useState("");
+  const [language, setLanguage] = useState<LanguageChoice>("pt");
+  const [status, setStatus] = useState<"idle" | "loading" | "loaded" | "error">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  const loadModel = async () => {
+    setStatus("loading");
+    setError(null);
+    try {
+      await invoke("configure_transcription_command", {
+        modelPath,
+        modelName: modelNameFromPath(modelPath),
+        language: language === "auto" ? null : language,
+      });
+      setStatus("loaded");
+    } catch (e) {
+      setStatus("error");
+      setError(String(e));
+    }
+  };
+
+  return (
+    <section className="flex w-full max-w-md flex-col gap-2 rounded-lg border border-neutral-800 p-4 text-left">
+      <h2 className="text-base font-semibold">Modelo de transcrição</h2>
+      <label className="text-xs text-neutral-400">
+        Caminho do modelo (.bin, formato ggml/whisper.cpp)
+        <input
+          type="text"
+          value={modelPath}
+          onChange={(e) => setModelPath(e.target.value)}
+          placeholder="/caminho/para/ggml-base.bin"
+          className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
+        />
+      </label>
+
+      <fieldset className="flex gap-4 text-xs text-neutral-400">
+        <label className="flex items-center gap-1">
+          <input
+            type="radio"
+            name="transcription-language"
+            checked={language === "pt"}
+            onChange={() => setLanguage("pt")}
+          />
+          Português
+        </label>
+        <label className="flex items-center gap-1">
+          <input
+            type="radio"
+            name="transcription-language"
+            checked={language === "auto"}
+            onChange={() => setLanguage("auto")}
+          />
+          Automático
+        </label>
+      </fieldset>
+
+      <button
+        type="button"
+        onClick={loadModel}
+        disabled={modelPath.length === 0 || status === "loading"}
+        className="w-full rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
+      >
+        {status === "loading" ? "Carregando..." : "Carregar modelo"}
+      </button>
+
+      {status === "loaded" && <p className="text-xs text-emerald-400">Modelo carregado.</p>}
+      {error && <p className="text-xs text-red-400">{error}</p>}
     </section>
   );
 }
@@ -171,6 +292,8 @@ export default function App() {
     <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
       <h1 className="text-2xl font-semibold">Helppye</h1>
       <p className="text-sm text-neutral-400">Microphone + system audio capture test</p>
+
+      <ModelConfigPanel />
 
       <div className="flex flex-col gap-4 sm:flex-row">
         {PANELS.map((config) => (
