@@ -1,4 +1,5 @@
 mod audio;
+mod transcription;
 
 use tracing_subscriber::EnvFilter;
 

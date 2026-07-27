@@ -7,7 +7,10 @@ pub mod platform;
 pub mod provider;
 pub mod resampler;
 pub mod sample_convert;
+pub mod segment;
+pub mod segmentation;
 pub mod types;
+pub mod vad;
 
 use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
