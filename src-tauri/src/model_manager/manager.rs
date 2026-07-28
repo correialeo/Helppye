@@ -87,13 +87,8 @@ impl ModelManager {
         if let Some(TranscriptionModelSelection::Custom { model_path }) =
             config_store::load(&self.config_path)?
         {
-            let state = if std::path::Path::new(&model_path).is_file() {
-                ModelInstallState::Ready
-            } else {
-                ModelInstallState::Corrupted {
-                    reason: "arquivo do modelo personalizado não existe mais".into(),
-                }
-            };
+            let state = self.load_persisted_custom_model(&model_path).await;
+            self.set_state(state.clone()).await;
             return Ok(ModelStatus {
                 model_id: DEFAULT_MODEL.id,
                 display_name: DEFAULT_MODEL.display_name,
@@ -116,13 +111,80 @@ impl ModelManager {
     }
 
     /// Passo 3 isolado: verifica se o modelo padrão já existe e é válido (tamanho +
-    /// checksum). Nunca considera um modelo "instalado" apenas por o arquivo existir.
+    /// checksum) e, se estiver, carrega-o de fato no `TranscriptionProvider` — o
+    /// arquivo em disco sobrevive a um restart do app, mas o estado em memória do
+    /// provider não, então validar só o checksum aqui deixaria `transcribe()` falhando
+    /// com "no transcription model configured" mesmo com `state == Ready`.
     pub async fn check_default_model(&self) -> Result<ModelInstallState, ModelManagerError> {
+        self.check_and_load(&DEFAULT_MODEL).await
+    }
+
+    /// Núcleo de `check_default_model`, parametrizado pela definição do modelo —
+    /// separado para ser testável com definições pequenas de teste, já que
+    /// `DEFAULT_MODEL` é uma constante de catálogo com um checksum real fixo que não dá
+    /// para forjar em teste.
+    async fn check_and_load(
+        &self,
+        definition: &ModelDefinition,
+    ) -> Result<ModelInstallState, ModelManagerError> {
         self.set_state(ModelInstallState::Checking).await;
-        let path = self.models_dir.join(DEFAULT_MODEL.filename);
-        let state = check_model_at_path(&path, &DEFAULT_MODEL).await?;
+        let path = self.models_dir.join(definition.filename);
+        let mut state = check_model_at_path(&path, definition).await?;
+        if state == ModelInstallState::Ready {
+            if let Err(e) = self
+                .load_provider(path, definition.display_name.into())
+                .await
+            {
+                state = ModelInstallState::Failed {
+                    reason: e.to_string(),
+                };
+            }
+        }
         self.set_state(state.clone()).await;
         Ok(state)
+    }
+
+    /// Carrega um caminho de modelo já verificado no `TranscriptionProvider`
+    /// configurado — usado tanto para restaurar o modelo padrão quanto um modelo
+    /// personalizado persistido ao reabrir o app.
+    async fn load_provider(
+        &self,
+        model_path: PathBuf,
+        model_name: String,
+    ) -> Result<(), ModelManagerError> {
+        let config = ModelConfig {
+            model_path,
+            model_name,
+            language: TranscriptionLanguage::default(),
+            device: InferenceDevice::Cpu,
+        };
+        self.provider
+            .load(config)
+            .await
+            .map_err(|e| ModelManagerError::LoadFailed(e.to_string()))
+    }
+
+    /// Restaura uma seleção de modelo personalizado persistida em uma sessão anterior:
+    /// o arquivo é revalidado (ainda existe?) e recarregado no provider, já que
+    /// `model_name` nunca é persistido junto com `Custom` — deriva um nome de exibição
+    /// a partir do nome do arquivo como fallback.
+    async fn load_persisted_custom_model(&self, model_path: &str) -> ModelInstallState {
+        let path = std::path::Path::new(model_path);
+        if !path.is_file() {
+            return ModelInstallState::Corrupted {
+                reason: "arquivo do modelo personalizado não existe mais".into(),
+            };
+        }
+        let display_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Modelo personalizado".into());
+        match self.load_provider(path.to_path_buf(), display_name).await {
+            Ok(()) => ModelInstallState::Ready,
+            Err(e) => ModelInstallState::Failed {
+                reason: e.to_string(),
+            },
+        }
     }
 
     pub async fn download_default_model(&self) -> Result<(), ModelManagerError> {
@@ -249,16 +311,8 @@ impl ModelManager {
         )?;
 
         // 10. carrega e valida o modelo de fato (não só o arquivo em disco).
-        let config = ModelConfig {
-            model_path: final_path.clone(),
-            model_name: definition.display_name.into(),
-            language: TranscriptionLanguage::default(),
-            device: InferenceDevice::Cpu,
-        };
-        self.provider
-            .load(config)
-            .await
-            .map_err(|e| ModelManagerError::LoadFailed(e.to_string()))?;
+        self.load_provider(final_path.clone(), definition.display_name.into())
+            .await?;
 
         self.set_state(ModelInstallState::Ready).await;
         self.emit(ModelDownloadEvent::Completed {
@@ -737,5 +791,77 @@ mod tests {
                 model_path: custom_model_path.display().to_string()
             }
         );
+    }
+
+    // Reproduz o bug relatado: após reiniciar o app (novo `ModelManager` + novo
+    // `TranscriptionProvider`, já que ambos são recriados a cada processo), o modelo
+    // padrão já baixado numa sessão anterior precisa ser recarregado de fato no
+    // provider, não só ter seu checksum revalidado em disco.
+    #[tokio::test]
+    async fn restarting_the_app_reloads_the_already_downloaded_default_model_into_a_fresh_provider()
+    {
+        let tmp = TempDir::new("restart-default");
+        let (definition, bytes) = test_definition("t11", "model.bin");
+        let downloader = Arc::new(FakeDownloader::new(vec![FakeOutcome::Success(bytes)]));
+        let first_provider = Arc::new(FakeProvider::new(false));
+        let manager = manager_with(tmp.path(), downloader.clone(), first_provider.clone());
+        manager.download_model(definition).await.unwrap();
+        assert_eq!(first_provider.load_calls.lock().unwrap().len(), 1);
+
+        // Simula o restart: novo manager, novo provider "vazio" — mas o mesmo arquivo
+        // em disco de antes (o `TempDir` persiste entre os dois managers). Usa
+        // `check_and_load` diretamente (em vez de `status_snapshot`, que sempre checa
+        // contra `DEFAULT_MODEL`, uma constante de catálogo com checksum real fixo que
+        // não dá para forjar com a definição pequena de teste).
+        let fresh_provider = Arc::new(FakeProvider::new(false));
+        let fresh_manager = manager_with(tmp.path(), downloader, fresh_provider.clone());
+
+        let state = fresh_manager.check_and_load(&definition).await.unwrap();
+
+        assert_eq!(state, ModelInstallState::Ready);
+        assert_eq!(fresh_provider.load_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restarting_the_app_reloads_a_persisted_custom_model_into_a_fresh_provider() {
+        let tmp = TempDir::new("restart-custom");
+        let custom_model_path = tmp.path().join("my-custom-model.bin");
+        std::fs::write(&custom_model_path, b"not a real ggml file, but present").unwrap();
+        let downloader = Arc::new(FakeDownloader::new(vec![FakeOutcome::Http404]));
+        let first_provider = Arc::new(FakeProvider::new(false));
+        let manager = manager_with(tmp.path(), downloader.clone(), first_provider.clone());
+        manager
+            .select_custom_model(custom_model_path.clone(), "my custom model".into())
+            .await
+            .unwrap();
+
+        let fresh_provider = Arc::new(FakeProvider::new(false));
+        let fresh_manager = manager_with(tmp.path(), downloader, fresh_provider.clone());
+
+        let status = fresh_manager.status_snapshot().await.unwrap();
+
+        assert_eq!(status.state, ModelInstallState::Ready);
+        assert_eq!(fresh_provider.load_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            fresh_provider.load_calls.lock().unwrap()[0],
+            custom_model_path
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_surfaces_a_failed_state_when_the_fresh_provider_load_fails() {
+        let tmp = TempDir::new("restart-load-failure");
+        let (definition, bytes) = test_definition("t12", "model.bin");
+        let downloader = Arc::new(FakeDownloader::new(vec![FakeOutcome::Success(bytes)]));
+        let first_provider = Arc::new(FakeProvider::new(false));
+        let manager = manager_with(tmp.path(), downloader.clone(), first_provider.clone());
+        manager.download_model(definition).await.unwrap();
+
+        let failing_provider = Arc::new(FakeProvider::new(true));
+        let fresh_manager = manager_with(tmp.path(), downloader, failing_provider);
+
+        let state = fresh_manager.check_and_load(&definition).await.unwrap();
+
+        assert!(matches!(state, ModelInstallState::Failed { .. }));
     }
 }
