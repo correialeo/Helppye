@@ -29,7 +29,8 @@ pub fn run() {
                     tracing::warn!(%e, "failed to emit transcription event to frontend");
                 }
             }));
-            app.manage(audio::AudioState::new(queue.clone()));
+            let audio_state = audio::build(app.handle(), queue.clone())?;
+            app.manage(audio_state);
             app.manage(TranscriptionState::new(provider.clone(), queue));
 
             let model_manager_state = model_manager::build(app.handle(), provider)?;
@@ -40,6 +41,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             audio::list_audio_devices_command,
             audio::list_system_audio_devices_command,
+            audio::resolve_device_selection_command,
+            audio::select_input_device_command,
+            audio::select_output_device_command,
             audio::start_microphone_capture_command,
             audio::stop_microphone_capture_command,
             audio::start_system_audio_capture_command,

@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Debug, Error, Clone)]
+#[derive(Debug, Error, Clone, PartialEq)]
 pub enum AudioCaptureError {
     #[error("no matching audio device found")]
     NoDeviceFound,
@@ -12,6 +12,8 @@ pub enum AudioCaptureError {
     Unsupported(String),
     #[error("capture cancelled")]
     Cancelled,
+    #[error("capture already running for this source")]
+    AlreadyRunning,
     #[error("internal audio error: {0}")]
     Internal(String),
 }

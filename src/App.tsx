@@ -285,48 +285,107 @@ function rmsDbfs(samples: number[]): number {
   return rms > 0 ? 20 * Math.log10(rms) : -Infinity;
 }
 
+type ResolutionSource = "persisted" | "windows_default" | "first_available_fallback";
+
+interface ResolvedDevice {
+  device_id: string;
+  device_name: string;
+  is_windows_default: boolean;
+  source: ResolutionSource;
+}
+
+interface DeviceSelectionSnapshot {
+  input: ResolvedDevice | null;
+  output: ResolvedDevice | null;
+}
+
 interface PanelConfig {
   source: AudioSourceKind;
   title: string;
-  subtitle: string;
   listDevicesCommand: string;
+  selectDeviceCommand: string;
   startCommand: string;
   stopCommand: string;
 }
 
-const PANELS: PanelConfig[] = [
+const PANELS: readonly [PanelConfig, PanelConfig] = [
   {
     source: "microphone",
-    title: "Microphone",
-    subtitle: "cpal input capture",
+    title: "Entrada",
     listDevicesCommand: "list_audio_devices_command",
+    selectDeviceCommand: "select_input_device_command",
     startCommand: "start_microphone_capture_command",
     stopCommand: "stop_microphone_capture_command",
   },
   {
     source: "system_output",
-    title: "System output",
-    subtitle: "WASAPI loopback capture (Windows only)",
+    title: "Saída",
     listDevicesCommand: "list_system_audio_devices_command",
+    selectDeviceCommand: "select_output_device_command",
     startCommand: "start_system_audio_capture_command",
     stopCommand: "stop_system_audio_capture_command",
   },
 ];
 
-function CapturePanel({ config }: { config: PanelConfig }) {
+type PanelStatus =
+  | { kind: "parado" }
+  | { kind: "capturando" }
+  | { kind: "trocando" }
+  | { kind: "desconectado" }
+  | { kind: "erro"; message: string };
+
+function statusLabel(status: PanelStatus): string {
+  switch (status.kind) {
+    case "capturando":
+      return "Capturando";
+    case "parado":
+      return "Parado";
+    case "desconectado":
+      return "Dispositivo desconectado";
+    case "trocando":
+      return "Trocando dispositivo...";
+    case "erro":
+      return "Erro";
+  }
+}
+
+function selectionLabel(source: ResolutionSource | null): string {
+  if (source === "windows_default") return "Padrão do Windows";
+  if (source === "first_available_fallback") {
+    return "Nenhum dispositivo padrão encontrado — usando o primeiro disponível";
+  }
+  return "Seleção manual";
+}
+
+// Exatamente 1 dispositivo selecionado por vez para esta categoria (entrada OU saída) —
+// um único <select>, nunca multi-select. Parar → esperar o encerramento real → reabrir
+// no novo dispositivo é responsabilidade do backend (`CaptureEngine::select_device`);
+// este painel só precisa exibir "Trocando dispositivo..." enquanto aguarda essa promessa
+// e suprimir os eventos started/stopped que chegam como parte dessa troca interna, para
+// não piscar entre estados intermediários.
+function DeviceCapturePanel({
+  config,
+  initialSelection,
+}: {
+  config: PanelConfig;
+  initialSelection: ResolvedDevice | null;
+}) {
   const [devices, setDevices] = useState<AudioDevice[]>([]);
-  const [capturing, setCapturing] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(initialSelection?.device_id ?? null);
+  const [selectionSource, setSelectionSource] = useState<ResolutionSource | null>(initialSelection?.source ?? null);
+  const [status, setStatus] = useState<PanelStatus>({ kind: "parado" });
   const [levelDb, setLevelDb] = useState(-Infinity);
   const [frameCount, setFrameCount] = useState(0);
-  const [error, setError] = useState<string | null>(null);
   const [transcript, setTranscript] = useState("");
   const [transcriptError, setTranscriptError] = useState<string | null>(null);
+  const [suggestedDevice, setSuggestedDevice] = useState<ResolvedDevice | null>(null);
   const levelDecayTimer = useRef<number | null>(null);
+  const switchingRef = useRef(false);
 
   const refreshDevices = useCallback(() => {
     invoke<AudioDevice[]>(config.listDevicesCommand)
       .then(setDevices)
-      .catch((e) => setError(String(e)));
+      .catch((e) => setStatus({ kind: "erro", message: String(e) }));
   }, [config.listDevicesCommand]);
 
   useEffect(() => {
@@ -340,8 +399,11 @@ function CapturePanel({ config }: { config: PanelConfig }) {
       // `source` field identifies which panel it belongs to.
       const eventSource = payload.type === "started" ? payload.device.source : payload.source;
       if (eventSource !== config.source) return;
+      if (switchingRef.current) return;
 
-      if (payload.type === "frame") {
+      if (payload.type === "started") {
+        setStatus({ kind: "capturando" });
+      } else if (payload.type === "frame") {
         // Throttled by design: the level meter only updates on frame arrival (100ms
         // frames from CaptureConfig::default), and decays to silence if frames stop.
         setLevelDb(rmsDbfs(payload.samples));
@@ -349,19 +411,30 @@ function CapturePanel({ config }: { config: PanelConfig }) {
         if (levelDecayTimer.current !== null) window.clearTimeout(levelDecayTimer.current);
         levelDecayTimer.current = window.setTimeout(() => setLevelDb(-Infinity), 300);
       } else if (payload.type === "error") {
-        setError(payload.message);
-        setCapturing(false);
+        setStatus({ kind: "erro", message: payload.message });
       } else if (payload.type === "device_disconnected") {
-        setError(`device disconnected: ${payload.device_id}`);
-        setCapturing(false);
+        setStatus({ kind: "desconectado" });
+        setLevelDb(-Infinity);
+        refreshDevices();
+        // The backend already stopped capture and re-persisted a fallback selection on
+        // its own (`CaptureEngine::resolve_and_persist`) — never auto-restart, just
+        // reflect that fallback here as an opt-in suggestion for the user.
+        invoke<DeviceSelectionSnapshot>("resolve_device_selection_command")
+          .then((snapshot) => {
+            const resolved = config.source === "microphone" ? snapshot.input : snapshot.output;
+            setSuggestedDevice(resolved);
+            setSelectedId(resolved?.device_id ?? null);
+            setSelectionSource(resolved?.source ?? null);
+          })
+          .catch(() => {});
       } else if (payload.type === "stopped") {
-        setCapturing(false);
+        setStatus((s) => (s.kind === "desconectado" || s.kind === "erro" ? s : { kind: "parado" }));
       }
     });
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [config.source]);
+  }, [config.source, refreshDevices]);
 
   useEffect(() => {
     const unlisten = listen<TranscriptEvent>("transcription://event", (event) => {
@@ -382,55 +455,88 @@ function CapturePanel({ config }: { config: PanelConfig }) {
     };
   }, [config.source]);
 
+  const handleSelectDevice = async (deviceId: string) => {
+    const wasCapturing = status.kind === "capturando";
+    setSelectedId(deviceId);
+    setSelectionSource(null);
+    setSuggestedDevice(null);
+    if (wasCapturing) {
+      switchingRef.current = true;
+      setStatus({ kind: "trocando" });
+    }
+    try {
+      await invoke(config.selectDeviceCommand, { deviceId });
+      setStatus(wasCapturing ? { kind: "capturando" } : { kind: "parado" });
+    } catch (e) {
+      setStatus({ kind: "erro", message: String(e) });
+    } finally {
+      switchingRef.current = false;
+    }
+  };
+
   const startCapture = async () => {
-    setError(null);
     setFrameCount(0);
+    setSuggestedDevice(null);
     try {
       await invoke(config.startCommand);
-      setCapturing(true);
+      setStatus({ kind: "capturando" });
     } catch (e) {
-      setError(String(e));
+      setStatus({ kind: "erro", message: String(e) });
     }
   };
 
   const stopCapture = async () => {
     try {
       await invoke(config.stopCommand);
+      setStatus({ kind: "parado" });
     } catch (e) {
-      setError(String(e));
-    } finally {
-      setCapturing(false);
+      setStatus({ kind: "erro", message: String(e) });
     }
   };
 
+  const useSuggestedDevice = async () => {
+    if (!suggestedDevice) return;
+    setSuggestedDevice(null);
+    await startCapture();
+  };
+
   const levelPercent = Number.isFinite(levelDb) ? Math.min(100, Math.max(0, (levelDb + 60) * (100 / 60))) : 0;
+  const noDevices = devices.length === 0;
+  const controlsDisabled = noDevices || status.kind === "trocando";
 
   return (
     <section className="flex w-full max-w-xs flex-col items-center gap-3 rounded-lg border border-neutral-800 p-4">
       <div className="text-center">
         <h2 className="text-base font-semibold">{config.title}</h2>
-        <p className="text-xs text-neutral-500">{config.subtitle}</p>
+        <p className="text-xs text-neutral-500">{statusLabel(status)}</p>
       </div>
 
-      <div className="w-full text-left text-xs text-neutral-400">
-        <p className="mb-1 font-medium text-neutral-300">Devices ({devices.length})</p>
-        <ul className="max-h-24 overflow-y-auto rounded border border-neutral-700 p-2">
+      <label className="w-full text-left text-xs text-neutral-400">
+        Dispositivo
+        <select
+          value={selectedId ?? ""}
+          onChange={(e) => handleSelectDevice(e.target.value)}
+          disabled={controlsDisabled}
+          className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200 disabled:opacity-50"
+        >
+          {noDevices && <option value="">Nenhum dispositivo encontrado</option>}
           {devices.map((d) => (
-            <li key={d.id}>
+            <option key={d.id} value={d.id}>
               {d.name}
-              {d.is_default ? " (default)" : ""}
-            </li>
+              {d.is_default ? " (padrão do Windows)" : ""}
+            </option>
           ))}
-          {devices.length === 0 && <li className="text-neutral-500">No devices found</li>}
-        </ul>
-      </div>
+        </select>
+      </label>
+      <p className="w-full text-left text-xs text-neutral-500">{selectionLabel(selectionSource)}</p>
 
       <button
         type="button"
-        onClick={capturing ? stopCapture : startCapture}
-        className="w-full rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500"
+        onClick={status.kind === "capturando" ? stopCapture : startCapture}
+        disabled={controlsDisabled}
+        className="w-full rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
       >
-        {capturing ? "Stop capture" : "Start capture"}
+        {status.kind === "capturando" ? "Parar captura" : "Iniciar captura"}
       </button>
 
       <div className="w-full">
@@ -438,11 +544,30 @@ function CapturePanel({ config }: { config: PanelConfig }) {
           <div className="h-full bg-emerald-500 transition-all" style={{ width: `${levelPercent}%` }} />
         </div>
         <p className="mt-1 text-xs text-neutral-500">
-          {capturing ? `${frameCount} frames` : "idle"} — {Number.isFinite(levelDb) ? `${levelDb.toFixed(1)} dBFS` : "-∞ dBFS"}
+          {status.kind === "capturando" ? `${frameCount} frames` : "idle"} —{" "}
+          {Number.isFinite(levelDb) ? `${levelDb.toFixed(1)} dBFS` : "-∞ dBFS"}
         </p>
       </div>
 
-      {error && <p className="text-xs text-red-400">{error}</p>}
+      {status.kind === "erro" && <p className="text-xs text-red-400">{status.message}</p>}
+
+      {status.kind === "desconectado" && (
+        <div className="w-full rounded border border-amber-700 bg-amber-950/30 p-2 text-left text-xs text-amber-300">
+          <p>
+            Dispositivo desconectado.
+            {suggestedDevice ? ` Dispositivo sugerido: ${suggestedDevice.device_name}.` : ""}
+          </p>
+          {suggestedDevice && (
+            <button
+              type="button"
+              onClick={useSuggestedDevice}
+              className="mt-2 rounded border border-amber-700 px-2 py-1 text-xs font-medium hover:bg-amber-900/40"
+            >
+              [Usar este dispositivo]
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="w-full text-left">
         <p className="mb-1 text-xs font-medium text-neutral-300">Transcrição</p>
@@ -452,6 +577,37 @@ function CapturePanel({ config }: { config: PanelConfig }) {
         {transcriptError && <p className="mt-1 text-xs text-red-400">{transcriptError}</p>}
       </div>
     </section>
+  );
+}
+
+// Resolve (sem iniciar captura) a seleção de entrada e de saída uma única vez, ao montar
+// — pré-seleciona o padrão do Windows (ou o fallback) e espera a ação explícita do
+// usuário para efetivamente abrir qualquer dispositivo.
+function AudioCaptureSection() {
+  const [selection, setSelection] = useState<DeviceSelectionSnapshot | null>(null);
+  const [resolveError, setResolveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<DeviceSelectionSnapshot>("resolve_device_selection_command")
+      .then(setSelection)
+      .catch((e) => setResolveError(String(e)));
+  }, []);
+
+  if (resolveError) {
+    return <p className="text-sm text-red-400">Erro ao resolver dispositivos de áudio: {resolveError}</p>;
+  }
+
+  if (!selection) {
+    return <p className="text-sm text-neutral-400">Resolvendo dispositivos de áudio...</p>;
+  }
+
+  const [inputPanel, outputPanel] = PANELS;
+
+  return (
+    <div className="flex flex-col gap-4 sm:flex-row">
+      <DeviceCapturePanel config={inputPanel} initialSelection={selection.input} />
+      <DeviceCapturePanel config={outputPanel} initialSelection={selection.output} />
+    </div>
   );
 }
 
@@ -526,11 +682,7 @@ export default function App() {
 
         <AdvancedTranscriptionSettings />
 
-        <div className="flex flex-col gap-4 sm:flex-row">
-          {PANELS.map((config) => (
-            <CapturePanel key={config.source} config={config} />
-          ))}
-        </div>
+        <AudioCaptureSection />
       </main>
     </ModelOnboardingGate>
   );

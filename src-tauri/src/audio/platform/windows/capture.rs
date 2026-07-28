@@ -9,8 +9,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
-    IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    eConsole, eRender, IAudioCaptureClient, IAudioClient, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK,
 };
 use windows::Win32::System::Com::{CoTaskMemFree, CLSCTX_ALL};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -75,11 +76,13 @@ pub fn run_capture_thread(
     }
 
     info!(
-        device = %setup.device.name,
-        channels = setup.wave_format.channels,
-        sample_rate = setup.wave_format.sample_rate,
+        device_id = %setup.device.id,
+        device_name = %setup.device.name,
+        is_windows_default = setup.device.is_default,
+        native_rate = setup.wave_format.sample_rate,
+        native_channels = setup.wave_format.channels,
         target_rate = config.target_sample_rate,
-        "system audio (loopback) capture started"
+        "system output capture started"
     );
     let _ = ready_tx.send(Ok(()));
     let _ = sender.try_send(AudioCaptureEvent::Started {
@@ -177,7 +180,15 @@ fn setup(config: &CaptureConfig) -> Result<Setup, AudioCaptureError> {
         warn!(%e, id, "failed to read output device friendly name, using id");
         id.clone()
     });
-    let is_default = config.device_id.is_none();
+    // Compared against the endpoint actually opened above, not just "was a device_id
+    // filter requested" — a caller can pass the id of the device that happens to already
+    // be the default, so `config.device_id.is_none()` alone would be wrong in that case.
+    // SAFETY: `enumerator` is the same valid IMMDeviceEnumerator used to resolve `device`.
+    let is_default = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+        .ok()
+        .and_then(|d| unsafe { device_id(&d) }.ok())
+        .as_deref()
+        == Some(id.as_str());
 
     Ok(Setup {
         _com: com,

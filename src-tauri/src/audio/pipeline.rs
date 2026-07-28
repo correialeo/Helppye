@@ -56,6 +56,7 @@ fn run_capture_thread(
     ready_tx: tokio::sync::oneshot::Sender<Result<(), AudioCaptureError>>,
 ) {
     let host = cpal::default_host();
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
 
     let device = match &config.device_id {
         Some(id) => host
@@ -72,6 +73,9 @@ fn run_capture_thread(
     };
 
     let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
+    // The device is currently identified by name (no stable cross-platform mic ID exists
+    // via cpal); `id == name` here mirrors `devices::list_input_devices`.
+    let is_windows_default = default_name.as_deref() == Some(device_name.as_str());
 
     let stream_config = match device.default_input_config() {
         Ok(c) if c.sample_format() == cpal::SampleFormat::F32 => c,
@@ -100,6 +104,8 @@ fn run_capture_thread(
     let tx = sender.clone();
 
     let err_tx = sender.clone();
+    let err_device_id = device_name.clone();
+    let err_cancel = cancel.clone();
     let stream = device.build_input_stream(
         &stream_config.config(),
         move |data: &[f32], _| {
@@ -133,11 +139,25 @@ fn run_capture_thread(
             }
         },
         move |err| {
-            error!(%err, "cpal input stream error");
-            let _ = err_tx.try_send(AudioCaptureEvent::Error {
-                source: AudioSource::Microphone,
-                message: err.to_string(),
-            });
+            // `DeviceNotAvailable` is cpal's cross-platform signal that the device was
+            // unplugged, disabled, or otherwise invalidated mid-stream — the same
+            // situation the Windows loopback path detects via `AUDCLNT_E_DEVICE_INVALIDATED`
+            // (see `platform::windows::capture::handle_stream_error`). Anything else is a
+            // generic stream error, not a disconnection.
+            if matches!(err, cpal::StreamError::DeviceNotAvailable) {
+                error!(%err, "microphone device invalidated (disconnected or disabled)");
+                let _ = err_tx.try_send(AudioCaptureEvent::DeviceDisconnected {
+                    source: AudioSource::Microphone,
+                    device_id: err_device_id.clone(),
+                });
+                err_cancel.cancel();
+            } else {
+                error!(%err, "cpal input stream error");
+                let _ = err_tx.try_send(AudioCaptureEvent::Error {
+                    source: AudioSource::Microphone,
+                    message: err.to_string(),
+                });
+            }
         },
         None,
     );
@@ -155,14 +175,22 @@ fn run_capture_thread(
         return;
     }
 
-    info!(device = %device_name, native_rate, native_channels, target_rate, "microphone capture started");
+    info!(
+        device_id = %device_name,
+        device_name = %device_name,
+        is_windows_default = is_windows_default,
+        native_rate,
+        native_channels,
+        target_rate,
+        "microphone capture started"
+    );
     let _ = ready_tx.send(Ok(()));
     let _ = sender.try_send(AudioCaptureEvent::Started {
         device: AudioDevice {
             id: device_name.clone(),
             name: device_name,
             source: AudioSource::Microphone,
-            is_default: config.device_id.is_none(),
+            is_default: is_windows_default,
         },
     });
 
