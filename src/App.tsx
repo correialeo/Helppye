@@ -1,6 +1,253 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+
+type ModelInstallState =
+  | { state: "not_installed" }
+  | { state: "checking" }
+  | { state: "downloading" }
+  | { state: "cancelled" }
+  | { state: "verifying" }
+  | { state: "installing" }
+  | { state: "ready" }
+  | { state: "corrupted"; reason: string }
+  | { state: "failed"; reason: string };
+
+interface ModelStatus {
+  model_id: string;
+  display_name: string;
+  approximate_size_bytes: number;
+  state: ModelInstallState;
+  custom_model_path: string | null;
+  language_support: "multilingual" | "english_only" | null;
+}
+
+type ModelDownloadEvent =
+  | { type: "started"; model_id: string; total_bytes: number }
+  | { type: "progress"; model_id: string; downloaded_bytes: number; total_bytes: number; bytes_per_second: number }
+  | { type: "verifying"; model_id: string }
+  | { type: "completed"; model_id: string; path: string }
+  | { type: "cancelled"; model_id: string }
+  | { type: "failed"; model_id: string; error: string };
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function formatSeconds(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "calculando...";
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.ceil(seconds % 60);
+  return `${minutes}min ${remainder}s`;
+}
+
+// Onboarding/consentimento → download → verificação → modelo pronto. Nunca baixa
+// silenciosamente: o download só começa após o clique explícito em "Baixar e continuar".
+// Também cobre a tela de erro (com retry) e, quando pronto, exibe o texto de privacidade.
+function ModelOnboardingGate({ children }: { children: ReactNode }) {
+  const [status, setStatus] = useState<ModelStatus | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<{ downloaded: number; total: number; bytesPerSecond: number } | null>(
+    null,
+  );
+
+  const refreshStatus = useCallback(() => {
+    invoke<ModelStatus>("model_status_command")
+      .then((s) => {
+        setStatus(s);
+        setStatusError(null);
+      })
+      .catch((e) => setStatusError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    refreshStatus();
+  }, [refreshStatus]);
+
+  useEffect(() => {
+    const unlisten = listen<ModelDownloadEvent>("model-download://event", (event) => {
+      const payload = event.payload;
+      if (payload.type === "progress") {
+        setProgress({
+          downloaded: payload.downloaded_bytes,
+          total: payload.total_bytes,
+          bytesPerSecond: payload.bytes_per_second,
+        });
+      } else if (payload.type === "started") {
+        setProgress({ downloaded: 0, total: payload.total_bytes, bytesPerSecond: 0 });
+      } else {
+        // verifying/completed/cancelled/failed — refresh the authoritative status
+        // rather than trying to derive UI state from the event stream alone.
+        refreshStatus();
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [refreshStatus]);
+
+  const startDownload = async () => {
+    try {
+      await invoke("start_model_download_command");
+      setStatus((s) => (s ? { ...s, state: { state: "downloading" } } : s));
+    } catch (e) {
+      setStatusError(String(e));
+    }
+  };
+
+  const cancelDownload = async () => {
+    try {
+      await invoke("cancel_model_download_command");
+    } catch {
+      // Cancellation is best-effort from the UI's perspective — the authoritative
+      // outcome arrives via the `cancelled`/`failed` event, which triggers a refresh.
+    }
+  };
+
+  if (statusError) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
+        <p className="text-sm text-red-400">Erro ao verificar o modelo: {statusError}</p>
+        <button
+          type="button"
+          onClick={refreshStatus}
+          className="rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500"
+        >
+          Tentar novamente
+        </button>
+      </main>
+    );
+  }
+
+  if (!status) {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
+        <p className="text-sm text-neutral-400">Verificando modelo de transcrição...</p>
+      </main>
+    );
+  }
+
+  const state = status.state.state;
+
+  if (state === "downloading" || state === "verifying" || state === "installing") {
+    const downloaded = progress?.downloaded ?? 0;
+    const total = progress?.total ?? status.approximate_size_bytes;
+    const percent = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
+    const remainingBytes = Math.max(0, total - downloaded);
+    const remainingSeconds =
+      progress && progress.bytesPerSecond > 0 ? remainingBytes / progress.bytesPerSecond : NaN;
+    const barLength = 15;
+    const filled = Math.round((percent / 100) * barLength);
+    const bar = "█".repeat(filled) + "░".repeat(barLength - filled);
+
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
+        <h1 className="text-xl font-semibold">Preparando transcrição local</h1>
+
+        <p className="font-mono text-lg tracking-tight">
+          {bar} {percent}%
+        </p>
+
+        {state === "downloading" ? (
+          <>
+            <p className="text-sm text-neutral-400">
+              {formatBytes(downloaded)} de {formatBytes(total)}
+            </p>
+            <p className="text-sm text-neutral-400">
+              Velocidade: {progress ? `${formatBytes(progress.bytesPerSecond)}/s` : "calculando..."}
+            </p>
+            <p className="text-sm text-neutral-400">
+              Tempo restante aproximado: {formatSeconds(remainingSeconds)}
+            </p>
+            <button
+              type="button"
+              onClick={cancelDownload}
+              className="rounded border border-neutral-700 px-4 py-2 text-sm font-medium hover:bg-neutral-800"
+            >
+              Cancelar
+            </button>
+          </>
+        ) : (
+          <p className="text-sm text-neutral-400">
+            {state === "verifying" ? "Verificando integridade do arquivo..." : "Instalando..."}
+          </p>
+        )}
+      </main>
+    );
+  }
+
+  if (state === "failed" || state === "corrupted") {
+    const reason = "reason" in status.state ? status.state.reason : "erro desconhecido";
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
+        <h1 className="text-xl font-semibold">Não foi possível baixar o modelo.</h1>
+        <p className="max-w-md text-sm text-neutral-400">{reason}</p>
+        <div className="flex gap-3">
+          <button
+            type="button"
+            onClick={startDownload}
+            className="rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500"
+          >
+            Tentar novamente
+          </button>
+          <button
+            type="button"
+            disabled
+            title="Ainda não implementado"
+            className="rounded border border-neutral-700 px-4 py-2 text-sm font-medium opacity-50"
+          >
+            Usar provedor online
+          </button>
+        </div>
+      </main>
+    );
+  }
+
+  if (state === "ready") {
+    return (
+      <>
+        <p className="mx-auto max-w-md rounded border border-neutral-800 bg-neutral-900/50 p-3 text-xs text-neutral-400">
+          O modelo é executado no seu computador.
+          <br />
+          O áudio não é enviado a terceiros quando a transcrição local está ativa.
+        </p>
+        {children}
+      </>
+    );
+  }
+
+  // not_installed / checking / cancelled: onboarding + consent screen.
+  return (
+    <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
+      <h1 className="text-xl font-semibold">Transcrição local e privada</h1>
+      <p className="max-w-md text-sm text-neutral-400">
+        Para transformar as conversas em texto sem enviar o áudio
+        <br />
+        para serviços externos, o Helppye precisa baixar um modelo
+        <br />
+        de transcrição.
+      </p>
+      <div className="rounded-lg border border-neutral-800 p-4">
+        <p className="font-medium">{status.display_name}</p>
+        <p className="text-sm text-neutral-400">
+          Tamanho aproximado: {formatBytes(status.approximate_size_bytes)}
+        </p>
+        <p className="text-xs text-neutral-500">Download necessário apenas uma vez.</p>
+      </div>
+      <button
+        type="button"
+        onClick={startDownload}
+        className="rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500"
+      >
+        Baixar e continuar
+      </button>
+    </main>
+  );
+}
 
 type AudioSourceKind = "microphone" | "system_output";
 
@@ -208,27 +455,26 @@ function CapturePanel({ config }: { config: PanelConfig }) {
   );
 }
 
-type LanguageChoice = "pt" | "auto";
-
 function modelNameFromPath(path: string): string {
   const parts = path.split(/[\\/]/);
   return parts[parts.length - 1] || path;
 }
 
-function ModelConfigPanel() {
+// Configurações → Transcrição → Avançado → Usar modelo local personalizado. Fora do
+// fluxo principal (por trás de um <details>) — usuários comuns nunca precisam disso.
+// `select_custom_model_command` carrega o arquivo de fato antes de persistir a seleção.
+function AdvancedTranscriptionSettings() {
   const [modelPath, setModelPath] = useState("");
-  const [language, setLanguage] = useState<LanguageChoice>("pt");
   const [status, setStatus] = useState<"idle" | "loading" | "loaded" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
 
-  const loadModel = async () => {
+  const selectCustomModel = async () => {
     setStatus("loading");
     setError(null);
     try {
-      await invoke("configure_transcription_command", {
+      await invoke("select_custom_model_command", {
         modelPath,
         modelName: modelNameFromPath(modelPath),
-        language: language === "auto" ? null : language,
       });
       setStatus("loaded");
     } catch (e) {
@@ -238,68 +484,54 @@ function ModelConfigPanel() {
   };
 
   return (
-    <section className="flex w-full max-w-md flex-col gap-2 rounded-lg border border-neutral-800 p-4 text-left">
-      <h2 className="text-base font-semibold">Modelo de transcrição</h2>
-      <label className="text-xs text-neutral-400">
-        Caminho do modelo (.bin, formato ggml/whisper.cpp)
-        <input
-          type="text"
-          value={modelPath}
-          onChange={(e) => setModelPath(e.target.value)}
-          placeholder="/caminho/para/ggml-base.bin"
-          className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
-        />
-      </label>
-
-      <fieldset className="flex gap-4 text-xs text-neutral-400">
-        <label className="flex items-center gap-1">
+    <details className="w-full max-w-md rounded-lg border border-neutral-800 p-4 text-left">
+      <summary className="cursor-pointer text-sm font-medium text-neutral-300">
+        Configurações → Transcrição → Avançado
+      </summary>
+      <div className="mt-3 flex flex-col gap-2">
+        <p className="text-xs text-neutral-500">Usar modelo local personalizado</p>
+        <label className="text-xs text-neutral-400">
+          Caminho do modelo (.bin, formato ggml/whisper.cpp)
           <input
-            type="radio"
-            name="transcription-language"
-            checked={language === "pt"}
-            onChange={() => setLanguage("pt")}
+            type="text"
+            value={modelPath}
+            onChange={(e) => setModelPath(e.target.value)}
+            placeholder="/caminho/para/modelo.bin"
+            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
           />
-          Português
         </label>
-        <label className="flex items-center gap-1">
-          <input
-            type="radio"
-            name="transcription-language"
-            checked={language === "auto"}
-            onChange={() => setLanguage("auto")}
-          />
-          Automático
-        </label>
-      </fieldset>
 
-      <button
-        type="button"
-        onClick={loadModel}
-        disabled={modelPath.length === 0 || status === "loading"}
-        className="w-full rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
-      >
-        {status === "loading" ? "Carregando..." : "Carregar modelo"}
-      </button>
+        <button
+          type="button"
+          onClick={selectCustomModel}
+          disabled={modelPath.length === 0 || status === "loading"}
+          className="w-full rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
+        >
+          {status === "loading" ? "Validando..." : "Usar este modelo"}
+        </button>
 
-      {status === "loaded" && <p className="text-xs text-emerald-400">Modelo carregado.</p>}
-      {error && <p className="text-xs text-red-400">{error}</p>}
-    </section>
+        {status === "loaded" && <p className="text-xs text-emerald-400">Modelo personalizado validado e configurado.</p>}
+        {error && <p className="text-xs text-red-400">{error}</p>}
+      </div>
+    </details>
   );
 }
 
 export default function App() {
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
-      <h1 className="text-2xl font-semibold">Helppye</h1>
-      <p className="text-sm text-neutral-400">Microphone + system audio capture test</p>
+    <ModelOnboardingGate>
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 p-6 text-center">
+        <h1 className="text-2xl font-semibold">Helppye</h1>
+        <p className="text-sm text-neutral-400">Microphone + system audio capture test</p>
 
-      <ModelConfigPanel />
+        <AdvancedTranscriptionSettings />
 
-      <div className="flex flex-col gap-4 sm:flex-row">
-        {PANELS.map((config) => (
-          <CapturePanel key={config.source} config={config} />
-        ))}
-      </div>
-    </main>
+        <div className="flex flex-col gap-4 sm:flex-row">
+          {PANELS.map((config) => (
+            <CapturePanel key={config.source} config={config} />
+          ))}
+        </div>
+      </main>
+    </ModelOnboardingGate>
   );
 }

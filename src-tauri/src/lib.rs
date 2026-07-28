@@ -1,4 +1,5 @@
 mod audio;
+mod model_manager;
 mod transcription;
 
 use std::sync::Arc;
@@ -29,7 +30,11 @@ pub fn run() {
                 }
             }));
             app.manage(audio::AudioState::new(queue.clone()));
-            app.manage(TranscriptionState::new(provider, queue));
+            app.manage(TranscriptionState::new(provider.clone(), queue));
+
+            let model_manager_state = model_manager::build(app.handle(), provider)?;
+            app.manage(model_manager_state);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -41,6 +46,10 @@ pub fn run() {
             audio::stop_system_audio_capture_command,
             transcription::configure_transcription_command,
             transcription::transcription_diagnostics_command,
+            model_manager::model_status_command,
+            model_manager::start_model_download_command,
+            model_manager::cancel_model_download_command,
+            model_manager::select_custom_model_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Helppye application");
