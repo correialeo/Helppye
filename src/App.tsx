@@ -319,6 +319,39 @@ type ConversationTimelineEvent =
     }
   | { type: "utterance_finalized"; turn_id: number; utterance: ConversationUtterance };
 
+type QuestionDetectionStatus = "candidate" | "confirmed" | "dismissed";
+
+interface QuestionSignal {
+  kind: string;
+  phrase?: string;
+  observed?: string;
+  reason?: string;
+  weight: number;
+}
+
+interface QuestionDetection {
+  id: number;
+  turn_id: number;
+  speaker: ConversationSpeaker;
+  source: AudioSourceKind;
+  detected: boolean;
+  confidence: number;
+  question_text: string | null;
+  matched_signals: QuestionSignal[];
+  detected_at: number;
+  detection_mode: "rule_based" | "semantic";
+  status: QuestionDetectionStatus;
+  normalized_text: string;
+  utterance_ids: number[];
+  status_reason: string;
+}
+
+type QuestionDetectionEvent =
+  | { type: "candidate"; detection: QuestionDetection }
+  | { type: "updated"; detection: QuestionDetection }
+  | { type: "confirmed"; detection: QuestionDetection }
+  | { type: "dismissed"; detection_id: number; turn_id: number };
+
 function rmsDbfs(samples: number[]): number {
   if (samples.length === 0) return -Infinity;
   const meanSquare = samples.reduce((sum, s) => sum + s * s, 0) / samples.length;
@@ -626,9 +659,17 @@ function sortUtterances(utterances: ConversationUtterance[]): ConversationUttera
   );
 }
 
+function signalLabel(signal: QuestionSignal): string {
+  if (signal.phrase && signal.observed) return `${signal.kind}: ${signal.phrase} (${signal.observed})`;
+  if (signal.phrase) return `${signal.kind}: ${signal.phrase}`;
+  if (signal.reason) return `${signal.kind}: ${signal.reason}`;
+  return signal.kind;
+}
+
 function ConversationTimelineView() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [utterances, setUtterances] = useState<ConversationUtterance[]>([]);
+  const [questionDetections, setQuestionDetections] = useState<Record<number, QuestionDetection>>({});
   const [error, setError] = useState<string | null>(null);
   const showSegments = import.meta.env.DEV;
 
@@ -718,6 +759,44 @@ function ConversationTimelineView() {
     };
   }, []);
 
+  useEffect(() => {
+    const unlisten = listen<QuestionDetectionEvent>("question://detection-event", (event) => {
+      const payload = event.payload;
+      if (payload.type === "dismissed") {
+        setQuestionDetections((current) => {
+          const next = { ...current };
+          delete next[payload.turn_id];
+          return next;
+        });
+        return;
+      }
+
+      setQuestionDetections((current) => ({
+        ...current,
+        [payload.detection.turn_id]: payload.detection,
+      }));
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const markAsQuestion = async (turnId: number) => {
+    try {
+      await invoke("question_mark_turn_as_question_command", { turnId });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const dismissQuestion = async (turnId: number) => {
+    try {
+      await invoke("question_dismiss_turn_question_command", { turnId });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <section className="flex w-full max-w-3xl flex-col gap-3 rounded-lg border border-neutral-800 p-4 text-left">
       <div>
@@ -734,27 +813,84 @@ function ConversationTimelineView() {
           <p className="text-xs text-neutral-500">Aguardando transcrições...</p>
         ) : (
           <ol className="flex flex-col gap-3">
-            {utterances.map((utterance) => (
-              <li key={utterance.id} className="grid grid-cols-[4.5rem_1fr] gap-3 text-sm">
-                <div className="text-xs text-neutral-500">
-                  <p>{formatTimelineTime(utterance.started_at)}</p>
-                  <p>{sourceLabel(utterance.source)}</p>
-                  {!utterance.finalized_at && <p className="text-emerald-400">aberto</p>}
-                </div>
-                <div>
-                  <p className="text-xs font-medium text-neutral-300">{speakerLabel(utterance.speaker)}</p>
-                  <p className="text-neutral-100">
-                    {utterance.text || <span className="text-neutral-500">...</span>}
-                  </p>
-                  {showSegments && utterance.segments.length > 0 && (
-                    <details className="mt-1 text-xs text-neutral-500">
-                      <summary className="cursor-pointer">Segmentos internos</summary>
-                      <p className="mt-1 font-mono">{utterance.segments.join(", ")}</p>
-                    </details>
-                  )}
-                </div>
-              </li>
-            ))}
+            {utterances.map((utterance) => {
+              const turn = turns.find((candidate) => candidate.utterances.includes(utterance.id));
+              const detection = turn ? questionDetections[turn.id] : undefined;
+              const usesUtterance = detection?.utterance_ids.includes(utterance.id) ?? false;
+              const isConfirmedQuestion = usesUtterance && detection?.status === "confirmed";
+              const isCandidateQuestion = usesUtterance && detection?.status === "candidate";
+
+              return (
+                <li
+                  key={utterance.id}
+                  className={`grid grid-cols-[4.5rem_1fr] gap-3 rounded p-2 text-sm ${
+                    isConfirmedQuestion
+                      ? "border border-emerald-700 bg-emerald-950/25"
+                      : isCandidateQuestion
+                        ? "border border-amber-800 bg-amber-950/20"
+                        : ""
+                  }`}
+                >
+                  <div className="text-xs text-neutral-500">
+                    <p>{formatTimelineTime(utterance.started_at)}</p>
+                    <p>{sourceLabel(utterance.source)}</p>
+                    {!utterance.finalized_at && <p className="text-emerald-400">aberto</p>}
+                  </div>
+                  <div>
+                    <p className="text-xs font-medium text-neutral-300">{speakerLabel(utterance.speaker)}</p>
+                    <p className="whitespace-pre-wrap text-neutral-100">
+                      {isConfirmedQuestion && detection?.question_text
+                        ? detection.question_text
+                        : utterance.text || <span className="text-neutral-500">...</span>}
+                    </p>
+                    {isCandidateQuestion && (
+                      <p className="mt-1 text-xs font-medium text-amber-300">Analisando possível pergunta...</p>
+                    )}
+                    {isConfirmedQuestion && (
+                      <p className="mt-1 text-xs font-medium text-emerald-300">Pergunta detectada</p>
+                    )}
+                    {showSegments && detection && usesUtterance && (
+                      <details className="mt-2 text-xs text-neutral-500">
+                        <summary className="cursor-pointer">Diagnóstico da pergunta</summary>
+                        <div className="mt-1 flex flex-col gap-1 font-mono">
+                          <p>turn_id: {detection.turn_id}</p>
+                          <p>status: {detection.status}</p>
+                          <p>confidence: {Math.round(detection.confidence * 100)}%</p>
+                          <p>utterances: {detection.utterance_ids.join(", ")}</p>
+                          <p>normalized: {detection.normalized_text}</p>
+                          <p>reason: {detection.status_reason}</p>
+                          <p>signals: {detection.matched_signals.map(signalLabel).join(" | ")}</p>
+                        </div>
+                      </details>
+                    )}
+                    {showSegments && turn && (
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => markAsQuestion(turn.id)}
+                          className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+                        >
+                          Marcar como pergunta
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => dismissQuestion(turn.id)}
+                          className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
+                        >
+                          Desconsiderar pergunta
+                        </button>
+                      </div>
+                    )}
+                    {showSegments && utterance.segments.length > 0 && (
+                      <details className="mt-1 text-xs text-neutral-500">
+                        <summary className="cursor-pointer">Segmentos internos</summary>
+                        <p className="mt-1 font-mono">{utterance.segments.join(", ")}</p>
+                      </details>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
           </ol>
         )}
       </div>

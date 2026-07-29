@@ -1,60 +1,53 @@
 # Helppye
 
 Real-time meeting copilot. Tauri 2 (Rust core) + React/TypeScript frontend,
-local-first: local audio capture and local transcription, with local LLM integration
+local-first: local audio capture, local transcription, local LLM integration
 planned for a later phase.
 
 ## Status
 
-Audio capture and local transcription foundations are implemented:
+Audio capture and local transcription foundations implemented:
 
 - Microphone capture via `cpal`.
 - Windows system-output capture via WASAPI Loopback.
-- VAD, speech segmentation, and bounded transcription queue.
+- VAD, speech segmentation, bounded transcription queue.
 - Local Whisper transcription through `whisper-rs`.
-- Guided download/verification of the default Whisper Base Multilingual model.
-- Conversation Timeline with utterance and turn assembly: raw transcript segments are
-  consolidated into readable utterances and speaker-held conversation turns while
-  preserving source, speaker role, timestamps, utterance IDs, and segment IDs for
-  diagnostics.
+- Guided download/verification default Whisper Base Multilingual model.
+- Conversation Timeline utterance/turn assembly preserving source, speaker role,
+  timestamps, utterance IDs, segment IDs, and diagnostics.
+- Rule-based local question detection for `OtherPerson` turns from system output,
+  with candidate/updated/confirmed/dismissed frontend events and visual highlight.
 
-Question detection, answer overlay, Ollama integration, and persistent conversation
-history are not implemented yet.
+Answer overlay, Ollama integration, and persistent conversation history are not
+implemented yet.
 
 ## Stack
 
 - Tauri 2, stable Rust, Tokio
 - React 18, TypeScript (strict), Vite, Tailwind CSS, Zustand
-- `whisper-rs` / whisper.cpp for local speech-to-text
+- `whisper-rs` / whisper.cpp local speech-to-text
 - Ollama and SQLite planned, not implemented yet
 - `tracing` structured logging
 
 ## Layout
 
 - `src/` — React/TypeScript frontend
-- `src-tauri/` — Rust core (Tauri commands, audio pipeline, transcription, model
-  manager, conversation timeline)
-- `docs/` — architecture audit, design notes, roadmap
+- `src-tauri/` — Rust core (Tauri commands, audio pipeline, transcription,
+  model manager, conversation timeline, question detection)
+- `docs/` — architecture audit, design notes, roadmap, including
+  `docs/question-detection.md`
 - `prompts/` — LLM prompt templates (added in Ollama integration phase)
-- `tests/` — cross-cutting/integration tests; Rust unit tests live alongside modules
-  under `src-tauri/src`
+- `tests/` — cross-cutting/integration tests; Rust unit tests live alongside
+  modules under `src-tauri/src`
 
-## Relationship With Meetily
+## Relationship Meetily
 
-`meetily/` (sibling directory, not part of the package) is a reference-only clone of
-Zackriya Solutions' Meetily project (MIT licensed), used exclusively for architecture
-research. See `docs/meetily-audio-audit.md` for the full audit and
-`docs/third-party-components.md` for anything adapted from it, with attribution tracked
-in `NOTICE`.
+`meetily/` (sibling directory, not part of the package) is a reference-only clone
+of Zackriya Solutions' Meetily project (MIT licensed), used exclusively for
+architecture research. See `docs/meetily-audio-audit.md`,
+`docs/third-party-components.md`, and `NOTICE`.
 
-## Development
-
-```bash
-npm install
-npm run tauri dev # requires a working Rust toolchain
-```
-
-Common validation commands:
+## Validation
 
 ```bash
 cd src-tauri

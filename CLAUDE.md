@@ -8,9 +8,10 @@ local-first: transcrição local, LLM local via Ollama, sem dependência de nuve
 Fundação de áudio e transcrição local implementada. A captura de microfone, a captura de
 saída do sistema no Windows via WASAPI Loopback, o pipeline de VAD/segmentação e a
 transcrição local com Whisper Base Multilíngue já existem. A camada atual em construção é
-a **Conversation Timeline**, responsável por organizar transcrições em uma linha do tempo
-única preservando ordem, origem (usuário/outra pessoa) e timestamps. Detecção de
-perguntas, overlay de resposta e integração com LLM/Ollama ainda **não** estão
+  a **Conversation Timeline**, responsável por organizar transcrições em uma linha do tempo
+única preservando ordem, origem (usuário/outra pessoa) e timestamps. A primeira
+detecção local de perguntas por regras já existe para turnos da outra pessoa vindos da
+saída do sistema. Overlay de resposta e integração com LLM/Ollama ainda **não** estão
 implementados.
 
 ## Stack
@@ -137,9 +138,23 @@ Eventos emitidos via `conversation://timeline-event`:
 
 Os timestamps dos segmentos são convertidos pelo `CaptureEngine` para um relógio
 monotônico comum do processo antes de entrar na fila de transcrição, para que falas de
-microfone e saída do sistema sejam comparáveis na mesma linha do tempo. O futuro
-`QuestionDetector` deve consumir `ConversationTurn`, não `AudioFrame`, `AudioSegment` ou
+microfone e saída do sistema sejam comparáveis na mesma linha do tempo. O
+`QuestionDetector` consome `ConversationTurn`, não `AudioFrame`, `AudioSegment` ou
 eventos brutos de transcrição.
+
+## Detecção de perguntas (`src-tauri/src/question_detection.rs`)
+
+O primeiro `QuestionDetector` implementado é `RuleBasedQuestionDetector`, local e
+determinístico. Ele roda somente sobre `ConversationTurn` elegível
+(`speaker = OtherPerson`, `source = SystemOutput`) e emite eventos independentes via
+`question://detection-event`: `candidate`, `updated`, `confirmed` e `dismissed`.
+
+O detector combina sinais de pontuação, termos interrogativos, construções dirigidas ao
+usuário e padrões comuns de entrevista. Ele também aplica penalidades para casos como
+"como disse" e cláusulas declarativas contendo "por que". Turnos abertos são analisados
+em `TurnUpdated` com debounce inicial de 800 ms; `TurnFinalized` pode confirmar a
+detecção pendente. Não há geração automática de resposta nesta fase. Ver
+`docs/question-detection.md`.
 
 ## Relação com o Meetily
 

@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
 use crate::audio::types::{AudioCaptureEvent, AudioSource};
+use crate::question_detection::{process_conversation_events, QuestionDetectionState};
 use crate::transcription::types::{Transcript, TranscriptEvent};
 
 pub const CONVERSATION_TIMELINE_EVENT: &str = "conversation://timeline-event";
@@ -39,9 +40,26 @@ impl From<AudioSource> for ConversationSpeaker {
 #[serde(transparent)]
 pub struct UtteranceId(u64);
 
+impl UtteranceId {
+    #[cfg(test)]
+    pub(crate) fn from_raw(value: u64) -> Self {
+        UtteranceId(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct TurnId(u64);
+
+impl TurnId {
+    pub(crate) fn from_raw(value: u64) -> Self {
+        TurnId(value)
+    }
+
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TranscriptSegment {
@@ -697,8 +715,11 @@ pub async fn conversation_timeline_snapshot_command(
 pub async fn conversation_flush_turns_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
+    question_state: State<'_, Arc<QuestionDetectionState>>,
 ) -> Result<(), String> {
-    emit_conversation_events(&app, state.0.flush());
+    let events = state.0.flush();
+    emit_conversation_events(&app, events.clone());
+    process_conversation_events(&app, question_state.inner().clone(), &events);
     Ok(())
 }
 
@@ -706,8 +727,11 @@ pub async fn conversation_flush_turns_command(
 pub async fn conversation_end_session_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
+    question_state: State<'_, Arc<QuestionDetectionState>>,
 ) -> Result<(), String> {
-    emit_conversation_events(&app, state.0.end_session());
+    let events = state.0.end_session();
+    emit_conversation_events(&app, events.clone());
+    process_conversation_events(&app, question_state.inner().clone(), &events);
     Ok(())
 }
 
