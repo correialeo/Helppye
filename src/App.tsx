@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { questionRenderStateForUtterance } from "./questionDetectionViewModel";
+import {
+  applyResponseSuggestionEvent,
+  type ResponseSuggestionEventRef,
+  type SuggestionState,
+} from "./responseSuggestionViewModel";
 
 type ModelInstallState =
   | { state: "not_installed" }
@@ -320,70 +324,15 @@ type ConversationTimelineEvent =
     }
   | { type: "utterance_finalized"; turn_id: number; utterance: ConversationUtterance };
 
-type QuestionDetectionStatus = "candidate" | "confirmed" | "dismissed";
-type QuestionDetectionDecision =
-  | "ineligible_source"
-  | "empty_text"
-  | "below_threshold"
-  | "candidate"
-  | "confirmed"
-  | "dismissed"
-  | "duplicate"
-  | "superseded";
+type ResponseProviderKind = "ollama" | "open_ai" | "deep_seek" | "anthropic";
 
-interface QuestionSignal {
-  kind: string;
-  phrase?: string;
-  observed?: string;
-  reason?: string;
-  weight: number;
+interface ResponseProviderStatus {
+  provider: ResponseProviderKind;
+  model: string;
+  base_url: string | null;
+  requires_api_key: boolean;
+  has_api_key: boolean;
 }
-
-interface QuestionPenalty {
-  reason: string;
-  weight: number;
-}
-
-interface QuestionDetectionEvaluation {
-  turn_id: number;
-  eligible: boolean;
-  normalized_text: string;
-  candidate_text: string | null;
-  confidence: number;
-  threshold: number;
-  matched_signals: QuestionSignal[];
-  applied_penalties: QuestionPenalty[];
-  decision: QuestionDetectionDecision;
-  matched_utterance_ids: number[];
-}
-
-interface QuestionDetection {
-  id: number;
-  turn_id: number;
-  speaker: ConversationSpeaker;
-  source: AudioSourceKind;
-  detected: boolean;
-  confidence: number;
-  question_text: string | null;
-  matched_signals: QuestionSignal[];
-  applied_penalties: QuestionPenalty[];
-  detected_at: number;
-  detection_mode: "rule_based" | "semantic";
-  status: QuestionDetectionStatus;
-  normalized_text: string;
-  candidate_text: string | null;
-  threshold: number;
-  matched_utterance_ids: number[];
-  utterance_ids: number[];
-  status_reason: string;
-}
-
-type QuestionDetectionEvent =
-  | { type: "candidate"; detection: QuestionDetection }
-  | { type: "updated"; detection: QuestionDetection }
-  | { type: "confirmed"; detection: QuestionDetection }
-  | { type: "evaluated"; evaluation: QuestionDetectionEvaluation }
-  | { type: "dismissed"; detection_id: number; turn_id: number };
 
 function rmsDbfs(samples: number[]): number {
   if (samples.length === 0) return -Infinity;
@@ -692,41 +641,25 @@ function sortUtterances(utterances: ConversationUtterance[]): ConversationUttera
   );
 }
 
-function signalLabel(signal: QuestionSignal): string {
-  if (signal.phrase && signal.observed) return `${signal.kind}: ${signal.phrase} (${signal.observed})`;
-  if (signal.phrase) return `${signal.kind}: ${signal.phrase}`;
-  if (signal.reason) return `${signal.kind}: ${signal.reason}`;
-  return signal.kind;
-}
-
-function penaltyLabel(penalty: QuestionPenalty): string {
-  return `${penalty.reason}: ${penalty.weight}`;
-}
-
-function evaluationFromDetection(detection: QuestionDetection): QuestionDetectionEvaluation {
-  return {
-    turn_id: detection.turn_id,
-    eligible: detection.speaker === "other_person" && detection.source === "system_output",
-    normalized_text: detection.normalized_text,
-    candidate_text: detection.candidate_text,
-    confidence: detection.confidence,
-    threshold: detection.threshold,
-    matched_signals: detection.matched_signals,
-    applied_penalties: detection.applied_penalties,
-    decision: detection.status,
-    matched_utterance_ids: detection.matched_utterance_ids,
-  };
-}
-
-function sortQuestionEvaluations(evaluations: Record<number, QuestionDetectionEvaluation>): QuestionDetectionEvaluation[] {
-  return Object.values(evaluations).sort((a, b) => a.turn_id - b.turn_id);
+function suggestionStatusLabel(status: SuggestionState["status"]): string {
+  switch (status) {
+    case "streaming":
+      return "Gerando sugestão de resposta...";
+    case "completed":
+      return "Sugestão de resposta";
+    case "skipped":
+      return "Nenhuma resposta sugerida";
+    case "cancelled":
+      return "Sugestão cancelada";
+    case "error":
+      return "Falha ao gerar sugestão";
+  }
 }
 
 function ConversationTimelineView() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [utterances, setUtterances] = useState<ConversationUtterance[]>([]);
-  const [questionDetections, setQuestionDetections] = useState<Record<number, QuestionDetection>>({});
-  const [questionEvaluations, setQuestionEvaluations] = useState<Record<number, QuestionDetectionEvaluation>>({});
+  const [suggestions, setSuggestions] = useState<Record<number, SuggestionState>>({});
   const [error, setError] = useState<string | null>(null);
   const showSegments = import.meta.env.DEV;
 
@@ -817,54 +750,13 @@ function ConversationTimelineView() {
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<QuestionDetectionEvent>("question://detection-event", (event) => {
-      const payload = event.payload;
-      if (payload.type === "dismissed") {
-        setQuestionDetections((current) => {
-          const next = { ...current };
-          delete next[payload.turn_id];
-          return next;
-        });
-        return;
-      }
-
-      if (payload.type === "evaluated") {
-        setQuestionEvaluations((current) => ({
-          ...current,
-          [payload.evaluation.turn_id]: payload.evaluation,
-        }));
-        return;
-      }
-
-      setQuestionDetections((current) => ({
-        ...current,
-        [payload.detection.turn_id]: payload.detection,
-      }));
-      setQuestionEvaluations((current) => ({
-        ...current,
-        [payload.detection.turn_id]: evaluationFromDetection(payload.detection),
-      }));
+    const unlisten = listen<ResponseSuggestionEventRef>("response://suggestion-event", (event) => {
+      setSuggestions((current) => applyResponseSuggestionEvent(current, event.payload));
     });
     return () => {
       unlisten.then((fn) => fn());
     };
   }, []);
-
-  const markAsQuestion = async (turnId: number) => {
-    try {
-      await invoke("question_mark_turn_as_question_command", { turnId });
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
-  const dismissQuestion = async (turnId: number) => {
-    try {
-      await invoke("question_dismiss_turn_question_command", { turnId });
-    } catch (e) {
-      setError(String(e));
-    }
-  };
 
   return (
     <section className="flex w-full max-w-3xl flex-col gap-3 rounded-lg border border-neutral-800 p-4 text-left">
@@ -883,22 +775,13 @@ function ConversationTimelineView() {
         ) : (
           <ol className="flex flex-col gap-3">
             {utterances.map((utterance) => {
-              const { turn, detection, isConfirmedQuestion, isCandidateQuestion } =
-                questionRenderStateForUtterance(utterance.id, turns, questionDetections);
-              const evaluation = turn ? questionEvaluations[turn.id] : undefined;
-              const showQuestionDiagnostics = showSegments && evaluation;
+              const turn = turns.find((candidate) => candidate.utterances.includes(utterance.id));
+              const isLastUtteranceOfTurn =
+                turn !== undefined && turn.utterances[turn.utterances.length - 1] === utterance.id;
+              const suggestion = turn && isLastUtteranceOfTurn ? suggestions[turn.id] : undefined;
 
               return (
-                <li
-                  key={utterance.id}
-                  className={`grid grid-cols-[4.5rem_1fr] gap-3 rounded p-2 text-sm ${
-                    isConfirmedQuestion
-                      ? "border border-emerald-700 bg-emerald-950/25"
-                      : isCandidateQuestion
-                        ? "border border-amber-800 bg-amber-950/20"
-                        : ""
-                  }`}
-                >
+                <li key={utterance.id} className="grid grid-cols-[4.5rem_1fr] gap-3 rounded p-2 text-sm">
                   <div className="text-xs text-neutral-500">
                     <p>{formatTimelineTime(utterance.started_at)}</p>
                     <p>{sourceLabel(utterance.source)}</p>
@@ -907,56 +790,27 @@ function ConversationTimelineView() {
                   <div>
                     <p className="text-xs font-medium text-neutral-300">{speakerLabel(utterance.speaker)}</p>
                     <p className="whitespace-pre-wrap text-neutral-100">
-                      {isConfirmedQuestion && detection?.question_text
-                        ? detection.question_text
-                        : utterance.text || <span className="text-neutral-500">...</span>}
+                      {utterance.text || <span className="text-neutral-500">...</span>}
                     </p>
-                    {isCandidateQuestion && (
-                      <p className="mt-1 text-xs font-medium text-amber-300">Analisando possível pergunta...</p>
-                    )}
-                    {isConfirmedQuestion && (
-                      <p className="mt-1 text-xs font-medium text-emerald-300">Pergunta detectada</p>
-                    )}
-                    {showQuestionDiagnostics && (
-                      <details className="mt-2 text-xs text-neutral-500">
-                        <summary className="cursor-pointer">Diagnóstico da pergunta</summary>
-                        <div className="mt-1 flex flex-col gap-1 font-mono">
-                          <p>turn_id: {evaluation.turn_id}</p>
-                          <p>eligible: {String(evaluation.eligible)}</p>
-                          <p>decision: {evaluation.decision}</p>
-                          <p>confidence: {Math.round(evaluation.confidence * 100)}%</p>
-                          <p>threshold: {Math.round(evaluation.threshold * 100)}%</p>
-                          <p>utterances: {evaluation.matched_utterance_ids.join(", ")}</p>
-                          <p>candidate: {evaluation.candidate_text ?? ""}</p>
-                          <p>normalized: {evaluation.normalized_text}</p>
-                          <p>signals: {evaluation.matched_signals.map(signalLabel).join(" | ")}</p>
-                          <p>penalties: {evaluation.applied_penalties.map(penaltyLabel).join(" | ")}</p>
-                        </div>
-                      </details>
-                    )}
-                    {showSegments && turn && (
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() => markAsQuestion(turn.id)}
-                          className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
-                        >
-                          Marcar como pergunta
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => dismissQuestion(turn.id)}
-                          className="rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:bg-neutral-800"
-                        >
-                          Desconsiderar pergunta
-                        </button>
-                      </div>
-                    )}
                     {showSegments && utterance.segments.length > 0 && (
                       <details className="mt-1 text-xs text-neutral-500">
                         <summary className="cursor-pointer">Segmentos internos</summary>
                         <p className="mt-1 font-mono">{utterance.segments.join(", ")}</p>
                       </details>
+                    )}
+                    {suggestion && (
+                      <div className="mt-2 rounded border border-indigo-800 bg-indigo-950/25 p-2">
+                        <p className="text-xs font-medium text-indigo-300">
+                          {suggestionStatusLabel(suggestion.status)}
+                        </p>
+                        {(suggestion.status === "streaming" || suggestion.status === "completed") &&
+                          suggestion.text && (
+                            <p className="mt-1 whitespace-pre-wrap text-sm text-neutral-100">{suggestion.text}</p>
+                          )}
+                        {suggestion.status === "error" && suggestion.errorMessage && (
+                          <p className="mt-1 text-xs text-red-400">{suggestion.errorMessage}</p>
+                        )}
+                      </div>
                     )}
                   </div>
                 </li>
@@ -989,36 +843,6 @@ function ConversationTimelineView() {
                 </div>
               </div>
             ))}
-          </div>
-        </details>
-      )}
-
-      {showSegments && Object.keys(questionEvaluations).length > 0 && (
-        <details className="border-t border-neutral-800 pt-3 text-xs text-neutral-500" open>
-          <summary className="cursor-pointer">Avaliações do detector</summary>
-          <div className="mt-3 flex flex-col gap-2">
-            {sortQuestionEvaluations(questionEvaluations).map((evaluation) => {
-              const turn = turns.find((candidate) => candidate.id === evaluation.turn_id);
-              return (
-                <div key={evaluation.turn_id} className="rounded border border-neutral-800 p-2 font-mono">
-                  <p className="font-medium text-neutral-300">
-                    Turno {evaluation.turn_id}
-                    {turn ? ` · ${speakerLabel(turn.speaker)} · ${sourceLabel(turn.source)}` : ""}
-                  </p>
-                  <p>eligible: {String(evaluation.eligible)}</p>
-                  <p>decision: {evaluation.decision}</p>
-                  <p>
-                    confidence: {Math.round(evaluation.confidence * 100)}% / threshold:{" "}
-                    {Math.round(evaluation.threshold * 100)}%
-                  </p>
-                  <p>matched_utterances: {evaluation.matched_utterance_ids.join(", ")}</p>
-                  <p>candidate: {evaluation.candidate_text ?? ""}</p>
-                  <p>normalized: {evaluation.normalized_text}</p>
-                  <p>signals: {evaluation.matched_signals.map(signalLabel).join(" | ")}</p>
-                  <p>penalties: {evaluation.applied_penalties.map(penaltyLabel).join(" | ")}</p>
-                </div>
-              );
-            })}
           </div>
         </details>
       )}
@@ -1119,6 +943,177 @@ function AdvancedTranscriptionSettings() {
   );
 }
 
+const RESPONSE_PROVIDER_OPTIONS: { value: ResponseProviderKind; label: string }[] = [
+  { value: "ollama", label: "Ollama (local)" },
+  { value: "open_ai", label: "OpenAI" },
+  { value: "deep_seek", label: "DeepSeek" },
+  { value: "anthropic", label: "Anthropic" },
+];
+
+// Configurações → Sugestão de resposta. Provedor local (Ollama) por padrão; provedores de
+// nuvem (OpenAI/DeepSeek/Anthropic) são opt-in e guardam a API key no keychain do SO via
+// `response_set_api_key_command` — nunca em texto puro no disco.
+function ResponseProviderSettings() {
+  const [status, setStatus] = useState<ResponseProviderStatus | null>(null);
+  const [provider, setProvider] = useState<ResponseProviderKind>("ollama");
+  const [model, setModel] = useState("");
+  const [baseUrl, setBaseUrl] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshStatus = useCallback(() => {
+    invoke<ResponseProviderStatus>("response_provider_status_command")
+      .then((s) => {
+        setStatus(s);
+        setProvider(s.provider);
+        setModel(s.model);
+        setBaseUrl(s.base_url ?? "");
+        setError(null);
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    refreshStatus();
+  }, [refreshStatus]);
+
+  const saveConfig = async () => {
+    setError(null);
+    setMessage(null);
+    try {
+      await invoke("response_set_provider_config_command", {
+        provider,
+        model,
+        baseUrl: baseUrl.trim().length > 0 ? baseUrl.trim() : null,
+      });
+      setMessage("Configuração salva.");
+      refreshStatus();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const saveApiKey = async () => {
+    setError(null);
+    setMessage(null);
+    try {
+      await invoke("response_set_api_key_command", { provider, apiKey });
+      setApiKey("");
+      setMessage("API key salva no keychain do sistema.");
+      refreshStatus();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const deleteApiKey = async () => {
+    setError(null);
+    setMessage(null);
+    try {
+      await invoke("response_delete_api_key_command", { provider });
+      setMessage("API key removida.");
+      refreshStatus();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const requiresApiKey = provider !== "ollama";
+
+  return (
+    <details className="w-full max-w-md rounded-lg border border-neutral-800 p-4 text-left">
+      <summary className="cursor-pointer text-sm font-medium text-neutral-300">
+        Configurações → Sugestão de resposta
+      </summary>
+      <div className="mt-3 flex flex-col gap-2">
+        <label className="text-xs text-neutral-400">
+          Provedor
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as ResponseProviderKind)}
+            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
+          >
+            {RESPONSE_PROVIDER_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="text-xs text-neutral-400">
+          Modelo
+          <input
+            type="text"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="ex.: llama3.1, gpt-4o-mini, claude-sonnet-5..."
+            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
+          />
+        </label>
+
+        <label className="text-xs text-neutral-400">
+          URL base (opcional)
+          <input
+            type="text"
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder="padrão do provedor"
+            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
+          />
+        </label>
+
+        <button
+          type="button"
+          onClick={saveConfig}
+          disabled={model.trim().length === 0}
+          className="w-full rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
+        >
+          Salvar configuração
+        </button>
+
+        {requiresApiKey && (
+          <div className="mt-2 flex flex-col gap-2 border-t border-neutral-800 pt-2">
+            <p className="text-xs text-neutral-500">
+              API key {status?.has_api_key ? "configurada" : "não configurada"} (armazenada no keychain do
+              sistema).
+            </p>
+            <input
+              type="password"
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder="API key"
+              className="w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
+            />
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={saveApiKey}
+                disabled={apiKey.length === 0}
+                className="flex-1 rounded bg-indigo-600 px-4 py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50"
+              >
+                Salvar API key
+              </button>
+              <button
+                type="button"
+                onClick={deleteApiKey}
+                disabled={!status?.has_api_key}
+                className="flex-1 rounded border border-neutral-700 px-4 py-2 text-sm font-medium hover:bg-neutral-800 disabled:opacity-50"
+              >
+                Remover
+              </button>
+            </div>
+          </div>
+        )}
+
+        {message && <p className="text-xs text-emerald-400">{message}</p>}
+        {error && <p className="text-xs text-red-400">{error}</p>}
+      </div>
+    </details>
+  );
+}
+
 export default function App() {
   return (
     <ModelOnboardingGate>
@@ -1127,6 +1122,7 @@ export default function App() {
         <p className="text-sm text-neutral-400">Microphone + system audio capture test</p>
 
         <AdvancedTranscriptionSettings />
+        <ResponseProviderSettings />
 
         <AudioCaptureSection />
         <ConversationTimelineView />

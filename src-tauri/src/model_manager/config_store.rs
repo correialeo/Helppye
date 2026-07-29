@@ -1,7 +1,7 @@
-//! Seleção de modelo de transcrição persistida em disco. Deliberadamente separada de
-//! qualquer configuração futura de `ResponseProvider` (Ollama/OpenAI/Gemini) — a escolha
-//! de qual modelo transcreve o áudio nunca é acoplada à escolha de qual provedor gera
-//! respostas.
+//! Seleção de modelo de transcrição persistida em disco. Deliberadamente separada da
+//! configuração de `ResponseProvider` (Ollama/OpenAI/DeepSeek/Anthropic, ver
+//! `response_provider::config_store`) — a escolha de qual modelo transcreve o áudio nunca
+//! é acoplada à escolha de qual provedor gera respostas.
 
 use std::path::Path;
 

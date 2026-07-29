@@ -1,7 +1,7 @@
 mod audio;
 mod conversation;
 mod model_manager;
-mod question_detection;
+mod response_provider;
 mod transcription;
 
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
 
 use conversation::{emit_conversation_events, ConversationTimeline, ConversationTimelineState};
-use question_detection::{process_conversation_events, QuestionDetectionState};
+use response_provider::engine::process_conversation_events;
 use transcription::provider::TranscriptionProvider;
 use transcription::queue::TranscriptionQueue;
 use transcription::whisper_provider::WhisperCppProvider;
@@ -28,10 +28,11 @@ pub fn run() {
         .setup(|app| {
             let provider: Arc<dyn TranscriptionProvider> = Arc::new(WhisperCppProvider::new());
             let timeline = Arc::new(ConversationTimeline::default());
-            let question_detection = Arc::new(QuestionDetectionState::default());
+            let response_engine_state = response_provider::build(app.handle());
+            let response_engine = response_engine_state.0.clone();
             let app_handle = app.handle().clone();
             let timeline_for_queue = timeline.clone();
-            let questions_for_queue = question_detection.clone();
+            let response_engine_for_queue = response_engine.clone();
             let queue = Arc::new(TranscriptionQueue::spawn(provider.clone(), move |event| {
                 if let Err(e) = app_handle.emit(TRANSCRIPTION_EVENT, &event) {
                     tracing::warn!(%e, "failed to emit transcription event to frontend");
@@ -40,7 +41,7 @@ pub fn run() {
                 emit_conversation_events(&app_handle, conversation_events.clone());
                 process_conversation_events(
                     &app_handle,
-                    questions_for_queue.clone(),
+                    response_engine_for_queue.clone(),
                     &conversation_events,
                 );
             }));
@@ -48,11 +49,11 @@ pub fn run() {
                 app.handle(),
                 queue.clone(),
                 timeline.clone(),
-                question_detection.clone(),
+                response_engine.clone(),
             )?;
             app.manage(audio_state);
             app.manage(ConversationTimelineState(timeline));
-            app.manage(question_detection);
+            app.manage(response_engine_state);
             app.manage(TranscriptionState::new(provider.clone(), queue));
 
             let model_manager_state = model_manager::build(app.handle(), provider)?;
@@ -74,8 +75,10 @@ pub fn run() {
             conversation::conversation_flush_turns_command,
             conversation::conversation_end_session_command,
             conversation::conversation_raw_segments_command,
-            question_detection::question_mark_turn_as_question_command,
-            question_detection::question_dismiss_turn_question_command,
+            response_provider::response_provider_status_command,
+            response_provider::response_set_provider_config_command,
+            response_provider::response_set_api_key_command,
+            response_provider::response_delete_api_key_command,
             transcription::configure_transcription_command,
             transcription::transcription_diagnostics_command,
             model_manager::model_status_command,

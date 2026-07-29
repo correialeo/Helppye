@@ -1,18 +1,23 @@
 # Helppye
 
-Copiloto de reuniões em tempo real. Núcleo Tauri 2 (Rust) + frontend React/TypeScript,
-local-first: transcrição local, LLM local via Ollama, sem dependência de nuvem.
+Copiloto de reuniões em tempo real. Núcleo Tauri 2 (Rust) + frontend React/TypeScript.
+Local-first por padrão: transcrição sempre local (Whisper). A sugestão de resposta usa
+LLM local via Ollama por padrão, mas o usuário pode optar explicitamente por um provedor
+de nuvem (OpenAI, DeepSeek ou Anthropic) — nesse caso a API key fica no keychain do SO,
+nunca em texto puro no disco.
 
 ## Status
 
 Fundação de áudio e transcrição local implementada. A captura de microfone, a captura de
 saída do sistema no Windows via WASAPI Loopback, o pipeline de VAD/segmentação e a
-transcrição local com Whisper Base Multilíngue já existem. A camada atual em construção é
-  a **Conversation Timeline**, responsável por organizar transcrições em uma linha do tempo
-única preservando ordem, origem (usuário/outra pessoa) e timestamps. A primeira
-detecção local de perguntas por regras já existe para turnos da outra pessoa vindos da
-saída do sistema. Overlay de resposta e integração com LLM/Ollama ainda **não** estão
-implementados.
+transcrição local com Whisper Base Multilíngue já existem. A Conversation Timeline
+organiza transcrições em uma linha do tempo única preservando ordem, origem
+(usuário/outra pessoa) e timestamps. A camada atual em construção é a **sugestão de
+resposta em streaming** (`src-tauri/src/response_provider/`): turnos elegíveis da outra
+pessoa disparam geração de uma sugestão de resposta via LLM (Ollama/OpenAI/DeepSeek/
+Anthropic, escolhido pelo usuário), transmitida ao frontend em streaming. Substitui a
+antiga detecção de perguntas por regras, removida. Overlay de resposta dedicado (janela
+flutuante fora da timeline) ainda **não** está implementado.
 
 ## Stack
 
@@ -23,8 +28,8 @@ implementados.
 - **Transcrição local:** `whisper-rs`/whisper.cpp, CPU-only por padrão, modelo padrão
   Whisper Base Multilíngue (`ggml-base.bin`) baixado apenas após ação explícita do
   usuário.
-- **Planejado, ainda não implementado:** Ollama (LLM local), SQLite (histórico
-  persistente além das configurações JSON atuais).
+- **Planejado, ainda não implementado:** SQLite (histórico persistente além das
+  configurações JSON atuais).
 
 ## Layout
 
@@ -139,24 +144,28 @@ Eventos emitidos via `conversation://timeline-event`:
 Os timestamps dos segmentos são convertidos pelo `CaptureEngine` para um relógio
 monotônico comum do processo antes de entrar na fila de transcrição, para que falas de
 microfone e saída do sistema sejam comparáveis na mesma linha do tempo. O
-`QuestionDetector` consome `ConversationTurn`, não `AudioFrame`, `AudioSegment` ou
-eventos brutos de transcrição.
+`ResponseEngine` (`response_provider::engine::process_conversation_events`) consome
+`ConversationTurn`, não `AudioFrame`, `AudioSegment` ou eventos brutos de transcrição.
 
-## Detecção de perguntas (`src-tauri/src/question_detection.rs`)
+## Sugestão de resposta (`src-tauri/src/response_provider/`)
 
-O primeiro `QuestionDetector` implementado é `RuleBasedQuestionDetector`, local e
-determinístico. Ele roda somente sobre `ConversationTurn` elegível
-(`speaker = OtherPerson`, `source = SystemOutput`) e emite eventos independentes via
-`question://detection-event`: `candidate`, `updated`, `confirmed`, `evaluated` e
-`dismissed`.
+Substitui a antiga detecção local de perguntas por regras (`question_detection.rs`,
+removida). Em vez de apenas sinalizar que um turno da outra pessoa parece uma pergunta,
+o `ResponseEngine` gera, via LLM e em streaming, uma sugestão real de resposta. Roda
+sobre o mesmo `ConversationTurn` elegível de antes (`speaker = OtherPerson`,
+`source = SystemOutput`), disparando geração em `UtteranceFinalized` (não é preciso
+esperar o turno inteiro terminar). Uma nova utterance no mesmo turno cancela e substitui
+a geração em andamento, para nunca sugerir resposta a uma fala que ainda não terminou.
 
-O detector combina sinais de pontuação, termos interrogativos, construções dirigidas ao
-usuário, perguntas de sim/não dirigidas ao usuário, fragmentos comportamentais e padrões
-comuns de entrevista. Ele também aplica penalidades para casos como "como disse" e
-cláusulas declarativas contendo "por que". Turnos abertos são analisados em `TurnUpdated`
-com debounce inicial de 800 ms; `TurnFinalized` reexecuta o detector e pode confirmar
-imediatamente a detecção final. Não há geração automática de resposta nesta fase. Ver
-`docs/question-detection.md`.
+O usuário escolhe o provedor de LLM: Ollama local (padrão) ou um provedor de nuvem
+(OpenAI, DeepSeek, Anthropic). A mesma chamada que gera a resposta também decide se deve
+responder, via um marcador `[SKIP]` no início do stream quando a fala não exige resposta
+— sem uma segunda chamada de classificação. API keys de provedores de nuvem ficam no
+keychain do SO via crate `keyring`, nunca em texto puro no disco. Eventos emitidos via
+`response://suggestion-event`: `started`, `delta`, `completed`, `skipped`, `cancelled` e
+`error`, todos carregando `turn_id` e `generation_id` para o frontend descartar eventos
+de uma geração já superada. Ver `docs/response-suggestion.md` para a arquitetura
+completa, módulo por módulo.
 
 ## Relação com o Meetily
 

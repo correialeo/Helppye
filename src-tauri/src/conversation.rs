@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
 use crate::audio::types::{AudioCaptureEvent, AudioSource};
-use crate::question_detection::{process_conversation_events, QuestionDetectionState};
+use crate::response_provider::engine::process_conversation_events;
+use crate::response_provider::ResponseEngineState;
 use crate::transcription::types::{Transcript, TranscriptEvent};
 
 pub const CONVERSATION_TIMELINE_EVENT: &str = "conversation://timeline-event";
@@ -52,6 +53,7 @@ impl UtteranceId {
 pub struct TurnId(u64);
 
 impl TurnId {
+    #[cfg(test)]
     pub(crate) fn from_raw(value: u64) -> Self {
         TurnId(value)
     }
@@ -715,11 +717,11 @@ pub async fn conversation_timeline_snapshot_command(
 pub async fn conversation_flush_turns_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
-    question_state: State<'_, Arc<QuestionDetectionState>>,
+    response_state: State<'_, ResponseEngineState>,
 ) -> Result<(), String> {
     let events = state.0.flush();
     emit_conversation_events(&app, events.clone());
-    process_conversation_events(&app, question_state.inner().clone(), &events);
+    process_conversation_events(&app, response_state.0.clone(), &events);
     Ok(())
 }
 
@@ -727,11 +729,11 @@ pub async fn conversation_flush_turns_command(
 pub async fn conversation_end_session_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
-    question_state: State<'_, Arc<QuestionDetectionState>>,
+    response_state: State<'_, ResponseEngineState>,
 ) -> Result<(), String> {
     let events = state.0.end_session();
     emit_conversation_events(&app, events.clone());
-    process_conversation_events(&app, question_state.inner().clone(), &events);
+    process_conversation_events(&app, response_state.0.clone(), &events);
     Ok(())
 }
 
