@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
 
-use conversation::{emit_turn_events, ConversationTimeline, ConversationTimelineState};
+use conversation::{emit_conversation_events, ConversationTimeline, ConversationTimelineState};
 use transcription::provider::TranscriptionProvider;
 use transcription::queue::TranscriptionQueue;
 use transcription::whisper_provider::WhisperCppProvider;
@@ -32,7 +32,7 @@ pub fn run() {
                 if let Err(e) = app_handle.emit(TRANSCRIPTION_EVENT, &event) {
                     tracing::warn!(%e, "failed to emit transcription event to frontend");
                 }
-                emit_turn_events(
+                emit_conversation_events(
                     &app_handle,
                     timeline_for_queue.ingest_transcript_event(event),
                 );

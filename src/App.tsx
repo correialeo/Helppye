@@ -272,16 +272,43 @@ interface ConversationTurn {
   source: AudioSourceKind;
   speaker: ConversationSpeaker;
   text: string;
+  utterances: number[];
+  started_at: number;
+  ended_at: number;
+  finalized_at: number | null;
+}
+
+interface ConversationUtterance {
+  id: number;
+  source: AudioSourceKind;
+  speaker: ConversationSpeaker;
+  text: string;
   segments: number[];
   started_at: number;
   ended_at: number;
   finalized_at: number | null;
 }
 
-type TurnEvent =
-  | { type: "started"; turn_id: number; speaker: ConversationSpeaker; source: AudioSourceKind; started_at: number }
+interface ConversationTimelineSnapshot {
+  turns: ConversationTurn[];
+  utterances: ConversationUtterance[];
+}
+
+type ConversationTimelineEvent =
+  | { type: "turn_started"; turn_id: number; speaker: ConversationSpeaker; source: AudioSourceKind; started_at: number }
+  | { type: "turn_updated"; turn: ConversationTurn }
+  | { type: "turn_finalized"; turn: ConversationTurn }
   | {
-      type: "updated";
+      type: "utterance_started";
+      utterance_id: number;
+      turn_id: number;
+      speaker: ConversationSpeaker;
+      source: AudioSourceKind;
+      started_at: number;
+    }
+  | {
+      type: "utterance_updated";
+      utterance_id: number;
       turn_id: number;
       speaker: ConversationSpeaker;
       source: AudioSourceKind;
@@ -290,7 +317,7 @@ type TurnEvent =
       ended_at: number;
       segments: number[];
     }
-  | { type: "finalized"; turn: ConversationTurn };
+  | { type: "utterance_finalized"; turn_id: number; utterance: ConversationUtterance };
 
 function rmsDbfs(samples: number[]): number {
   if (samples.length === 0) return -Infinity;
@@ -590,27 +617,64 @@ function sortTurns(turns: ConversationTurn[]): ConversationTurn[] {
   );
 }
 
+function sortUtterances(utterances: ConversationUtterance[]): ConversationUtterance[] {
+  return [...utterances].sort(
+    (a, b) =>
+      a.started_at - b.started_at ||
+      a.ended_at - b.ended_at ||
+      a.id - b.id,
+  );
+}
+
 function ConversationTimelineView() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
+  const [utterances, setUtterances] = useState<ConversationUtterance[]>([]);
   const [error, setError] = useState<string | null>(null);
   const showSegments = import.meta.env.DEV;
 
   useEffect(() => {
-    invoke<ConversationTurn[]>("conversation_timeline_snapshot_command")
+    invoke<ConversationTimelineSnapshot>("conversation_timeline_snapshot_command")
       .then((snapshot) => {
-        setTurns(sortTurns(snapshot));
+        setTurns(sortTurns(snapshot.turns));
+        setUtterances(sortUtterances(snapshot.utterances));
         setError(null);
       })
       .catch((e) => setError(String(e)));
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<TurnEvent>("conversation://timeline-event", (event) => {
+    const unlisten = listen<ConversationTimelineEvent>("conversation://timeline-event", (event) => {
       const payload = event.payload;
-      setTurns((current) => {
-        if (payload.type === "started") {
+      if (payload.type === "turn_started") {
+        setTurns((current) => {
           const nextTurn: ConversationTurn = {
             id: payload.turn_id,
+            speaker: payload.speaker,
+            source: payload.source,
+            text: "",
+            utterances: [],
+            started_at: payload.started_at,
+            ended_at: payload.started_at,
+            finalized_at: null,
+          };
+          const withoutDuplicate = current.filter((turn) => turn.id !== nextTurn.id);
+          return sortTurns([...withoutDuplicate, nextTurn]);
+        });
+        return;
+      }
+
+      if (payload.type === "turn_updated" || payload.type === "turn_finalized") {
+        setTurns((current) => {
+          const withoutDuplicate = current.filter((turn) => turn.id !== payload.turn.id);
+          return sortTurns([...withoutDuplicate, payload.turn]);
+        });
+        return;
+      }
+
+      if (payload.type === "utterance_started") {
+        setUtterances((current) => {
+          const nextUtterance: ConversationUtterance = {
+            id: payload.utterance_id,
             speaker: payload.speaker,
             source: payload.source,
             text: "",
@@ -619,14 +683,17 @@ function ConversationTimelineView() {
             ended_at: payload.started_at,
             finalized_at: null,
           };
-          const withoutDuplicate = current.filter((turn) => turn.id !== nextTurn.id);
-          return sortTurns([...withoutDuplicate, nextTurn]);
-        }
+          const withoutDuplicate = current.filter((utterance) => utterance.id !== nextUtterance.id);
+          return sortUtterances([...withoutDuplicate, nextUtterance]);
+        });
+        return;
+      }
 
-        if (payload.type === "updated") {
-          const existing = current.find((turn) => turn.id === payload.turn_id);
-          const nextTurn: ConversationTurn = {
-            id: payload.turn_id,
+      if (payload.type === "utterance_updated") {
+        setUtterances((current) => {
+          const existing = current.find((utterance) => utterance.id === payload.utterance_id);
+          const nextUtterance: ConversationUtterance = {
+            id: payload.utterance_id,
             speaker: existing?.speaker ?? payload.speaker,
             source: existing?.source ?? payload.source,
             text: payload.text,
@@ -635,12 +702,15 @@ function ConversationTimelineView() {
             ended_at: payload.ended_at,
             finalized_at: existing?.finalized_at ?? null,
           };
-          const withoutDuplicate = current.filter((turn) => turn.id !== nextTurn.id);
-          return sortTurns([...withoutDuplicate, nextTurn]);
-        }
+          const withoutDuplicate = current.filter((utterance) => utterance.id !== nextUtterance.id);
+          return sortUtterances([...withoutDuplicate, nextUtterance]);
+        });
+        return;
+      }
 
-        const withoutDuplicate = current.filter((turn) => turn.id !== payload.turn.id);
-        return sortTurns([...withoutDuplicate, payload.turn]);
+      setUtterances((current) => {
+        const withoutDuplicate = current.filter((utterance) => utterance.id !== payload.utterance.id);
+        return sortUtterances([...withoutDuplicate, payload.utterance]);
       });
     });
     return () => {
@@ -652,32 +722,34 @@ function ConversationTimelineView() {
     <section className="flex w-full max-w-3xl flex-col gap-3 rounded-lg border border-neutral-800 p-4 text-left">
       <div>
         <h2 className="text-base font-semibold">Timeline da conversa</h2>
-        <p className="text-xs text-neutral-500">{turns.length} turnos de fala</p>
+        <p className="text-xs text-neutral-500">
+          {utterances.length} blocos · {turns.length} turnos
+        </p>
       </div>
 
       {error && <p className="text-xs text-red-400">Erro ao carregar timeline: {error}</p>}
 
       <div className="max-h-72 min-h-24 overflow-y-auto border-t border-neutral-800 pt-3">
-        {turns.length === 0 ? (
+        {utterances.length === 0 ? (
           <p className="text-xs text-neutral-500">Aguardando transcrições...</p>
         ) : (
           <ol className="flex flex-col gap-3">
-            {turns.map((turn) => (
-              <li key={turn.id} className="grid grid-cols-[4.5rem_1fr] gap-3 text-sm">
+            {utterances.map((utterance) => (
+              <li key={utterance.id} className="grid grid-cols-[4.5rem_1fr] gap-3 text-sm">
                 <div className="text-xs text-neutral-500">
-                  <p>{formatTimelineTime(turn.started_at)}</p>
-                  <p>{sourceLabel(turn.source)}</p>
-                  {!turn.finalized_at && <p className="text-emerald-400">aberto</p>}
+                  <p>{formatTimelineTime(utterance.started_at)}</p>
+                  <p>{sourceLabel(utterance.source)}</p>
+                  {!utterance.finalized_at && <p className="text-emerald-400">aberto</p>}
                 </div>
                 <div>
-                  <p className="text-xs font-medium text-neutral-300">{speakerLabel(turn.speaker)}</p>
+                  <p className="text-xs font-medium text-neutral-300">{speakerLabel(utterance.speaker)}</p>
                   <p className="text-neutral-100">
-                    {turn.text || <span className="text-neutral-500">...</span>}
+                    {utterance.text || <span className="text-neutral-500">...</span>}
                   </p>
-                  {showSegments && turn.segments.length > 0 && (
+                  {showSegments && utterance.segments.length > 0 && (
                     <details className="mt-1 text-xs text-neutral-500">
                       <summary className="cursor-pointer">Segmentos internos</summary>
-                      <p className="mt-1 font-mono">{turn.segments.join(", ")}</p>
+                      <p className="mt-1 font-mono">{utterance.segments.join(", ")}</p>
                     </details>
                   )}
                 </div>
@@ -686,6 +758,33 @@ function ConversationTimelineView() {
           </ol>
         )}
       </div>
+
+      {showSegments && turns.length > 0 && (
+        <details className="border-t border-neutral-800 pt-3 text-xs text-neutral-500">
+          <summary className="cursor-pointer">Turnos consolidados</summary>
+          <div className="mt-3 flex flex-col gap-3">
+            {turns.map((turn) => (
+              <div key={turn.id} className="rounded border border-neutral-800 p-2">
+                <p className="font-medium text-neutral-300">
+                  Turno {turn.id} · {speakerLabel(turn.speaker)} · {turn.utterances.length} blocos
+                </p>
+                <p className="mt-1 text-neutral-400">{turn.text}</p>
+                <div className="mt-2 flex flex-col gap-1">
+                  {turn.utterances.map((utteranceId) => {
+                    const utterance = utterances.find((u) => u.id === utteranceId);
+                    return (
+                      <p key={utteranceId} className="font-mono">
+                        └─ Utterance {utteranceId}
+                        {utterance ? ` · segments: ${utterance.segments.join(", ")}` : ""}
+                      </p>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
     </section>
   );
 }

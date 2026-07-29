@@ -23,7 +23,7 @@ use pipeline::MicrophoneCaptureProvider;
 use platform::SystemAudioProvider;
 use types::{AudioDevice, AudioSource};
 
-use crate::conversation::{emit_turn_events, ConversationTimeline};
+use crate::conversation::{emit_conversation_events, ConversationTimeline};
 use crate::transcription::queue::TranscriptionQueue;
 
 const CAPTURE_EVENT: &str = "audio://capture-event";
@@ -59,7 +59,7 @@ pub fn build(
             if let Err(e) = app_handle.emit(CAPTURE_EVENT, &event) {
                 tracing::warn!(%e, "failed to emit audio capture event to frontend");
             }
-            emit_turn_events(
+            emit_conversation_events(
                 &app_handle_for_timeline,
                 conversation_timeline.ingest_capture_event(&event),
             );
