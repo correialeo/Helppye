@@ -718,6 +718,10 @@ function evaluationFromDetection(detection: QuestionDetection): QuestionDetectio
   };
 }
 
+function sortQuestionEvaluations(evaluations: Record<number, QuestionDetectionEvaluation>): QuestionDetectionEvaluation[] {
+  return Object.values(evaluations).sort((a, b) => a.turn_id - b.turn_id);
+}
+
 function ConversationTimelineView() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [utterances, setUtterances] = useState<ConversationUtterance[]>([]);
@@ -882,7 +886,7 @@ function ConversationTimelineView() {
               const { turn, detection, isConfirmedQuestion, isCandidateQuestion } =
                 questionRenderStateForUtterance(utterance.id, turns, questionDetections);
               const evaluation = turn ? questionEvaluations[turn.id] : undefined;
-              const showQuestionDiagnostics = showSegments && turn?.speaker === "other_person" && evaluation;
+              const showQuestionDiagnostics = showSegments && evaluation;
 
               return (
                 <li
@@ -985,6 +989,36 @@ function ConversationTimelineView() {
                 </div>
               </div>
             ))}
+          </div>
+        </details>
+      )}
+
+      {showSegments && Object.keys(questionEvaluations).length > 0 && (
+        <details className="border-t border-neutral-800 pt-3 text-xs text-neutral-500" open>
+          <summary className="cursor-pointer">Avaliações do detector</summary>
+          <div className="mt-3 flex flex-col gap-2">
+            {sortQuestionEvaluations(questionEvaluations).map((evaluation) => {
+              const turn = turns.find((candidate) => candidate.id === evaluation.turn_id);
+              return (
+                <div key={evaluation.turn_id} className="rounded border border-neutral-800 p-2 font-mono">
+                  <p className="font-medium text-neutral-300">
+                    Turno {evaluation.turn_id}
+                    {turn ? ` · ${speakerLabel(turn.speaker)} · ${sourceLabel(turn.source)}` : ""}
+                  </p>
+                  <p>eligible: {String(evaluation.eligible)}</p>
+                  <p>decision: {evaluation.decision}</p>
+                  <p>
+                    confidence: {Math.round(evaluation.confidence * 100)}% / threshold:{" "}
+                    {Math.round(evaluation.threshold * 100)}%
+                  </p>
+                  <p>matched_utterances: {evaluation.matched_utterance_ids.join(", ")}</p>
+                  <p>candidate: {evaluation.candidate_text ?? ""}</p>
+                  <p>normalized: {evaluation.normalized_text}</p>
+                  <p>signals: {evaluation.matched_signals.map(signalLabel).join(" | ")}</p>
+                  <p>penalties: {evaluation.applied_penalties.map(penaltyLabel).join(" | ")}</p>
+                </div>
+              );
+            })}
           </div>
         </details>
       )}
