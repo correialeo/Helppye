@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
@@ -62,6 +63,7 @@ pub struct CaptureEngine {
     selected: AsyncMutex<DeviceSelectionConfig>,
     config_path: PathBuf,
     transcription_queue: Arc<TranscriptionQueue>,
+    timeline_origin: Instant,
     emit: CaptureEventSink,
 }
 
@@ -82,6 +84,7 @@ impl CaptureEngine {
             selected: AsyncMutex::new(initial_selection),
             config_path,
             transcription_queue,
+            timeline_origin: Instant::now(),
             emit,
         }
     }
@@ -204,6 +207,7 @@ impl CaptureEngine {
             .await?;
 
         let session_id = category.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let session_timeline_offset_ms = self.timeline_origin.elapsed().as_millis() as u64;
         let engine = self.clone();
         let emit = self.emit.clone();
         let transcription_queue = self.transcription_queue.clone();
@@ -216,7 +220,9 @@ impl CaptureEngine {
                 if let AudioCaptureEvent::Frame(ref frame) = event {
                     for speech_event in segmenter.push_samples(&frame.samples) {
                         if let SpeechEvent::SegmentReady(segment) = speech_event {
-                            transcription_queue.try_enqueue(segment);
+                            transcription_queue.try_enqueue(
+                                segment.with_timestamp_offset(session_timeline_offset_ms),
+                            );
                         }
                     }
                 }

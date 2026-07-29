@@ -265,18 +265,22 @@ type AudioCaptureEvent =
   | { type: "error"; source: AudioSourceKind; message: string }
   | { type: "stopped"; source: AudioSourceKind };
 
-type TranscriptEvent =
-  | {
-      type: "ready";
-      segment_id: number;
-      source: AudioSourceKind;
-      text: string;
-      language: string | null;
-      started_at: number;
-      ended_at: number;
-      processing_time_ms: number;
-    }
-  | { type: "failed"; segment_id: number; source: AudioSourceKind; message: string };
+type ConversationSpeaker = "user" | "other_person";
+
+interface ConversationTimelineItem {
+  id: number;
+  segment_id: number;
+  source: AudioSourceKind;
+  speaker: ConversationSpeaker;
+  text: string;
+  language: string | null;
+  started_at: number;
+  ended_at: number;
+  processing_time_ms: number;
+  received_sequence: number;
+}
+
+type ConversationTimelineEvent = { type: "item_added"; item: ConversationTimelineItem };
 
 function rmsDbfs(samples: number[]): number {
   if (samples.length === 0) return -Infinity;
@@ -376,8 +380,6 @@ function DeviceCapturePanel({
   const [status, setStatus] = useState<PanelStatus>({ kind: "parado" });
   const [levelDb, setLevelDb] = useState(-Infinity);
   const [frameCount, setFrameCount] = useState(0);
-  const [transcript, setTranscript] = useState("");
-  const [transcriptError, setTranscriptError] = useState<string | null>(null);
   const [suggestedDevice, setSuggestedDevice] = useState<ResolvedDevice | null>(null);
   const levelDecayTimer = useRef<number | null>(null);
   const switchingRef = useRef(false);
@@ -435,25 +437,6 @@ function DeviceCapturePanel({
       unlisten.then((fn) => fn());
     };
   }, [config.source, refreshDevices]);
-
-  useEffect(() => {
-    const unlisten = listen<TranscriptEvent>("transcription://event", (event) => {
-      const payload = event.payload;
-      if (payload.source !== config.source) return;
-
-      if (payload.type === "ready") {
-        setTranscriptError(null);
-        if (payload.text.length > 0) {
-          setTranscript((t) => (t.length > 0 ? `${t} ${payload.text}` : payload.text));
-        }
-      } else {
-        setTranscriptError(payload.message);
-      }
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [config.source]);
 
   const handleSelectDevice = async (deviceId: string) => {
     const wasCapturing = status.kind === "capturando";
@@ -569,12 +552,88 @@ function DeviceCapturePanel({
         </div>
       )}
 
-      <div className="w-full text-left">
-        <p className="mb-1 text-xs font-medium text-neutral-300">Transcrição</p>
-        <p className="max-h-32 min-h-12 overflow-y-auto rounded border border-neutral-700 p-2 text-xs text-neutral-200">
-          {transcript || <span className="text-neutral-500">Aguardando fala...</span>}
-        </p>
-        {transcriptError && <p className="mt-1 text-xs text-red-400">{transcriptError}</p>}
+    </section>
+  );
+}
+
+function formatTimelineTime(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function speakerLabel(speaker: ConversationSpeaker): string {
+  return speaker === "user" ? "Você" : "Outra pessoa";
+}
+
+function sourceLabel(source: AudioSourceKind): string {
+  return source === "microphone" ? "Entrada" : "Saída";
+}
+
+function sortTimeline(items: ConversationTimelineItem[]): ConversationTimelineItem[] {
+  return [...items].sort(
+    (a, b) =>
+      a.started_at - b.started_at ||
+      a.ended_at - b.ended_at ||
+      a.received_sequence - b.received_sequence,
+  );
+}
+
+function ConversationTimelineView() {
+  const [items, setItems] = useState<ConversationTimelineItem[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<ConversationTimelineItem[]>("conversation_timeline_snapshot_command")
+      .then((snapshot) => {
+        setItems(sortTimeline(snapshot));
+        setError(null);
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<ConversationTimelineEvent>("conversation://timeline-event", (event) => {
+      if (event.payload.type !== "item_added") return;
+      setItems((current) => {
+        const withoutDuplicate = current.filter((item) => item.id !== event.payload.item.id);
+        return sortTimeline([...withoutDuplicate, event.payload.item]);
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  return (
+    <section className="flex w-full max-w-3xl flex-col gap-3 rounded-lg border border-neutral-800 p-4 text-left">
+      <div>
+        <h2 className="text-base font-semibold">Timeline da conversa</h2>
+        <p className="text-xs text-neutral-500">{items.length} trechos transcritos</p>
+      </div>
+
+      {error && <p className="text-xs text-red-400">Erro ao carregar timeline: {error}</p>}
+
+      <div className="max-h-72 min-h-24 overflow-y-auto border-t border-neutral-800 pt-3">
+        {items.length === 0 ? (
+          <p className="text-xs text-neutral-500">Aguardando transcrições...</p>
+        ) : (
+          <ol className="flex flex-col gap-3">
+            {items.map((item) => (
+              <li key={item.id} className="grid grid-cols-[4.5rem_1fr] gap-3 text-sm">
+                <div className="text-xs text-neutral-500">
+                  <p>{formatTimelineTime(item.started_at)}</p>
+                  <p>{sourceLabel(item.source)}</p>
+                </div>
+                <div>
+                  <p className="text-xs font-medium text-neutral-300">{speakerLabel(item.speaker)}</p>
+                  <p className="text-neutral-100">{item.text}</p>
+                </div>
+              </li>
+            ))}
+          </ol>
+        )}
       </div>
     </section>
   );
@@ -683,6 +742,7 @@ export default function App() {
         <AdvancedTranscriptionSettings />
 
         <AudioCaptureSection />
+        <ConversationTimelineView />
       </main>
     </ModelOnboardingGate>
   );

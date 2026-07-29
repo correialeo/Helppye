@@ -5,10 +5,13 @@ local-first: transcrição local, LLM local via Ollama, sem dependência de nuve
 
 ## Status
 
-Fundação inicial. A infraestrutura de captura de áudio está sendo construída de forma
-incremental. Detecção de perguntas e overlay de resposta ainda **não** estão
-implementados — a captura de áudio está sendo estabilizada primeiro (mic + saída do
-sistema, nessa ordem).
+Fundação de áudio e transcrição local implementada. A captura de microfone, a captura de
+saída do sistema no Windows via WASAPI Loopback, o pipeline de VAD/segmentação e a
+transcrição local com Whisper Base Multilíngue já existem. A camada atual em construção é
+a **Conversation Timeline**, responsável por organizar transcrições em uma linha do tempo
+única preservando ordem, origem (usuário/outra pessoa) e timestamps. Detecção de
+perguntas, overlay de resposta e integração com LLM/Ollama ainda **não** estão
+implementados.
 
 ## Stack
 
@@ -16,13 +19,18 @@ sistema, nessa ordem).
   `cpal` (captura de microfone multiplataforma), `tracing`/`tracing-subscriber` para
   logging estruturado, `thiserror` para erros tipados, `async-trait`.
 - **Frontend:** React 18, TypeScript estrito, Vite, Tailwind CSS, Zustand.
-- **Planejado, ainda não implementado:** Ollama (LLM local), SQLite (config/histórico).
+- **Transcrição local:** `whisper-rs`/whisper.cpp, CPU-only por padrão, modelo padrão
+  Whisper Base Multilíngue (`ggml-base.bin`) baixado apenas após ação explícita do
+  usuário.
+- **Planejado, ainda não implementado:** Ollama (LLM local), SQLite (histórico
+  persistente além das configurações JSON atuais).
 
 ## Layout
 
-- `src/` — frontend React/TypeScript. `App.tsx` é a UI atual: dois painéis de captura
-  (microfone e saída do sistema), cada um parametrizado por uma `PanelConfig` com os
-  comandos Tauri a chamar e o `AudioSource` a filtrar nos eventos.
+- `src/` — frontend React/TypeScript. `App.tsx` é a UI atual: onboarding/download do
+  modelo de transcrição, configurações avançadas de modelo local, dois painéis de
+  captura (microfone e saída do sistema) e a visualização consolidada da Conversation
+  Timeline.
 - `src-tauri/` — núcleo Rust (comandos Tauri, pipeline de áudio). Ver seção "Módulo de
   áudio" abaixo.
 - `docs/` — auditoria de arquitetura, notas de design, roadmap. Ler antes de tocar em
@@ -73,10 +81,42 @@ Pipeline compartilhado, independente de fonte:
   de loopback do Windows.
 
 `audio/mod.rs` expõe os comandos Tauri (`list_audio_devices_command`,
-`list_system_audio_devices_command`, `start_microphone_capture_command`,
-`stop_microphone_capture_command`, `start_system_audio_capture_command`,
-`stop_system_audio_capture_command`) e `AudioState` (dois `CancellationToken` opcionais
-independentes, um por fonte, sob mutex).
+`list_system_audio_devices_command`, `resolve_device_selection_command`,
+`select_input_device_command`, `select_output_device_command`,
+`start_microphone_capture_command`, `stop_microphone_capture_command`,
+`start_system_audio_capture_command`, `stop_system_audio_capture_command`) e
+`CaptureEngineState`. `CaptureEngine` garante exatamente uma sessão ativa por categoria
+(entrada e saída), reinicia a categoria correta em trocas de dispositivo e injeta a fila
+de transcrição como dependência.
+
+## Transcrição local (`src-tauri/src/transcription/`, `src-tauri/src/model_manager/`)
+
+`transcription::provider::TranscriptionProvider` é o ponto de extensão para backends de
+speech-to-text. A implementação atual é `WhisperCppProvider`, baseada em `whisper-rs`,
+com inferência CPU-only. `TranscriptionQueue` recebe `AudioSegment`s do pipeline de áudio
+em uma fila limitada e não bloqueante; se a transcrição ficar atrasada, segmentos novos
+são descartados e contabilizados, sem aplicar backpressure à captura.
+
+`model_manager` implementa o fluxo guiado de primeiro uso: status do modelo, download
+explícito, progresso, cancelamento, verificação de SHA-256, instalação atômica,
+persistência da seleção e carregamento real no provider. O modelo padrão é o Whisper Base
+Multilíngue; modelos personalizados podem ser selecionados por caminho local e são
+validados antes de persistir.
+
+## Conversation Timeline (`src-tauri/src/conversation.rs`)
+
+A Timeline é a primeira camada que une as duas fontes de áudio em uma conversa única sem
+misturar áudio bruto. Ela consome `TranscriptEvent::Ready`, ignora transcrições vazias,
+mapeia `AudioSource::Microphone` para `ConversationSpeaker::User` e
+`AudioSource::SystemOutput` para `ConversationSpeaker::OtherPerson`, preserva
+`segment_id`, `source`, texto, idioma, timestamps e uma sequência de recebimento.
+
+Os timestamps dos segmentos são convertidos pelo `CaptureEngine` para um relógio
+monotônico comum do processo antes de entrar na fila de transcrição, para que falas de
+microfone e saída do sistema sejam comparáveis na mesma linha do tempo. A Timeline expõe
+o comando `conversation_timeline_snapshot_command` e emite
+`conversation://timeline-event`. O futuro `QuestionDetector` deve consumir esta camada,
+não `AudioFrame`, `AudioSegment` ou eventos brutos de transcrição.
 
 ## Relação com o Meetily
 
@@ -121,9 +161,12 @@ provider.rs}` e `platform/windows/*` para uma crate mínima sem dependência do 
   comentário `// SAFETY:` explicando por que as precondições estão satisfeitas.
   Funções `unsafe fn` documentam o contrato de segurança em uma seção `# Safety` no
   doc comment.
-- Dispositivos são identificados por ID estável (ex. `IMMDevice::GetId` no Windows),
-  nunca por substring de nome — a auditoria do Meetily (seção 6, achado 7) sinalizou
-  correspondência por nome como frágil.
+- Dispositivos devem ser identificados por ID estável sempre que a plataforma expuser um
+  ID real (ex. `IMMDevice::GetId` no Windows para saída WASAPI), nunca por substring de
+  nome — a auditoria do Meetily (seção 6, achado 7) sinalizou correspondência por nome
+  como frágil. Limitação atual: o caminho de microfone via `cpal` ainda usa o nome do
+  dispositivo como `id` best-effort, porque o `cpal` não expõe um identificador estável
+  multiplataforma nesse nível.
 - Não fabricar resultados de teste que não foram de fato executados neste ambiente
   (WSL2/Linux, sem hardware de áudio Windows/macOS real). Ao documentar validação,
   separar explicitamente "verificado neste sandbox" de "ainda precisa de confirmação

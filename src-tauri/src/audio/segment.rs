@@ -17,6 +17,10 @@ impl AudioTimestamp {
     pub fn saturating_sub(self, other: AudioTimestamp) -> u64 {
         self.0.saturating_sub(other.0)
     }
+
+    pub fn saturating_add_ms(self, offset_ms: u64) -> Self {
+        AudioTimestamp(self.0.saturating_add(offset_ms))
+    }
 }
 
 static NEXT_SEGMENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -65,6 +69,16 @@ impl AudioSegment {
             ended_at,
             duration_ms: ended_at.saturating_sub(started_at),
         }
+    }
+
+    /// Shifts segment-local timestamps onto a broader monotonic timeline. Used by the
+    /// capture engine to make independently-started microphone and system-output sessions
+    /// comparable before transcription and conversation ordering.
+    pub fn with_timestamp_offset(mut self, offset_ms: u64) -> Self {
+        self.started_at = self.started_at.saturating_add_ms(offset_ms);
+        self.ended_at = self.ended_at.saturating_add_ms(offset_ms);
+        self.duration_ms = self.ended_at.saturating_sub(self.started_at);
+        self
     }
 }
 
