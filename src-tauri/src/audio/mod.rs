@@ -23,6 +23,7 @@ use pipeline::MicrophoneCaptureProvider;
 use platform::SystemAudioProvider;
 use types::{AudioDevice, AudioSource};
 
+use crate::conversation::{emit_turn_events, ConversationTimeline};
 use crate::transcription::queue::TranscriptionQueue;
 
 const CAPTURE_EVENT: &str = "audio://capture-event";
@@ -36,6 +37,7 @@ pub struct CaptureEngineState(pub Arc<CaptureEngine>);
 pub fn build(
     app: &AppHandle,
     transcription_queue: Arc<TranscriptionQueue>,
+    conversation_timeline: Arc<ConversationTimeline>,
 ) -> Result<CaptureEngineState, String> {
     let data_dir = app
         .path()
@@ -46,6 +48,7 @@ pub fn build(
     let initial_selection = selection::load(&config_path);
 
     let app_handle = app.clone();
+    let app_handle_for_timeline = app.clone();
     let engine = CaptureEngine::new(
         Arc::new(MicrophoneCaptureProvider),
         Arc::new(SystemAudioProvider),
@@ -56,6 +59,10 @@ pub fn build(
             if let Err(e) = app_handle.emit(CAPTURE_EVENT, &event) {
                 tracing::warn!(%e, "failed to emit audio capture event to frontend");
             }
+            emit_turn_events(
+                &app_handle_for_timeline,
+                conversation_timeline.ingest_capture_event(&event),
+            );
         }),
     );
     Ok(CaptureEngineState(Arc::new(engine)))

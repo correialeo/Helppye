@@ -106,17 +106,33 @@ validados antes de persistir.
 ## Conversation Timeline (`src-tauri/src/conversation.rs`)
 
 A Timeline é a primeira camada que une as duas fontes de áudio em uma conversa única sem
-misturar áudio bruto. Ela consome `TranscriptEvent::Ready`, ignora transcrições vazias,
-mapeia `AudioSource::Microphone` para `ConversationSpeaker::User` e
-`AudioSource::SystemOutput` para `ConversationSpeaker::OtherPerson`, preserva
-`segment_id`, `source`, texto, idioma, timestamps e uma sequência de recebimento.
+misturar áudio bruto. Ela consome `TranscriptEvent::Ready`, transforma cada resultado em
+um `TranscriptSegment` bruto e usa `TurnAssembler` para consolidar segmentos consecutivos
+em `ConversationTurn`s. A UI deve renderizar turnos, não segmentos.
+
+`TurnAssembler` mantém um turno aberto enquanto novos segmentos têm o mesmo speaker, a
+mesma `AudioSource`, não atravessam fala do outro interlocutor, respeitam o intervalo
+`same_speaker_merge_gap_ms` (default inicial: 1800 ms) e não ultrapassam
+`maximum_turn_duration_ms` (default inicial: 120000 ms). Segmentos fora de ordem são
+tolerados dentro de `out_of_order_tolerance_ms` (default inicial: 1000 ms), com warning;
+segmentos fora da tolerância não reabrem turnos já finalizados.
+
+Ao unir texto, a camada remove apenas espaços duplicados, adiciona um espaço entre
+trechos e preserva a pontuação produzida pelo transcritor. Não há correção semântica,
+reescrita, LLM, resumo ou troca de modelo nesta camada.
+
+Turnos são finalizados por mudança de speaker/source, gap excedido, pausa/parada da
+captura da fonte, flush manual e duração máxima. Eventos emitidos:
+`TurnEvent::Started`, `TurnEvent::Updated` e `TurnEvent::Finalized`, todos via
+`conversation://timeline-event`. A Timeline também expõe
+`conversation_timeline_snapshot_command`, `conversation_flush_turns_command` e
+`conversation_end_session_command` e `conversation_raw_segments_command`.
 
 Os timestamps dos segmentos são convertidos pelo `CaptureEngine` para um relógio
 monotônico comum do processo antes de entrar na fila de transcrição, para que falas de
-microfone e saída do sistema sejam comparáveis na mesma linha do tempo. A Timeline expõe
-o comando `conversation_timeline_snapshot_command` e emite
-`conversation://timeline-event`. O futuro `QuestionDetector` deve consumir esta camada,
-não `AudioFrame`, `AudioSegment` ou eventos brutos de transcrição.
+microfone e saída do sistema sejam comparáveis na mesma linha do tempo. O futuro
+`QuestionDetector` deve consumir `ConversationTurn`, não `AudioFrame`, `AudioSegment` ou
+eventos brutos de transcrição.
 
 ## Relação com o Meetily
 

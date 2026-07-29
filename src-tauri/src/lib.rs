@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tracing_subscriber::EnvFilter;
 
-use conversation::{ConversationTimeline, ConversationTimelineState, CONVERSATION_TIMELINE_EVENT};
+use conversation::{emit_turn_events, ConversationTimeline, ConversationTimelineState};
 use transcription::provider::TranscriptionProvider;
 use transcription::queue::TranscriptionQueue;
 use transcription::whisper_provider::WhisperCppProvider;
@@ -25,20 +25,19 @@ pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
             let provider: Arc<dyn TranscriptionProvider> = Arc::new(WhisperCppProvider::new());
-            let timeline = Arc::new(ConversationTimeline::new());
+            let timeline = Arc::new(ConversationTimeline::default());
             let app_handle = app.handle().clone();
             let timeline_for_queue = timeline.clone();
             let queue = Arc::new(TranscriptionQueue::spawn(provider.clone(), move |event| {
                 if let Err(e) = app_handle.emit(TRANSCRIPTION_EVENT, &event) {
                     tracing::warn!(%e, "failed to emit transcription event to frontend");
                 }
-                if let Some(timeline_event) = timeline_for_queue.ingest_transcript_event(event) {
-                    if let Err(e) = app_handle.emit(CONVERSATION_TIMELINE_EVENT, &timeline_event) {
-                        tracing::warn!(%e, "failed to emit conversation timeline event to frontend");
-                    }
-                }
+                emit_turn_events(
+                    &app_handle,
+                    timeline_for_queue.ingest_transcript_event(event),
+                );
             }));
-            let audio_state = audio::build(app.handle(), queue.clone())?;
+            let audio_state = audio::build(app.handle(), queue.clone(), timeline.clone())?;
             app.manage(audio_state);
             app.manage(ConversationTimelineState(timeline));
             app.manage(TranscriptionState::new(provider.clone(), queue));
@@ -59,6 +58,9 @@ pub fn run() {
             audio::start_system_audio_capture_command,
             audio::stop_system_audio_capture_command,
             conversation::conversation_timeline_snapshot_command,
+            conversation::conversation_flush_turns_command,
+            conversation::conversation_end_session_command,
+            conversation::conversation_raw_segments_command,
             transcription::configure_transcription_command,
             transcription::transcription_diagnostics_command,
             model_manager::model_status_command,

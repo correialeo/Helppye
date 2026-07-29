@@ -267,20 +267,30 @@ type AudioCaptureEvent =
 
 type ConversationSpeaker = "user" | "other_person";
 
-interface ConversationTimelineItem {
+interface ConversationTurn {
   id: number;
-  segment_id: number;
   source: AudioSourceKind;
   speaker: ConversationSpeaker;
   text: string;
-  language: string | null;
+  segments: number[];
   started_at: number;
   ended_at: number;
-  processing_time_ms: number;
-  received_sequence: number;
+  finalized_at: number | null;
 }
 
-type ConversationTimelineEvent = { type: "item_added"; item: ConversationTimelineItem };
+type TurnEvent =
+  | { type: "started"; turn_id: number; speaker: ConversationSpeaker; source: AudioSourceKind; started_at: number }
+  | {
+      type: "updated";
+      turn_id: number;
+      speaker: ConversationSpeaker;
+      source: AudioSourceKind;
+      started_at: number;
+      text: string;
+      ended_at: number;
+      segments: number[];
+    }
+  | { type: "finalized"; turn: ConversationTurn };
 
 function rmsDbfs(samples: number[]): number {
   if (samples.length === 0) return -Infinity;
@@ -571,34 +581,66 @@ function sourceLabel(source: AudioSourceKind): string {
   return source === "microphone" ? "Entrada" : "Saída";
 }
 
-function sortTimeline(items: ConversationTimelineItem[]): ConversationTimelineItem[] {
-  return [...items].sort(
+function sortTurns(turns: ConversationTurn[]): ConversationTurn[] {
+  return [...turns].sort(
     (a, b) =>
       a.started_at - b.started_at ||
       a.ended_at - b.ended_at ||
-      a.received_sequence - b.received_sequence,
+      a.id - b.id,
   );
 }
 
 function ConversationTimelineView() {
-  const [items, setItems] = useState<ConversationTimelineItem[]>([]);
+  const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const showSegments = import.meta.env.DEV;
 
   useEffect(() => {
-    invoke<ConversationTimelineItem[]>("conversation_timeline_snapshot_command")
+    invoke<ConversationTurn[]>("conversation_timeline_snapshot_command")
       .then((snapshot) => {
-        setItems(sortTimeline(snapshot));
+        setTurns(sortTurns(snapshot));
         setError(null);
       })
       .catch((e) => setError(String(e)));
   }, []);
 
   useEffect(() => {
-    const unlisten = listen<ConversationTimelineEvent>("conversation://timeline-event", (event) => {
-      if (event.payload.type !== "item_added") return;
-      setItems((current) => {
-        const withoutDuplicate = current.filter((item) => item.id !== event.payload.item.id);
-        return sortTimeline([...withoutDuplicate, event.payload.item]);
+    const unlisten = listen<TurnEvent>("conversation://timeline-event", (event) => {
+      const payload = event.payload;
+      setTurns((current) => {
+        if (payload.type === "started") {
+          const nextTurn: ConversationTurn = {
+            id: payload.turn_id,
+            speaker: payload.speaker,
+            source: payload.source,
+            text: "",
+            segments: [],
+            started_at: payload.started_at,
+            ended_at: payload.started_at,
+            finalized_at: null,
+          };
+          const withoutDuplicate = current.filter((turn) => turn.id !== nextTurn.id);
+          return sortTurns([...withoutDuplicate, nextTurn]);
+        }
+
+        if (payload.type === "updated") {
+          const existing = current.find((turn) => turn.id === payload.turn_id);
+          const nextTurn: ConversationTurn = {
+            id: payload.turn_id,
+            speaker: existing?.speaker ?? payload.speaker,
+            source: existing?.source ?? payload.source,
+            text: payload.text,
+            segments: payload.segments,
+            started_at: existing?.started_at ?? payload.started_at,
+            ended_at: payload.ended_at,
+            finalized_at: existing?.finalized_at ?? null,
+          };
+          const withoutDuplicate = current.filter((turn) => turn.id !== nextTurn.id);
+          return sortTurns([...withoutDuplicate, nextTurn]);
+        }
+
+        const withoutDuplicate = current.filter((turn) => turn.id !== payload.turn.id);
+        return sortTurns([...withoutDuplicate, payload.turn]);
       });
     });
     return () => {
@@ -610,25 +652,34 @@ function ConversationTimelineView() {
     <section className="flex w-full max-w-3xl flex-col gap-3 rounded-lg border border-neutral-800 p-4 text-left">
       <div>
         <h2 className="text-base font-semibold">Timeline da conversa</h2>
-        <p className="text-xs text-neutral-500">{items.length} trechos transcritos</p>
+        <p className="text-xs text-neutral-500">{turns.length} turnos de fala</p>
       </div>
 
       {error && <p className="text-xs text-red-400">Erro ao carregar timeline: {error}</p>}
 
       <div className="max-h-72 min-h-24 overflow-y-auto border-t border-neutral-800 pt-3">
-        {items.length === 0 ? (
+        {turns.length === 0 ? (
           <p className="text-xs text-neutral-500">Aguardando transcrições...</p>
         ) : (
           <ol className="flex flex-col gap-3">
-            {items.map((item) => (
-              <li key={item.id} className="grid grid-cols-[4.5rem_1fr] gap-3 text-sm">
+            {turns.map((turn) => (
+              <li key={turn.id} className="grid grid-cols-[4.5rem_1fr] gap-3 text-sm">
                 <div className="text-xs text-neutral-500">
-                  <p>{formatTimelineTime(item.started_at)}</p>
-                  <p>{sourceLabel(item.source)}</p>
+                  <p>{formatTimelineTime(turn.started_at)}</p>
+                  <p>{sourceLabel(turn.source)}</p>
+                  {!turn.finalized_at && <p className="text-emerald-400">aberto</p>}
                 </div>
                 <div>
-                  <p className="text-xs font-medium text-neutral-300">{speakerLabel(item.speaker)}</p>
-                  <p className="text-neutral-100">{item.text}</p>
+                  <p className="text-xs font-medium text-neutral-300">{speakerLabel(turn.speaker)}</p>
+                  <p className="text-neutral-100">
+                    {turn.text || <span className="text-neutral-500">...</span>}
+                  </p>
+                  {showSegments && turn.segments.length > 0 && (
+                    <details className="mt-1 text-xs text-neutral-500">
+                      <summary className="cursor-pointer">Segmentos internos</summary>
+                      <p className="mt-1 font-mono">{turn.segments.join(", ")}</p>
+                    </details>
+                  )}
                 </div>
               </li>
             ))}

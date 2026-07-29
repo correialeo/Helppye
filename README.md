@@ -13,8 +13,9 @@ Audio capture and local transcription foundations are implemented:
 - VAD, speech segmentation, and bounded transcription queue.
 - Local Whisper transcription through `whisper-rs`.
 - Guided download/verification of the default Whisper Base Multilingual model.
-- Conversation Timeline that merges completed transcripts from microphone and system
-  output while preserving source, speaker role, order, and timestamps.
+- Conversation Timeline with turn assembly: raw transcript segments are consolidated into
+  logical conversation turns while preserving source, speaker role, timestamps, and the
+  segment IDs used for diagnostics.
 
 Question detection, answer overlay, Ollama integration, and persistent conversation
 history are not implemented yet.
