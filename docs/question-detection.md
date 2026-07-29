@@ -18,6 +18,10 @@ O provider inicial é `RuleBasedQuestionDetector`. Ele usa listas centralizadas 
 - pronomes e advérbios interrogativos;
 - construções dirigidas ao usuário, como "você pode" e "me explique";
 - padrões comuns de entrevista técnica e comportamental;
+- perguntas de sim/não dirigidas ao usuário, como "você chegou a" e "você já";
+- fragmentos comportamentais acumuláveis, como "uma situação em que", "como reagiu"
+  e "o que fez";
+- escolhas contrastivas, como "ou só";
 - marcadores negativos, como "como disse" e "ele explicou por que".
 
 Não há LLM, correção do Whisper, reescrita semântica ou análise comportamental nesta
@@ -38,6 +42,9 @@ A confiança é determinística e limitada entre `0.0` e `1.0`. Os pesos iniciai
 - contém construção interrogativa: `+0.30`;
 - contém padrão de entrevista: `+0.40`;
 - possui verbo dirigido ao usuário: `+0.30`;
+- pergunta de sim/não dirigida ao usuário: `+0.60`;
+- fragmento comportamental: `+0.24` por fragmento;
+- escolha contrastiva: `+0.20`;
 - erro leve de transcrição em padrão conhecido: `+0.30`;
 - frase muito curta: `-0.20`;
 - palavra interrogativa isolada: `-0.20`;
@@ -55,15 +62,21 @@ Esses valores são parâmetros iniciais, não definitivos.
 
 Quando o turno contém explicação seguida de pergunta, o detector tenta extrair o trecho
 final com sinal forte em vez de devolver o turno inteiro. Se há `?`, ele prefere a última
-frase interrogativa. Sem pontuação, ele procura o último trecho com pronomes, construções
-ou padrões fortes.
+frase interrogativa, mas preserva a frase anterior quando ela também contém sinal forte.
+Sem pontuação, ele procura o último trecho com pronomes, construções ou padrões fortes.
+
+A janela inicial de utterances relacionadas é configurável e começa em 2 utterances
+finais. Como `ConversationTurn` ainda não carrega o texto individual de cada utterance, a
+associação visual usa `matched_utterance_ids` como sufixo conservador do turno.
 
 ## Debounce
 
 `TurnEvent::Updated` e `TurnEvent::Finalized` alimentam o detector. Em updates, uma
 pergunta entra como `Candidate` e só vira `Confirmed` após
 `question_detection_debounce_ms = 800`, desde que o texto não tenha mudado. Um
-`TurnFinalized` pode confirmar imediatamente a detecção pendente.
+`TurnFinalized` executa o detector novamente sobre o texto final e confirma
+imediatamente se o score estiver acima do threshold. O debounce pendente fica inofensivo
+porque a deduplicação guarda o fingerprint já confirmado.
 
 Os testes usam tempo controlável no estado do processador; não há `sleep` real em teste
 unitário.
@@ -82,10 +95,16 @@ O backend emite eventos no canal `question://detection-event`:
 - `candidate`;
 - `updated`;
 - `confirmed`;
+- `evaluated`;
 - `dismissed`.
 
 Esse canal é separado de `conversation://timeline-event` para manter responsabilidades
 claras.
+
+`evaluated` existe para observabilidade em modo de desenvolvimento, inclusive quando o
+turno remoto ficou abaixo do threshold ou a fonte/speaker não é elegível. A avaliação
+inclui `eligible`, `confidence`, `threshold`, `matched_signals`, `applied_penalties`,
+`candidate_text`, `decision` e `matched_utterance_ids`.
 
 ## Falsos Positivos Conhecidos
 

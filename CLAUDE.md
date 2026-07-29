@@ -147,13 +147,15 @@ eventos brutos de transcrição.
 O primeiro `QuestionDetector` implementado é `RuleBasedQuestionDetector`, local e
 determinístico. Ele roda somente sobre `ConversationTurn` elegível
 (`speaker = OtherPerson`, `source = SystemOutput`) e emite eventos independentes via
-`question://detection-event`: `candidate`, `updated`, `confirmed` e `dismissed`.
+`question://detection-event`: `candidate`, `updated`, `confirmed`, `evaluated` e
+`dismissed`.
 
 O detector combina sinais de pontuação, termos interrogativos, construções dirigidas ao
-usuário e padrões comuns de entrevista. Ele também aplica penalidades para casos como
-"como disse" e cláusulas declarativas contendo "por que". Turnos abertos são analisados
-em `TurnUpdated` com debounce inicial de 800 ms; `TurnFinalized` pode confirmar a
-detecção pendente. Não há geração automática de resposta nesta fase. Ver
+usuário, perguntas de sim/não dirigidas ao usuário, fragmentos comportamentais e padrões
+comuns de entrevista. Ele também aplica penalidades para casos como "como disse" e
+cláusulas declarativas contendo "por que". Turnos abertos são analisados em `TurnUpdated`
+com debounce inicial de 800 ms; `TurnFinalized` reexecuta o detector e pode confirmar
+imediatamente a detecção final. Não há geração automática de resposta nesta fase. Ver
 `docs/question-detection.md`.
 
 ## Relação com o Meetily

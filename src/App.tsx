@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { questionRenderStateForUtterance } from "./questionDetectionViewModel";
 
 type ModelInstallState =
   | { state: "not_installed" }
@@ -320,6 +321,15 @@ type ConversationTimelineEvent =
   | { type: "utterance_finalized"; turn_id: number; utterance: ConversationUtterance };
 
 type QuestionDetectionStatus = "candidate" | "confirmed" | "dismissed";
+type QuestionDetectionDecision =
+  | "ineligible_source"
+  | "empty_text"
+  | "below_threshold"
+  | "candidate"
+  | "confirmed"
+  | "dismissed"
+  | "duplicate"
+  | "superseded";
 
 interface QuestionSignal {
   kind: string;
@@ -327,6 +337,24 @@ interface QuestionSignal {
   observed?: string;
   reason?: string;
   weight: number;
+}
+
+interface QuestionPenalty {
+  reason: string;
+  weight: number;
+}
+
+interface QuestionDetectionEvaluation {
+  turn_id: number;
+  eligible: boolean;
+  normalized_text: string;
+  candidate_text: string | null;
+  confidence: number;
+  threshold: number;
+  matched_signals: QuestionSignal[];
+  applied_penalties: QuestionPenalty[];
+  decision: QuestionDetectionDecision;
+  matched_utterance_ids: number[];
 }
 
 interface QuestionDetection {
@@ -338,10 +366,14 @@ interface QuestionDetection {
   confidence: number;
   question_text: string | null;
   matched_signals: QuestionSignal[];
+  applied_penalties: QuestionPenalty[];
   detected_at: number;
   detection_mode: "rule_based" | "semantic";
   status: QuestionDetectionStatus;
   normalized_text: string;
+  candidate_text: string | null;
+  threshold: number;
+  matched_utterance_ids: number[];
   utterance_ids: number[];
   status_reason: string;
 }
@@ -350,6 +382,7 @@ type QuestionDetectionEvent =
   | { type: "candidate"; detection: QuestionDetection }
   | { type: "updated"; detection: QuestionDetection }
   | { type: "confirmed"; detection: QuestionDetection }
+  | { type: "evaluated"; evaluation: QuestionDetectionEvaluation }
   | { type: "dismissed"; detection_id: number; turn_id: number };
 
 function rmsDbfs(samples: number[]): number {
@@ -666,10 +699,30 @@ function signalLabel(signal: QuestionSignal): string {
   return signal.kind;
 }
 
+function penaltyLabel(penalty: QuestionPenalty): string {
+  return `${penalty.reason}: ${penalty.weight}`;
+}
+
+function evaluationFromDetection(detection: QuestionDetection): QuestionDetectionEvaluation {
+  return {
+    turn_id: detection.turn_id,
+    eligible: detection.speaker === "other_person" && detection.source === "system_output",
+    normalized_text: detection.normalized_text,
+    candidate_text: detection.candidate_text,
+    confidence: detection.confidence,
+    threshold: detection.threshold,
+    matched_signals: detection.matched_signals,
+    applied_penalties: detection.applied_penalties,
+    decision: detection.status,
+    matched_utterance_ids: detection.matched_utterance_ids,
+  };
+}
+
 function ConversationTimelineView() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [utterances, setUtterances] = useState<ConversationUtterance[]>([]);
   const [questionDetections, setQuestionDetections] = useState<Record<number, QuestionDetection>>({});
+  const [questionEvaluations, setQuestionEvaluations] = useState<Record<number, QuestionDetectionEvaluation>>({});
   const [error, setError] = useState<string | null>(null);
   const showSegments = import.meta.env.DEV;
 
@@ -771,9 +824,21 @@ function ConversationTimelineView() {
         return;
       }
 
+      if (payload.type === "evaluated") {
+        setQuestionEvaluations((current) => ({
+          ...current,
+          [payload.evaluation.turn_id]: payload.evaluation,
+        }));
+        return;
+      }
+
       setQuestionDetections((current) => ({
         ...current,
         [payload.detection.turn_id]: payload.detection,
+      }));
+      setQuestionEvaluations((current) => ({
+        ...current,
+        [payload.detection.turn_id]: evaluationFromDetection(payload.detection),
       }));
     });
     return () => {
@@ -814,11 +879,10 @@ function ConversationTimelineView() {
         ) : (
           <ol className="flex flex-col gap-3">
             {utterances.map((utterance) => {
-              const turn = turns.find((candidate) => candidate.utterances.includes(utterance.id));
-              const detection = turn ? questionDetections[turn.id] : undefined;
-              const usesUtterance = detection?.utterance_ids.includes(utterance.id) ?? false;
-              const isConfirmedQuestion = usesUtterance && detection?.status === "confirmed";
-              const isCandidateQuestion = usesUtterance && detection?.status === "candidate";
+              const { turn, detection, isConfirmedQuestion, isCandidateQuestion } =
+                questionRenderStateForUtterance(utterance.id, turns, questionDetections);
+              const evaluation = turn ? questionEvaluations[turn.id] : undefined;
+              const showQuestionDiagnostics = showSegments && turn?.speaker === "other_person" && evaluation;
 
               return (
                 <li
@@ -849,17 +913,20 @@ function ConversationTimelineView() {
                     {isConfirmedQuestion && (
                       <p className="mt-1 text-xs font-medium text-emerald-300">Pergunta detectada</p>
                     )}
-                    {showSegments && detection && usesUtterance && (
+                    {showQuestionDiagnostics && (
                       <details className="mt-2 text-xs text-neutral-500">
                         <summary className="cursor-pointer">Diagnóstico da pergunta</summary>
                         <div className="mt-1 flex flex-col gap-1 font-mono">
-                          <p>turn_id: {detection.turn_id}</p>
-                          <p>status: {detection.status}</p>
-                          <p>confidence: {Math.round(detection.confidence * 100)}%</p>
-                          <p>utterances: {detection.utterance_ids.join(", ")}</p>
-                          <p>normalized: {detection.normalized_text}</p>
-                          <p>reason: {detection.status_reason}</p>
-                          <p>signals: {detection.matched_signals.map(signalLabel).join(" | ")}</p>
+                          <p>turn_id: {evaluation.turn_id}</p>
+                          <p>eligible: {String(evaluation.eligible)}</p>
+                          <p>decision: {evaluation.decision}</p>
+                          <p>confidence: {Math.round(evaluation.confidence * 100)}%</p>
+                          <p>threshold: {Math.round(evaluation.threshold * 100)}%</p>
+                          <p>utterances: {evaluation.matched_utterance_ids.join(", ")}</p>
+                          <p>candidate: {evaluation.candidate_text ?? ""}</p>
+                          <p>normalized: {evaluation.normalized_text}</p>
+                          <p>signals: {evaluation.matched_signals.map(signalLabel).join(" | ")}</p>
+                          <p>penalties: {evaluation.applied_penalties.map(penaltyLabel).join(" | ")}</p>
                         </div>
                       </details>
                     )}

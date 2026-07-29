@@ -55,6 +55,19 @@ pub enum QuestionDetectionStatus {
     Dismissed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionDetectionDecision {
+    IneligibleSource,
+    EmptyText,
+    BelowThreshold,
+    Candidate,
+    Confirmed,
+    Dismissed,
+    Duplicate,
+    Superseded,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QuestionSignal {
@@ -77,13 +90,21 @@ pub enum QuestionSignal {
         phrase: &'static str,
         weight: f32,
     },
+    YesNoDirectedQuestion {
+        phrase: &'static str,
+        weight: f32,
+    },
+    BehavioralFragment {
+        phrase: &'static str,
+        weight: f32,
+    },
+    ContrastiveChoice {
+        phrase: &'static str,
+        weight: f32,
+    },
     TranscriptFuzzyMatch {
         phrase: &'static str,
         observed: String,
-        weight: f32,
-    },
-    Penalty {
-        reason: &'static str,
         weight: f32,
     },
 }
@@ -96,10 +117,38 @@ impl QuestionSignal {
             | QuestionSignal::InterrogativeConstruction { weight, .. }
             | QuestionSignal::InterviewPattern { weight, .. }
             | QuestionSignal::DirectedVerb { weight, .. }
-            | QuestionSignal::TranscriptFuzzyMatch { weight, .. }
-            | QuestionSignal::Penalty { weight, .. } => *weight,
+            | QuestionSignal::YesNoDirectedQuestion { weight, .. }
+            | QuestionSignal::BehavioralFragment { weight, .. }
+            | QuestionSignal::ContrastiveChoice { weight, .. }
+            | QuestionSignal::TranscriptFuzzyMatch { weight, .. } => *weight,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuestionPenalty {
+    pub reason: &'static str,
+    pub weight: f32,
+}
+
+impl QuestionPenalty {
+    fn weight(&self) -> f32 {
+        self.weight
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QuestionDetectionEvaluation {
+    pub turn_id: TurnId,
+    pub eligible: bool,
+    pub normalized_text: String,
+    pub candidate_text: Option<String>,
+    pub confidence: f32,
+    pub threshold: f32,
+    pub matched_signals: Vec<QuestionSignal>,
+    pub applied_penalties: Vec<QuestionPenalty>,
+    pub decision: QuestionDetectionDecision,
+    pub matched_utterance_ids: Vec<UtteranceId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -112,10 +161,14 @@ pub struct QuestionDetection {
     pub confidence: f32,
     pub question_text: Option<String>,
     pub matched_signals: Vec<QuestionSignal>,
+    pub applied_penalties: Vec<QuestionPenalty>,
     pub detected_at: AudioTimestamp,
     pub detection_mode: QuestionDetectionMode,
     pub status: QuestionDetectionStatus,
     pub normalized_text: String,
+    pub candidate_text: Option<String>,
+    pub threshold: f32,
+    pub matched_utterance_ids: Vec<UtteranceId>,
     pub utterance_ids: Vec<UtteranceId>,
     pub status_reason: String,
 }
@@ -131,6 +184,9 @@ pub enum QuestionDetectionEvent {
     },
     Confirmed {
         detection: QuestionDetection,
+    },
+    Evaluated {
+        evaluation: QuestionDetectionEvaluation,
     },
     Dismissed {
         detection_id: QuestionDetectionId,
@@ -164,6 +220,7 @@ pub struct RuleBasedQuestionDetector {
 pub struct RuleBasedQuestionDetectorConfig {
     pub question_threshold: f32,
     pub high_confidence_threshold: f32,
+    pub candidate_utterance_window: usize,
 }
 
 impl Default for RuleBasedQuestionDetectorConfig {
@@ -171,6 +228,7 @@ impl Default for RuleBasedQuestionDetectorConfig {
         RuleBasedQuestionDetectorConfig {
             question_threshold: QUESTION_THRESHOLD,
             high_confidence_threshold: HIGH_CONFIDENCE_THRESHOLD,
+            candidate_utterance_window: 2,
         }
     }
 }
@@ -191,8 +249,9 @@ impl QuestionDetector for RuleBasedQuestionDetector {
             source: turn.source,
             detected,
             confidence: analysis.confidence,
-            question_text: detected.then_some(analysis.question_text),
-            matched_signals: analysis.signals,
+            question_text: detected.then_some(analysis.question_text.clone()),
+            matched_signals: analysis.signals.clone(),
+            applied_penalties: analysis.penalties.clone(),
             detected_at: turn.ended_at,
             detection_mode: QuestionDetectionMode::RuleBased,
             status: if detected {
@@ -200,15 +259,18 @@ impl QuestionDetector for RuleBasedQuestionDetector {
             } else {
                 QuestionDetectionStatus::Dismissed
             },
-            normalized_text: analysis.normalized_text,
+            normalized_text: analysis.normalized_text.clone(),
+            candidate_text: (!analysis.question_text.is_empty()).then_some(analysis.question_text),
+            threshold: self.config.question_threshold,
+            matched_utterance_ids: analysis.utterance_ids.clone(),
             utterance_ids: analysis.utterance_ids,
-            status_reason: if analysis.confidence >= self.config.high_confidence_threshold {
-                "high_confidence_score_above_threshold".into()
-            } else if detected {
-                "score_above_threshold".into()
-            } else {
-                "score_below_threshold".into()
-            },
+            status_reason: status_reason(
+                analysis.reason,
+                detected,
+                analysis.confidence,
+                self.config.high_confidence_threshold,
+            )
+            .into(),
         })
     }
 
@@ -220,21 +282,40 @@ impl QuestionDetector for RuleBasedQuestionDetector {
 impl RuleBasedQuestionDetector {
     pub fn analyze(&self, turn: &ConversationTurn) -> RuleBasedQuestionAnalysis {
         if !is_eligible_turn(turn) {
-            return RuleBasedQuestionAnalysis::empty(turn, "ineligible_source_or_speaker");
+            return RuleBasedQuestionAnalysis::empty(
+                turn,
+                "ineligible_source_or_speaker",
+                false,
+                normalize_question_text(&turn.text),
+                self.config.candidate_utterance_window,
+            );
         }
 
         let normalized_full = normalize_question_text(&turn.text);
         if normalized_full.is_empty() {
-            return RuleBasedQuestionAnalysis::empty(turn, "empty_text");
+            return RuleBasedQuestionAnalysis::empty(
+                turn,
+                "empty_text",
+                true,
+                normalized_full,
+                self.config.candidate_utterance_window,
+            );
         }
 
         let candidate = extract_question_candidate(&turn.text);
         let normalized = normalize_question_text(&candidate);
         if normalized.is_empty() {
-            return RuleBasedQuestionAnalysis::empty(turn, "empty_candidate");
+            return RuleBasedQuestionAnalysis::empty(
+                turn,
+                "empty_candidate",
+                true,
+                normalized,
+                self.config.candidate_utterance_window,
+            );
         }
 
         let mut signals = Vec::new();
+        let mut penalties = Vec::new();
         if candidate.trim_end().ends_with('?') || turn.text.trim_end().ends_with('?') {
             signals.push(QuestionSignal::QuestionMark { weight: 0.45 });
         }
@@ -267,6 +348,29 @@ impl RuleBasedQuestionDetector {
             });
         }
 
+        collect_contained_signals(
+            &normalized,
+            YES_NO_DIRECTED_QUESTIONS,
+            0.60,
+            |phrase, weight| QuestionSignal::YesNoDirectedQuestion { phrase, weight },
+            &mut signals,
+        );
+
+        collect_contained_signals(
+            &normalized,
+            BEHAVIORAL_FRAGMENTS,
+            0.24,
+            |phrase, weight| QuestionSignal::BehavioralFragment { phrase, weight },
+            &mut signals,
+        );
+
+        if let Some(phrase) = find_contained_phrase(&normalized, CONTRASTIVE_CHOICES) {
+            signals.push(QuestionSignal::ContrastiveChoice {
+                phrase,
+                weight: 0.20,
+            });
+        }
+
         if let Some((phrase, observed)) = find_fuzzy_transcription_match(&normalized) {
             signals.push(QuestionSignal::TranscriptFuzzyMatch {
                 phrase,
@@ -276,14 +380,14 @@ impl RuleBasedQuestionDetector {
         }
 
         if starts_with_non_question_discourse(&normalized) {
-            signals.push(QuestionSignal::Penalty {
+            penalties.push(QuestionPenalty {
                 reason: "discourse_marker_not_question",
                 weight: -0.45,
             });
         }
 
         if looks_like_embedded_clause(&normalized) {
-            signals.push(QuestionSignal::Penalty {
+            penalties.push(QuestionPenalty {
                 reason: "embedded_interrogative_clause",
                 weight: -0.35,
             });
@@ -291,51 +395,113 @@ impl RuleBasedQuestionDetector {
 
         let word_count = normalized.split_whitespace().count();
         if word_count <= 2 {
-            signals.push(QuestionSignal::Penalty {
+            penalties.push(QuestionPenalty {
                 reason: "too_short_or_incomplete",
                 weight: -0.20,
             });
         }
         if is_standalone_interrogative(&normalized) {
-            signals.push(QuestionSignal::Penalty {
+            penalties.push(QuestionPenalty {
                 reason: "standalone_interrogative_word",
                 weight: -0.20,
             });
         }
 
-        let confidence = clamp_confidence(signals.iter().map(QuestionSignal::weight).sum());
+        let score = signals.iter().map(QuestionSignal::weight).sum::<f32>()
+            + penalties.iter().map(QuestionPenalty::weight).sum::<f32>();
+        let confidence = clamp_confidence(score);
         let question_text = restore_candidate_text(&candidate);
         RuleBasedQuestionAnalysis {
+            eligible: true,
             confidence,
             question_text,
             normalized_text: normalized,
             signals,
-            utterance_ids: candidate_utterance_ids(turn),
+            penalties,
+            utterance_ids: candidate_utterance_ids(turn, self.config.candidate_utterance_window),
+            reason: None,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleBasedQuestionAnalysis {
+    pub eligible: bool,
     pub confidence: f32,
     pub question_text: String,
     pub normalized_text: String,
     pub signals: Vec<QuestionSignal>,
+    pub penalties: Vec<QuestionPenalty>,
     pub utterance_ids: Vec<UtteranceId>,
+    pub reason: Option<&'static str>,
 }
 
 impl RuleBasedQuestionAnalysis {
-    fn empty(turn: &ConversationTurn, reason: &'static str) -> Self {
+    fn empty(
+        turn: &ConversationTurn,
+        reason: &'static str,
+        eligible: bool,
+        normalized_text: String,
+        utterance_window: usize,
+    ) -> Self {
         RuleBasedQuestionAnalysis {
+            eligible,
             confidence: 0.0,
             question_text: String::new(),
-            normalized_text: String::new(),
-            signals: vec![QuestionSignal::Penalty {
+            normalized_text,
+            signals: Vec::new(),
+            penalties: vec![QuestionPenalty {
                 reason,
                 weight: 0.0,
             }],
-            utterance_ids: candidate_utterance_ids(turn),
+            utterance_ids: candidate_utterance_ids(turn, utterance_window),
+            reason: Some(reason),
         }
+    }
+}
+
+fn status_reason(
+    analysis_reason: Option<&'static str>,
+    detected: bool,
+    confidence: f32,
+    high_confidence_threshold: f32,
+) -> &'static str {
+    if let Some(reason) = analysis_reason {
+        return reason;
+    }
+    if confidence >= high_confidence_threshold {
+        "high_confidence_score_above_threshold"
+    } else if detected {
+        "score_above_threshold"
+    } else {
+        "score_below_threshold"
+    }
+}
+
+fn decision_from_status_reason(reason: &str) -> QuestionDetectionDecision {
+    match reason {
+        "ineligible_source_or_speaker" => QuestionDetectionDecision::IneligibleSource,
+        "empty_text" | "empty_candidate" => QuestionDetectionDecision::EmptyText,
+        _ => QuestionDetectionDecision::BelowThreshold,
+    }
+}
+
+fn evaluation_from_detection(
+    detection: &QuestionDetection,
+    decision: QuestionDetectionDecision,
+) -> QuestionDetectionEvaluation {
+    QuestionDetectionEvaluation {
+        turn_id: detection.turn_id,
+        eligible: detection.speaker == ConversationSpeaker::OtherPerson
+            && detection.source == AudioSource::SystemOutput,
+        normalized_text: detection.normalized_text.clone(),
+        candidate_text: detection.candidate_text.clone(),
+        confidence: detection.confidence,
+        threshold: detection.threshold,
+        matched_signals: detection.matched_signals.clone(),
+        applied_penalties: detection.applied_penalties.clone(),
+        decision,
+        matched_utterance_ids: detection.matched_utterance_ids.clone(),
     }
 }
 
@@ -394,7 +560,17 @@ impl QuestionDetectionProcessor {
     ) -> Vec<QuestionDetectionEvent> {
         self.turns.insert(turn.id, turn);
         if !detection.detected || detection.confidence < self.config.question_threshold {
-            return self.dismiss_existing(detection.turn_id, now_ms, "score_below_threshold");
+            let mut events =
+                self.dismiss_existing(detection.turn_id, now_ms, detection.status_reason.as_str());
+            if events.is_empty() {
+                events.push(QuestionDetectionEvent::Evaluated {
+                    evaluation: evaluation_from_detection(
+                        &detection,
+                        decision_from_status_reason(&detection.status_reason),
+                    ),
+                });
+            }
+            return events;
         }
 
         detection.status = QuestionDetectionStatus::Candidate;
@@ -416,17 +592,52 @@ impl QuestionDetectionProcessor {
                     normalized_text = %record.detection.normalized_text,
                     "question candidate detected"
                 );
-                return vec![QuestionDetectionEvent::Updated {
-                    detection: record.detection.clone(),
-                }];
+                if is_finalized {
+                    let updated = QuestionDetectionEvent::Updated {
+                        detection: record.detection.clone(),
+                    };
+                    let superseded = QuestionDetectionEvent::Evaluated {
+                        evaluation: evaluation_from_detection(
+                            &record.detection,
+                            QuestionDetectionDecision::Superseded,
+                        ),
+                    };
+                    let mut events = vec![updated, superseded];
+                    events.extend(confirm_record(record, turn_id, "turn_finalized"));
+                    return events;
+                }
+                return vec![
+                    QuestionDetectionEvent::Updated {
+                        detection: record.detection.clone(),
+                    },
+                    QuestionDetectionEvent::Evaluated {
+                        evaluation: evaluation_from_detection(
+                            &record.detection,
+                            QuestionDetectionDecision::Superseded,
+                        ),
+                    },
+                ];
             }
             record.detection = detection;
             if is_finalized
                 || now_ms.saturating_sub(record.last_changed_at_ms) >= self.config.debounce_ms
             {
-                return confirm_record(record, turn_id);
+                return confirm_record(
+                    record,
+                    turn_id,
+                    if is_finalized {
+                        "turn_finalized"
+                    } else {
+                        "debounce_elapsed"
+                    },
+                );
             }
-            return Vec::new();
+            return vec![QuestionDetectionEvent::Evaluated {
+                evaluation: evaluation_from_detection(
+                    &record.detection,
+                    QuestionDetectionDecision::Duplicate,
+                ),
+            }];
         }
 
         debug!(
@@ -443,11 +654,23 @@ impl QuestionDetectionProcessor {
             last_changed_at_ms: now_ms,
             last_confirmed_fingerprint: None,
         };
+        if is_finalized {
+            let mut record = record;
+            let events = confirm_record(&mut record, turn_id, "turn_finalized");
+            self.detections_by_turn.insert(turn_id, record);
+            return events;
+        }
         let event = QuestionDetectionEvent::Candidate {
             detection: record.detection.clone(),
         };
+        let evaluation = QuestionDetectionEvent::Evaluated {
+            evaluation: evaluation_from_detection(
+                &record.detection,
+                QuestionDetectionDecision::Candidate,
+            ),
+        };
         self.detections_by_turn.insert(turn_id, record);
-        vec![event]
+        vec![event, evaluation]
     }
 
     pub fn confirm_due(&mut self, now_ms: u64) -> Vec<QuestionDetectionEvent> {
@@ -457,7 +680,7 @@ impl QuestionDetectionProcessor {
                 continue;
             }
             if now_ms.saturating_sub(record.last_changed_at_ms) >= self.config.debounce_ms {
-                events.extend(confirm_record(record, *turn_id));
+                events.extend(confirm_record(record, *turn_id, "debounce_elapsed"));
             }
         }
         events
@@ -488,10 +711,14 @@ impl QuestionDetectionProcessor {
                 phrase: "manual",
                 weight: 1.0,
             }],
+            applied_penalties: Vec::new(),
             detected_at: turn.ended_at,
             detection_mode: QuestionDetectionMode::RuleBased,
             status: QuestionDetectionStatus::Confirmed,
             normalized_text: normalized_text.clone(),
+            candidate_text: Some(restore_candidate_text(&turn.text)),
+            threshold: self.config.question_threshold,
+            matched_utterance_ids: turn.utterances.clone(),
             utterance_ids: turn.utterances.clone(),
             status_reason: "manual_mark".into(),
         };
@@ -517,7 +744,7 @@ impl QuestionDetectionProcessor {
         &mut self,
         turn_id: TurnId,
         now_ms: u64,
-        reason: &'static str,
+        reason: &str,
     ) -> Vec<QuestionDetectionEvent> {
         let Some(record) = self.detections_by_turn.get_mut(&turn_id) else {
             return Vec::new();
@@ -533,21 +760,33 @@ impl QuestionDetectionProcessor {
             turn_id = turn_id.value(),
             reason, "question candidate dismissed"
         );
-        vec![QuestionDetectionEvent::Dismissed {
-            detection_id: record.detection.id,
-            turn_id,
-        }]
+        vec![
+            QuestionDetectionEvent::Dismissed {
+                detection_id: record.detection.id,
+                turn_id,
+            },
+            QuestionDetectionEvent::Evaluated {
+                evaluation: evaluation_from_detection(
+                    &record.detection,
+                    QuestionDetectionDecision::Dismissed,
+                ),
+            },
+        ]
     }
 }
 
-fn confirm_record(record: &mut DetectionRecord, turn_id: TurnId) -> Vec<QuestionDetectionEvent> {
+fn confirm_record(
+    record: &mut DetectionRecord,
+    turn_id: TurnId,
+    reason: &'static str,
+) -> Vec<QuestionDetectionEvent> {
     if record.last_confirmed_fingerprint == Some(record.fingerprint) {
         return Vec::new();
     }
     record.status = QuestionDetectionStatus::Confirmed;
     record.last_confirmed_fingerprint = Some(record.fingerprint);
     record.detection.status = QuestionDetectionStatus::Confirmed;
-    record.detection.status_reason = "debounce_elapsed".into();
+    record.detection.status_reason = reason.into();
     info!(
         turn_id = turn_id.value(),
         confidence = record.detection.confidence,
@@ -560,9 +799,17 @@ fn confirm_record(record: &mut DetectionRecord, turn_id: TurnId) -> Vec<Question
         signals = ?record.detection.matched_signals,
         "question confirmed details"
     );
-    vec![QuestionDetectionEvent::Confirmed {
-        detection: record.detection.clone(),
-    }]
+    vec![
+        QuestionDetectionEvent::Confirmed {
+            detection: record.detection.clone(),
+        },
+        QuestionDetectionEvent::Evaluated {
+            evaluation: evaluation_from_detection(
+                &record.detection,
+                QuestionDetectionDecision::Confirmed,
+            ),
+        },
+    ]
 }
 
 pub struct QuestionDetectionState {
@@ -717,12 +964,19 @@ fn extract_question_candidate(text: &str) -> String {
         return clean;
     }
     if let Some(question_mark) = clean.rfind('?') {
-        let prefix = &clean[..question_mark];
-        let start = prefix
-            .rfind(['.', '!', '\n'])
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        return clean[start..=question_mark].trim().to_string();
+        let through_question = &clean[..=question_mark];
+        let parts = split_candidate_clauses(through_question);
+        if let Some(last) = parts.last() {
+            if parts.len() >= 2 {
+                let previous_index = parts.len() - 2;
+                if has_strong_question_signal(&normalize_question_text(&parts[previous_index]))
+                    && has_strong_question_signal(&normalize_question_text(last))
+                {
+                    return parts[previous_index..].join(" ").trim().to_string();
+                }
+            }
+            return last.trim().to_string();
+        }
     }
 
     let parts = split_candidate_clauses(&clean);
@@ -730,6 +984,12 @@ fn extract_question_candidate(text: &str) -> String {
         let tail = parts[index..].join(" ");
         let normalized = normalize_question_text(&tail);
         if has_strong_question_signal(&normalized) {
+            if index > 0 {
+                let previous = normalize_question_text(&parts[index - 1]);
+                if has_strong_question_signal(&previous) {
+                    return parts[index - 1..].join(" ").trim().to_string();
+                }
+            }
             return tail.trim().to_string();
         }
     }
@@ -737,25 +997,67 @@ fn extract_question_candidate(text: &str) -> String {
 }
 
 fn split_candidate_clauses(text: &str) -> Vec<String> {
-    text.split(['.', '!', '\n'])
-        .flat_map(|part| {
-            let trimmed = part.trim();
-            if trimmed.len() > 120 {
-                trimmed.split(", ").map(str::trim).collect::<Vec<_>>()
-            } else {
-                vec![trimmed]
-            }
-        })
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    for (index, ch) in text.char_indices() {
+        if matches!(ch, '.' | '!' | '?' | '\n') {
+            let end = index + ch.len_utf8();
+            push_candidate_clause(&mut clauses, &text[start..end]);
+            start = end;
+        }
+    }
+    if start < text.len() {
+        push_candidate_clause(&mut clauses, &text[start..]);
+    }
+    clauses
+}
+
+fn push_candidate_clause(clauses: &mut Vec<String>, part: &str) {
+    let trimmed = part.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if trimmed.len() > 120 {
+        clauses.extend(
+            trimmed
+                .split(", ")
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    } else {
+        clauses.push(trimmed.to_owned());
+    }
 }
 
 fn has_strong_question_signal(normalized: &str) -> bool {
     find_prefix(normalized, INTERROGATIVE_PREFIXES).is_some()
         || find_contained_phrase(normalized, INTERROGATIVE_CONSTRUCTIONS).is_some()
         || find_contained_phrase(normalized, INTERVIEW_PATTERNS).is_some()
+        || find_contained_phrase(normalized, YES_NO_DIRECTED_QUESTIONS).is_some()
+        || count_contained_phrases(normalized, BEHAVIORAL_FRAGMENTS) >= 2
         || find_fuzzy_transcription_match(normalized).is_some()
+}
+
+fn collect_contained_signals(
+    text: &str,
+    phrases: &[&'static str],
+    weight: f32,
+    build: impl Fn(&'static str, f32) -> QuestionSignal,
+    signals: &mut Vec<QuestionSignal>,
+) {
+    for phrase in phrases {
+        if contains_phrase(text, phrase) {
+            signals.push(build(phrase, weight));
+        }
+    }
+}
+
+fn count_contained_phrases(text: &str, phrases: &[&'static str]) -> usize {
+    phrases
+        .iter()
+        .filter(|phrase| contains_phrase(text, phrase))
+        .count()
 }
 
 fn find_prefix(text: &str, phrases: &[&'static str]) -> Option<&'static str> {
@@ -797,10 +1099,12 @@ fn is_standalone_interrogative(text: &str) -> bool {
 
 fn find_fuzzy_transcription_match(text: &str) -> Option<(&'static str, String)> {
     let words = text.split_whitespace().collect::<Vec<_>>();
-    words.windows(2).find_map(|window| {
-        let observed = format!("{} {}", window[0], window[1]);
-        (levenshtein(&observed, "me descreva") <= 1 || levenshtein(&observed, "me descreve") <= 1)
-            .then_some(("me descreva", observed))
+    FUZZY_PHRASES.iter().find_map(|phrase| {
+        let size = phrase.split_whitespace().count();
+        words.windows(size).find_map(|window| {
+            let observed = window.join(" ");
+            (levenshtein(&observed, phrase) <= 1).then_some((*phrase, observed))
+        })
     })
 }
 
@@ -822,8 +1126,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
     costs[b.chars().count()]
 }
 
-fn candidate_utterance_ids(turn: &ConversationTurn) -> Vec<UtteranceId> {
-    let count = turn.utterances.len().min(2);
+fn candidate_utterance_ids(turn: &ConversationTurn, window: usize) -> Vec<UtteranceId> {
+    let count = turn.utterances.len().min(window.max(1));
     turn.utterances
         .iter()
         .skip(turn.utterances.len().saturating_sub(count))
@@ -869,6 +1173,7 @@ const INTERROGATIVE_CONSTRUCTIONS: &[&str] = &[
     "me de um exemplo",
     "qual foi",
     "como lidou",
+    "como lida",
     "o que faria",
     "o que você faria",
     "onde você",
@@ -876,11 +1181,15 @@ const INTERROGATIVE_CONSTRUCTIONS: &[&str] = &[
     "gostaria que você explicasse",
     "quero que você me conte",
     "pode falar",
+    "conte uma situação",
+    "conte uma situacao",
 ];
 
 const INTERVIEW_PATTERNS: &[&str] = &[
     "fale sobre você",
     "me conte sobre sua experiência",
+    "conte uma situação",
+    "conte uma situacao",
     "qual foi seu maior desafio",
     "como você resolveu",
     "como você lidou",
@@ -918,6 +1227,68 @@ const DIRECTED_VERBS: &[&str] = &[
     "quero que você",
 ];
 
+const YES_NO_DIRECTED_QUESTIONS: &[&str] = &[
+    "você chegou a",
+    "voce chegou a",
+    "você já",
+    "voce ja",
+    "você teve",
+    "voce teve",
+    "você faria",
+    "voce faria",
+    "você consegue",
+    "voce consegue",
+    "você poderia",
+    "voce poderia",
+    "você considera",
+    "voce considera",
+    "você prefere",
+    "voce prefere",
+    "você concorda",
+    "voce concorda",
+    "você conhece",
+    "voce conhece",
+    "você costuma",
+    "voce costuma",
+    "você acredita",
+    "voce acredita",
+    "você acha",
+    "voce acha",
+    "você se considera",
+    "voce se considera",
+];
+
+const BEHAVIORAL_FRAGMENTS: &[&str] = &[
+    "uma situação em que",
+    "uma situacao em que",
+    "toma situação em que",
+    "toma situacao em que",
+    "situação onde",
+    "situacao onde",
+    "um momento em que",
+    "um exemplo de",
+    "como reagiu",
+    "como resolveu",
+    "como lidou",
+    "como lida",
+    "o que fez",
+    "o que aconteceu depois",
+    "qual foi o resultado",
+];
+
+const CONTRASTIVE_CHOICES: &[&str] = &["ou só", "ou so"];
+
+const FUZZY_PHRASES: &[&str] = &[
+    "me descreva",
+    "me descreve",
+    "me conte",
+    "me conta",
+    "como lidou",
+    "como lida",
+    "discordar",
+    "descordar",
+];
+
 const NON_QUESTION_PREFIXES: &[&str] = &[
     "como disse",
     "como eu disse",
@@ -943,12 +1314,21 @@ mod tests {
     use super::*;
 
     fn turn(source: AudioSource, speaker: ConversationSpeaker, text: &str) -> ConversationTurn {
+        turn_with_utterances(source, speaker, text, vec![10, 11])
+    }
+
+    fn turn_with_utterances(
+        source: AudioSource,
+        speaker: ConversationSpeaker,
+        text: &str,
+        utterances: Vec<u64>,
+    ) -> ConversationTurn {
         ConversationTurn {
             id: TurnId::from_raw(1),
             speaker,
             source,
             text: text.into(),
-            utterances: vec![UtteranceId::from_raw(10), UtteranceId::from_raw(11)],
+            utterances: utterances.into_iter().map(UtteranceId::from_raw).collect(),
             started_at: AudioTimestamp(0),
             ended_at: AudioTimestamp(1_000),
             finalized_at: None,
@@ -972,6 +1352,20 @@ mod tests {
             .detect(&other(text), &[])
             .await
             .unwrap()
+    }
+
+    async fn detect_turn(turn: &ConversationTurn) -> QuestionDetection {
+        RuleBasedQuestionDetector::default()
+            .detect(turn, &[])
+            .await
+            .unwrap()
+    }
+
+    fn confirmed_events(events: &[QuestionDetectionEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| matches!(event, QuestionDetectionEvent::Confirmed { .. }))
+            .count()
     }
 
     fn processor() -> QuestionDetectionProcessor {
@@ -1103,9 +1497,18 @@ mod tests {
         let first = detect("Qual foi seu maior desafio").await;
         p.apply_turn_detection(first, other("Qual foi seu maior desafio"), false, 0);
         let second = detect("Qual foi seu maior desafio").await;
-        assert!(p
-            .apply_turn_detection(second, other("Qual foi seu maior desafio"), false, 100)
-            .is_empty());
+        let events =
+            p.apply_turn_detection(second, other("Qual foi seu maior desafio"), false, 100);
+        assert_eq!(confirmed_events(&events), 0);
+        assert!(matches!(
+            events[0],
+            QuestionDetectionEvent::Evaluated {
+                evaluation: QuestionDetectionEvaluation {
+                    decision: QuestionDetectionDecision::Duplicate,
+                    ..
+                }
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1286,9 +1689,8 @@ mod tests {
         p.apply_turn_detection(detection, other("Qual foi seu maior desafio"), false, 0);
         p.confirm_due(801);
         let same = detect("Qual foi seu maior desafio").await;
-        assert!(p
-            .apply_turn_detection(same, other("Qual foi seu maior desafio"), false, 900)
-            .is_empty());
+        let events = p.apply_turn_detection(same, other("Qual foi seu maior desafio"), false, 900);
+        assert_eq!(confirmed_events(&events), 0);
     }
 
     #[tokio::test]
@@ -1305,5 +1707,206 @@ mod tests {
                 .await
                 .detected
         );
+    }
+
+    #[tokio::test]
+    async fn detects_real_asr_feedback_prompt() {
+        let detection = detect(
+            "Então toma situação em que você recebeu um feedback difícil, como reagiu e o que fez depois.",
+        )
+        .await;
+
+        assert!(detection.detected);
+        assert!(
+            (detection.confidence - 1.0).abs() < 0.001,
+            "confidence={}",
+            detection.confidence
+        );
+        assert!(detection.matched_signals.iter().any(|signal| matches!(
+            signal,
+            QuestionSignal::BehavioralFragment { phrase, .. } if *phrase == "toma situação em que"
+        )));
+    }
+
+    #[tokio::test]
+    async fn detects_intended_feedback_prompt() {
+        let detection = detect(
+            "Conte uma situação em que você recebeu um feedback difícil, como reagiu e o que fez depois.",
+        )
+        .await;
+
+        assert!(detection.detected);
+        assert!(detection.confidence >= 0.60);
+    }
+
+    #[tokio::test]
+    async fn detects_real_asr_discordar_prompt_score() {
+        let detection = detect(
+            "e você chegou a descordar essa mudança ou só seguir o enfrente. como lido com insunodia dia.",
+        )
+        .await;
+
+        assert!(detection.detected);
+        assert!((detection.confidence - 1.0).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn detects_yes_no_directed_question_with_discordar() {
+        let detection =
+            detect("Você chegou a discordar dessa mudança ou só seguiu em frente.").await;
+
+        assert!(detection.detected);
+        assert!(detection
+            .matched_signals
+            .iter()
+            .any(|signal| matches!(signal, QuestionSignal::YesNoDirectedQuestion { .. })));
+    }
+
+    #[tokio::test]
+    async fn detects_how_lida_day_to_day_question() {
+        let detection = detect("Como lida com isso no dia a dia.").await;
+
+        assert!(detection.detected);
+        assert!(detection.confidence >= 0.60);
+    }
+
+    #[tokio::test]
+    async fn preserves_two_final_utterances_for_compound_question() {
+        let turn = turn_with_utterances(
+            AudioSource::SystemOutput,
+            ConversationSpeaker::OtherPerson,
+            "Você chegou a discordar dessa mudança ou só seguiu em frente. Como lida com isso no dia a dia.",
+            vec![101, 102],
+        );
+        let detection = detect_turn(&turn).await;
+
+        assert!(detection.detected);
+        assert_eq!(
+            detection.matched_utterance_ids,
+            vec![UtteranceId::from_raw(101), UtteranceId::from_raw(102)]
+        );
+        assert_eq!(
+            detection.question_text.as_deref(),
+            Some("Você chegou a discordar dessa mudança ou só seguiu em frente. Como lida com isso no dia a dia.")
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_two_punctuated_questions_for_manual_validation_case() {
+        let detection = detect(
+            "Você chegou a discordar dessa mudança ou só seguiu em frente? Como lidou com isso no dia a dia?",
+        )
+        .await;
+
+        assert!(detection.detected);
+        assert_eq!(
+            detection.question_text.as_deref(),
+            Some(
+                "Você chegou a discordar dessa mudança ou só seguiu em frente? Como lidou com isso no dia a dia?"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn detects_yes_no_question_without_question_mark() {
+        assert!(
+            detect("Você já precisou lidar com uma entrega atrasada")
+                .await
+                .detected
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_sentence_with_voce_is_not_question() {
+        assert!(
+            !detect("Você fez isso ontem durante a reunião.")
+                .await
+                .detected
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_candidate_finalized_confirms_final_text_once() {
+        let mut p = processor();
+        let first = detect("Qual foi seu maior desafio").await;
+        let first_events =
+            p.apply_turn_detection(first, other("Qual foi seu maior desafio"), false, 0);
+        let detection_id = match &first_events[0] {
+            QuestionDetectionEvent::Candidate { detection } => detection.id,
+            _ => panic!("expected candidate"),
+        };
+
+        let final_text = "Qual foi seu maior desafio e como você resolveu";
+        let finalized = detect(final_text).await;
+        let events = p.apply_turn_detection(finalized, other(final_text), true, 100);
+
+        assert!(matches!(events[0], QuestionDetectionEvent::Updated { .. }));
+        assert_eq!(confirmed_events(&events), 1);
+        let confirmed = events.iter().find_map(|event| match event {
+            QuestionDetectionEvent::Confirmed { detection } => Some(detection),
+            _ => None,
+        });
+        assert_eq!(confirmed.map(|detection| detection.id), Some(detection_id));
+        assert_eq!(
+            confirmed.and_then(|detection| detection.question_text.as_deref()),
+            Some(final_text)
+        );
+        assert_eq!(confirmed_events(&p.confirm_due(901)), 0);
+    }
+
+    #[tokio::test]
+    async fn finalized_turn_without_pending_candidate_confirms_immediately() {
+        let mut p = processor();
+        let detection = detect("Conte uma situação em que você recebeu um feedback difícil").await;
+        let events = p.apply_turn_detection(
+            detection,
+            other("Conte uma situação em que você recebeu um feedback difícil"),
+            true,
+            0,
+        );
+
+        assert_eq!(confirmed_events(&events), 1);
+    }
+
+    #[tokio::test]
+    async fn evaluation_below_threshold_is_emitted_for_remote_turn() {
+        let mut p = processor();
+        let detection = detect("Você fez isso ontem durante a reunião.").await;
+        let events = p.apply_turn_detection(
+            detection,
+            other("Você fez isso ontem durante a reunião."),
+            false,
+            0,
+        );
+
+        assert!(matches!(
+            events[0],
+            QuestionDetectionEvent::Evaluated {
+                evaluation: QuestionDetectionEvaluation {
+                    eligible: true,
+                    decision: QuestionDetectionDecision::BelowThreshold,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn evaluation_ineligible_source_is_emitted() {
+        let mut p = processor();
+        let user_turn = user("Você já passou por isso?");
+        let detection = detect_turn(&user_turn).await;
+        let events = p.apply_turn_detection(detection, user_turn, false, 0);
+
+        assert!(matches!(
+            events[0],
+            QuestionDetectionEvent::Evaluated {
+                evaluation: QuestionDetectionEvaluation {
+                    eligible: false,
+                    decision: QuestionDetectionDecision::IneligibleSource,
+                    ..
+                }
+            }
+        ));
     }
 }
