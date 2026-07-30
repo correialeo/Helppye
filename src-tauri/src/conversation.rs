@@ -8,11 +8,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
-use tracing::{info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
 use crate::audio::types::{AudioCaptureEvent, AudioSource};
@@ -49,6 +50,10 @@ impl UtteranceId {
     pub(crate) fn from_raw(value: u64) -> Self {
         UtteranceId(value)
     }
+
+    pub fn value(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -66,21 +71,28 @@ impl TurnId {
     }
 }
 
-/// Identifica um processo de app em execução (uma "sessão" de captura). Não persiste
-/// entre execuções — gerado uma vez quando o `ConversationTimeline` é criado, a partir do
-/// relógio de parede, só para dar aos eventos `UtteranceFinalized` uma referência estável
-/// dentro da mesma sessão (ver `docs/response-suggestion.md`).
+/// Contador global de sessões do processo. Monotônico (não derivado do relógio de parede,
+/// que pode repetir ou andar para trás): a identidade da sessão é usada para *rejeitar*
+/// trabalho antigo, então dois ids iguais em sessões diferentes seriam uma falha de
+/// isolamento, não um detalhe cosmético.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identifica uma sessão de conversa (do "Iniciar sessão" ao "Encerrar sessão"), não o
+/// processo do app: encerrar uma sessão descarta todo o estado conversacional e cria uma
+/// nova `SessionId`. É a fronteira rígida que o `ResponseEngine` valida antes de montar
+/// contexto, iniciar geração ou publicar qualquer evento — ver
+/// `docs/response-suggestion.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SessionId(u64);
 
 impl SessionId {
     pub(crate) fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        SessionId(nanos)
+        SessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn value(self) -> u64 {
+        self.0
     }
 }
 
@@ -333,6 +345,20 @@ pub enum ConversationTimelineEvent {
     },
     TurnFinalized {
         turn: ConversationTurn,
+        /// Sessão dona deste turno. Sem isso, `process_conversation_events` não teria como
+        /// recusar um turno de uma sessão já encerrada ao alimentar o histórico usado no
+        /// prompt — era exatamente por aí que a conversa de uma sessão vazava para a
+        /// seguinte.
+        session_id: SessionId,
+    },
+    /// Fronteira de sessão: tudo que veio antes pertence a `session_id` e não deve mais
+    /// influenciar nada. O frontend usa isso para zerar o que está em tela sem depender de
+    /// a janela de sessão ser desmontada.
+    SessionEnded {
+        session_id: SessionId,
+    },
+    SessionStarted {
+        session_id: SessionId,
     },
 }
 
@@ -668,7 +694,39 @@ impl ConversationAssembler {
             "conversation turn finalized"
         );
         self.finalized_turns.push(turn.clone());
-        vec![ConversationTimelineEvent::TurnFinalized { turn }]
+        vec![ConversationTimelineEvent::TurnFinalized {
+            turn,
+            session_id: self.session_id,
+        }]
+    }
+
+    /// Descarta *todo* o conteúdo conversacional e abre uma nova sessão. Só a configuração
+    /// (gaps/timeouts) sobrevive — ela é preferência do usuário, não conversa.
+    ///
+    /// `next_utterance_id`/`next_turn_id` continuam de onde estavam de propósito: ids
+    /// únicos por processo tornam impossível um evento atrasado da sessão anterior casar
+    /// com um turno/utterance da nova por coincidência de id (a identidade lógica é
+    /// `session_id + turn_id + utterance_id`, ver `docs/response-suggestion.md`).
+    fn reset_for_new_session(&mut self) -> SessionId {
+        let previous_session_id = self.session_id;
+        let discarded_turns = self.finalized_turns.len() + usize::from(self.open_turn.is_some());
+        let discarded_utterances =
+            self.finalized_utterances.len() + usize::from(self.open_utterance.is_some());
+        self.open_utterance = None;
+        self.finalized_utterances.clear();
+        self.open_turn = None;
+        self.finalized_turns.clear();
+        self.raw_segments.clear();
+        self.last_finalized_ended_at = None;
+        self.session_id = SessionId::new();
+        info!(
+            previous_session_id = previous_session_id.0,
+            new_session_id = self.session_id.0,
+            discarded_turns,
+            discarded_utterances,
+            "session_state_cleared"
+        );
+        self.session_id
     }
 
     fn finalize_source(
@@ -775,10 +833,24 @@ pub struct ConversationTimelineSnapshot {
 /// mesmo jeito que uma finalizada por um novo segmento.
 pub type ConversationEventSink = Arc<dyn Fn(Vec<ConversationTimelineEvent>) + Send + Sync>;
 
+/// Resultado de uma transição de sessão. `events` já vem na ordem em que deve chegar ao
+/// frontend (finalizações da sessão que acabou, depois a fronteira).
+pub struct SessionTransition {
+    pub previous_session_id: SessionId,
+    pub session_id: SessionId,
+    pub events: Vec<ConversationTimelineEvent>,
+}
+
 pub struct ConversationTimeline {
     assembler: Mutex<ConversationAssembler>,
     next_sequence: AtomicU64,
     sink: OnceLock<ConversationEventSink>,
+    /// Token raiz da sessão atual: cancelado (e substituído por um novo) em toda
+    /// transição de sessão, para que nenhum timer de utterance agendado na sessão
+    /// anterior chegue a rodar. A checagem de `session_id`/revisão em
+    /// `fire_utterance_timeout` já tornaria o timer um no-op, mas cancelar é o que
+    /// garante que a task nem acorda — ver `docs/response-suggestion.md`.
+    session_cancel: Mutex<CancellationToken>,
     /// Referência fraca a si mesmo, usada para o timer dedicado poder chamar de volta em
     /// `fire_utterance_timeout` depois de `tokio::time::sleep`. Só fica populada depois de
     /// `attach()`; sem isso (app encerrando, ou testes que não chamam `attach`), o timer
@@ -798,6 +870,7 @@ impl ConversationTimeline {
             assembler: Mutex::new(ConversationAssembler::new(config)),
             next_sequence: AtomicU64::new(0),
             sink: OnceLock::new(),
+            session_cancel: Mutex::new(CancellationToken::new()),
             self_weak: OnceLock::new(),
         }
     }
@@ -811,6 +884,59 @@ impl ConversationTimeline {
 
     pub fn set_event_sink(&self, sink: ConversationEventSink) {
         let _ = self.sink.set(sink);
+    }
+
+    /// Sessão ativa neste momento. Todo evento/tarefa que se refira à conversa carrega
+    /// uma `SessionId` e é comparado com esta antes de produzir qualquer efeito.
+    pub fn session_id(&self) -> SessionId {
+        self.assembler
+            .lock()
+            .expect("conversation timeline mutex poisoned")
+            .session_id
+    }
+
+    /// Cancela o token da sessão que está saindo e instala um token raiz novo. Nunca
+    /// reaproveita um token já cancelado.
+    fn rotate_session_token(&self) {
+        let mut token = self
+            .session_cancel
+            .lock()
+            .expect("conversation timeline mutex poisoned");
+        token.cancel();
+        *token = CancellationToken::new();
+    }
+
+    fn session_token(&self) -> CancellationToken {
+        self.session_cancel
+            .lock()
+            .expect("conversation timeline mutex poisoned")
+            .clone()
+    }
+
+    /// Abre uma sessão nova, descartando qualquer resto da anterior (utterance/turno
+    /// aberto incluídos — são descartados, não finalizados: pertencem a uma conversa que
+    /// não existe mais). Idempotente no sentido que importa: chamar duas vezes só produz
+    /// outra fronteira sobre um estado já vazio.
+    pub fn start_session(&self) -> SessionTransition {
+        self.rotate_session_token();
+        let (previous_session_id, session_id) = {
+            let mut assembler = self
+                .assembler
+                .lock()
+                .expect("conversation timeline mutex poisoned");
+            let previous = assembler.session_id;
+            (previous, assembler.reset_for_new_session())
+        };
+        info!(
+            session_id = session_id.0,
+            previous_session_id = previous_session_id.0,
+            "session_started"
+        );
+        SessionTransition {
+            previous_session_id,
+            session_id,
+            events: vec![ConversationTimelineEvent::SessionStarted { session_id }],
+        }
     }
 
     /// `same_speaker_utterance_gap_ms` atualmente em uso — configurável em runtime via
@@ -860,7 +986,7 @@ impl ConversationTimeline {
     /// novo com a revisão atual. Se não houver utterance aberta, ou o timeline ainda não
     /// tiver sido `attach()`ado, não faz nada.
     fn reschedule_utterance_timer(&self) {
-        let (identity, gap_ms) = {
+        let (identity, gap_ms, session_id) = {
             let assembler = self
                 .assembler
                 .lock()
@@ -868,6 +994,7 @@ impl ConversationTimeline {
             (
                 assembler.open_utterance_identity(),
                 assembler.config.same_speaker_utterance_gap_ms,
+                assembler.session_id,
             )
         };
         let Some((utterance_id, revision)) = identity else {
@@ -876,22 +1003,50 @@ impl ConversationTimeline {
         let Some(timeline) = self.self_weak.get().and_then(Weak::upgrade) else {
             return;
         };
+        let session_token = self.session_token();
 
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
-            timeline.fire_utterance_timeout(utterance_id, revision);
+            tokio::select! {
+                _ = session_token.cancelled() => {
+                    debug!(
+                        session_id = session_id.0,
+                        utterance_id = utterance_id.0,
+                        "utterance timer dropped: session ended before it fired"
+                    );
+                }
+                _ = tokio::time::sleep(Duration::from_millis(gap_ms)) => {
+                    timeline.fire_utterance_timeout(session_id, utterance_id, revision);
+                }
+            }
         });
     }
 
-    /// Executado quando um timer de utterance expira. Só produz efeito se a utterance
-    /// ainda for a mesma (mesmo id + revisão) que estava aberta quando o timer foi
-    /// agendado — ver `ConversationAssembler::finalize_utterance_if_stale`.
-    fn fire_utterance_timeout(&self, utterance_id: UtteranceId, revision: u64) {
+    /// Executado quando um timer de utterance expira. Só produz efeito se ainda estivermos
+    /// na mesma sessão *e* a utterance aberta ainda for a mesma (mesmo id + revisão) que
+    /// estava aberta quando o timer foi agendado — ver
+    /// `ConversationAssembler::finalize_utterance_if_stale`. A checagem de sessão é o que
+    /// impede um timer agendado na sessão A de finalizar (e disparar geração para) uma
+    /// utterance depois que a sessão B começou.
+    fn fire_utterance_timeout(
+        &self,
+        session_id: SessionId,
+        utterance_id: UtteranceId,
+        revision: u64,
+    ) {
         let events = {
             let mut assembler = self
                 .assembler
                 .lock()
                 .expect("conversation timeline mutex poisoned");
+            if assembler.session_id != session_id {
+                debug!(
+                    timer_session_id = session_id.0,
+                    active_session_id = assembler.session_id.0,
+                    utterance_id = utterance_id.0,
+                    "utterance timer discarded: belongs to a finished session"
+                );
+                return;
+            }
             assembler.finalize_utterance_if_stale(utterance_id, revision)
         };
         if events.is_empty() {
@@ -922,11 +1077,42 @@ impl ConversationTimeline {
             .flush()
     }
 
-    pub fn end_session(&self) -> Vec<ConversationTimelineEvent> {
-        self.assembler
+    /// Encerra a sessão ativa: finaliza o que estava aberto (para o frontend ver a
+    /// conversa fechada), cancela os timers em voo, apaga *todo* o estado conversacional e
+    /// já abre a fronteira da próxima sessão. Os eventos devolvidos pertencem à sessão que
+    /// acabou e **não** devem ser reprocessados pelo `ResponseEngine` — ver
+    /// `conversation_end_session_command`.
+    pub fn end_session(&self) -> SessionTransition {
+        let previous_session_id = self.session_id();
+        info!(session_id = previous_session_id.0, "session_ending");
+
+        let mut events = self
+            .assembler
             .lock()
             .expect("conversation timeline mutex poisoned")
-            .end_session()
+            .end_session();
+        events.push(ConversationTimelineEvent::SessionEnded {
+            session_id: previous_session_id,
+        });
+
+        self.rotate_session_token();
+        let session_id = self
+            .assembler
+            .lock()
+            .expect("conversation timeline mutex poisoned")
+            .reset_for_new_session();
+        events.push(ConversationTimelineEvent::SessionStarted { session_id });
+        info!(
+            session_id = previous_session_id.0,
+            next_session_id = session_id.0,
+            "session_ended"
+        );
+
+        SessionTransition {
+            previous_session_id,
+            session_id,
+            events,
+        }
     }
 
     pub fn snapshot(&self) -> ConversationTimelineSnapshot {
@@ -965,15 +1151,53 @@ pub async fn conversation_flush_turns_command(
     Ok(())
 }
 
+/// Abre uma sessão nova e vazia. Chamado pelo frontend ao iniciar uma sessão, antes de
+/// qualquer captura: garante a fronteira mesmo que a sessão anterior tenha terminado por
+/// um caminho que não passou por `conversation_end_session_command`.
+#[tauri::command]
+pub async fn conversation_start_session_command(
+    app: AppHandle,
+    state: State<'_, ConversationTimelineState>,
+    response_state: State<'_, ResponseEngineState>,
+) -> Result<(), String> {
+    let engine = response_state.0.clone();
+    // Encerra o que estiver ativo no motor antes de trocar a fronteira: cancela geração em
+    // andamento e limpa contexto da sessão anterior.
+    engine.end_session(state.0.session_id());
+    let transition = state.0.start_session();
+    engine.begin_session(transition.session_id);
+    info!(
+        previous_session_id = transition.previous_session_id.value(),
+        session_id = transition.session_id.value(),
+        "conversation session boundary opened"
+    );
+    emit_conversation_events(&app, transition.events);
+    Ok(())
+}
+
+/// Encerramento atômico e ordenado: marca a sessão como encerrando (nenhum gatilho novo é
+/// aceito), cancela a geração ativa e os timers, apaga contexto/turnos/utterances/segmentos
+/// e só então abre a fronteira da próxima sessão. Os eventos de finalização são emitidos
+/// ao frontend, mas **não** passam por `process_conversation_events` — reprocessá-los era
+/// justamente o que fazia a última fala da sessão encerrada gerar uma sugestão que
+/// aparecia na sessão seguinte. Idempotente: encerrar duas vezes só troca a fronteira de
+/// novo, sobre um estado já vazio.
 #[tauri::command]
 pub async fn conversation_end_session_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
     response_state: State<'_, ResponseEngineState>,
 ) -> Result<(), String> {
-    let events = state.0.end_session();
-    emit_conversation_events(&app, events.clone());
-    process_conversation_events(&app, response_state.0.clone(), &events);
+    let engine = response_state.0.clone();
+    engine.end_session(state.0.session_id());
+    let transition = state.0.end_session();
+    info!(
+        previous_session_id = transition.previous_session_id.value(),
+        session_id = transition.session_id.value(),
+        "conversation session boundary closed"
+    );
+    emit_conversation_events(&app, transition.events);
+    engine.begin_session(transition.session_id);
     Ok(())
 }
 
@@ -992,16 +1216,30 @@ pub async fn conversation_regenerate_suggestion_command(
     state: State<'_, ConversationTimelineState>,
     response_state: State<'_, ResponseEngineState>,
 ) -> Result<(), String> {
+    let session_id = state.0.session_id();
     let snapshot = state.0.snapshot();
     let turn = snapshot
         .turns
-        .into_iter()
+        .iter()
         .find(|t| t.id.value() == turn_id)
+        .cloned()
         .ok_or_else(|| "turno não encontrado".to_string())?;
     if !is_eligible_turn(&turn) {
         return Err("turno não é elegível para sugestão de resposta".to_string());
     }
+    // A "fala atual" de uma regeneração é a última utterance do turno, não o turno
+    // inteiro: é o mesmo recorte que o gatilho automático usa, para o modelo decidir sobre
+    // a fala mais recente e não sobre tudo que a pessoa já disse enquanto tinha a palavra.
+    let last_utterance = turn
+        .utterances
+        .last()
+        .and_then(|id| snapshot.utterances.iter().find(|u| u.id == *id))
+        .ok_or_else(|| "turno não tem utterance para regenerar".to_string())?;
     let trigger = GenerationTrigger {
+        session_id,
+        utterance_id: last_utterance.id,
+        utterance_revision: last_utterance.revision,
+        utterance_text: last_utterance.text.clone(),
         utterance_finalized_at: Instant::now(),
         finalization_reason: "manual_regenerate".to_string(),
         gap_ms_used: 0,
@@ -1109,7 +1347,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                ConversationTimelineEvent::TurnFinalized { turn } => Some(turn),
+                ConversationTimelineEvent::TurnFinalized { turn, .. } => Some(turn),
                 _ => None,
             })
             .collect()
@@ -1813,6 +2051,196 @@ mod tests {
             finalized_utterance_events(&events).len(),
             1,
             "the shorter, dev-configured gap was honored by the timer"
+        );
+    }
+
+    // --- Fronteira de sessão -----------------------------------------------------------
+
+    #[test]
+    fn ending_a_session_clears_every_conversational_collection() {
+        let timeline = ConversationTimeline::default();
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Em qual situação você escolheria usar monolitos?",
+            0,
+            1_000,
+        )));
+        assert!(!timeline.snapshot().turns.is_empty());
+
+        let transition = timeline.end_session();
+        assert_ne!(transition.previous_session_id, transition.session_id);
+
+        let snapshot = timeline.snapshot();
+        assert!(
+            snapshot.turns.is_empty() && snapshot.utterances.is_empty(),
+            "a sessão nova começa vazia: nada da anterior sobra no snapshot que o frontend relê"
+        );
+        assert!(
+            timeline.raw_segments().is_empty(),
+            "os segmentos brutos usados como contexto também são apagados"
+        );
+        assert_eq!(timeline.session_id(), transition.session_id);
+    }
+
+    #[test]
+    fn ending_a_session_twice_is_idempotent() {
+        let timeline = ConversationTimeline::default();
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Pergunta.",
+            0,
+            1_000,
+        )));
+
+        let first = timeline.end_session();
+        let second = timeline.end_session();
+
+        assert_eq!(second.previous_session_id, first.session_id);
+        assert_ne!(second.session_id, first.session_id);
+        assert!(timeline.snapshot().turns.is_empty());
+        // O segundo encerramento não tem nada aberto para finalizar.
+        assert!(finalized_utterance_events(&second.events).is_empty());
+    }
+
+    #[test]
+    fn session_events_mark_the_boundary_in_order() {
+        let timeline = ConversationTimeline::default();
+        let transition = timeline.end_session();
+        let kinds: Vec<&str> = transition
+            .events
+            .iter()
+            .map(|e| match e {
+                ConversationTimelineEvent::SessionEnded { .. } => "session_ended",
+                ConversationTimelineEvent::SessionStarted { .. } => "session_started",
+                _ => "other",
+            })
+            .collect();
+        let ended = kinds.iter().position(|k| *k == "session_ended").unwrap();
+        let started = kinds.iter().position(|k| *k == "session_started").unwrap();
+        assert!(ended < started);
+    }
+
+    #[test]
+    fn finalized_events_carry_the_session_that_owned_them() {
+        let timeline = ConversationTimeline::default();
+        let session = timeline.session_id();
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Pergunta.",
+            0,
+            1_000,
+        )));
+        let events = timeline.end_session().events;
+
+        let utterance_sessions: Vec<SessionId> = events
+            .iter()
+            .filter_map(|e| match e {
+                ConversationTimelineEvent::UtteranceFinalized { session_id, .. } => {
+                    Some(*session_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(utterance_sessions, vec![session]);
+        let turn_sessions: Vec<SessionId> = events
+            .iter()
+            .filter_map(|e| match e {
+                ConversationTimelineEvent::TurnFinalized { session_id, .. } => Some(*session_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turn_sessions, vec![session]);
+    }
+
+    #[test]
+    fn utterances_finalized_at_session_end_are_marked_as_such() {
+        let timeline = ConversationTimeline::default();
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Pergunta que ficou aberta.",
+            0,
+            1_000,
+        )));
+        let events = timeline.end_session().events;
+        let finalized = finalized_utterance_events(&events);
+        assert_eq!(finalized.len(), 1);
+        let ConversationTimelineEvent::UtteranceFinalized {
+            finalization_reason,
+            ..
+        } = finalized[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            *finalization_reason,
+            UtteranceFinalizationReason::SessionEnded,
+            "é este motivo que faz o ResponseEngine recusar o gatilho — ver \
+             response_provider::engine::triggers_generation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_timer_from_the_previous_session_cannot_finalize_anything_in_the_new_one() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Fala da sessão A.",
+            0,
+            1_000,
+        )));
+
+        // Encerra a sessão antes de o timer expirar: o token da sessão é cancelado e o
+        // timer agendado morre com ela.
+        timeline.end_session();
+        sink_events.lock().unwrap().clear();
+
+        advance_past_gap(ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms)
+            .await;
+
+        let events = sink_events.lock().unwrap();
+        assert!(
+            finalized_utterance_events(&events).is_empty(),
+            "um timer da sessão A não pode finalizar nada depois que a sessão B começou: {:?}",
+            events.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_new_session_has_its_own_working_timer() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+
+        timeline.end_session();
+        sink_events.lock().unwrap().clear();
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Fala da sessão B.",
+            0,
+            1_000,
+        )));
+        advance_past_gap(ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms)
+            .await;
+
+        let events = sink_events.lock().unwrap();
+        assert_eq!(
+            finalized_utterance_events(&events).len(),
+            1,
+            "cancelar a sessão anterior não pode desligar o timer da sessão nova"
         );
     }
 }

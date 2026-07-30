@@ -31,6 +31,10 @@ pub fn run() {
             timeline.attach();
             let response_engine_state = response_provider::build(app.handle());
             let response_engine = response_engine_state.0.clone();
+            // O motor e a timeline nascem separados, cada um com sua ideia de "sessão
+            // atual". Alinha os dois já no boot para que o primeiro turno da primeira
+            // sessão não seja recusado como pertencente a outra sessão.
+            response_engine.begin_session(timeline.session_id());
             let app_handle = app.handle().clone();
 
             // O timer dedicado da utterance (`ConversationTimeline::reschedule_utterance_timer`)
@@ -92,6 +96,7 @@ pub fn run() {
             audio::stop_system_audio_capture_command,
             conversation::conversation_timeline_snapshot_command,
             conversation::conversation_flush_turns_command,
+            conversation::conversation_start_session_command,
             conversation::conversation_end_session_command,
             conversation::conversation_raw_segments_command,
             conversation::conversation_get_utterance_gap_ms_command,

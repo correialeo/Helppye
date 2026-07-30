@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { onResponseSuggestionEvent } from "../services/conversationService";
+import { onConversationTimelineEvent, onResponseSuggestionEvent } from "../services/conversationService";
 import {
   applyResponseSuggestionDiagnostics,
   applyResponseSuggestionEvent,
@@ -18,6 +18,21 @@ export function useResponseSuggestions() {
     const unlistenPromise = onResponseSuggestionEvent((event) => {
       setSuggestions((current) => applyResponseSuggestionEvent(current, event));
       setDiagnostics((current) => applyResponseSuggestionDiagnostics(current, event));
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  // Fronteira de sessão: o backend já garante que nenhuma sugestão da sessão encerrada
+  // volta a ser emitida — isto só evita que a última sugestão continue em memória aqui
+  // depois que a conversa que a originou deixou de existir.
+  useEffect(() => {
+    const unlistenPromise = onConversationTimelineEvent((event) => {
+      if (event.type === "session_ended" || event.type === "session_started") {
+        setSuggestions({});
+        setDiagnostics({});
+      }
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());

@@ -48,7 +48,7 @@ export type ConversationTimelineEvent =
       started_at: number;
     }
   | { type: "turn_updated"; turn: ConversationTurn }
-  | { type: "turn_finalized"; turn: ConversationTurn }
+  | { type: "turn_finalized"; turn: ConversationTurn; session_id: number }
   | {
       type: "utterance_started";
       utterance_id: number;
@@ -76,4 +76,9 @@ export type ConversationTimelineEvent =
       gap_ms_used: number;
       silence_detected_ms: number | null;
       session_id: number;
-    };
+    }
+  // Fronteira de sessão: tudo que veio antes pertence à sessão encerrada. O backend já
+  // para de emitir qualquer coisa daquela sessão; estes eventos existem para a tela não
+  // continuar mostrando o que já não é mais da conversa atual.
+  | { type: "session_ended"; session_id: number }
+  | { type: "session_started"; session_id: number };

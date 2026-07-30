@@ -179,9 +179,17 @@ Eventos emitidos via `conversation://timeline-event`:
 (`UtteranceFinalizationReason` — `inactivity_timeout`, `speaker_changed`,
 `source_changed`, `capture_stopped`, `manual_flush`, `session_ended`,
 `maximum_duration`), `gap_ms_used`, `silence_detected_ms` (quando mensurável) e
-`session_id`. A Timeline também expõe `conversation_timeline_snapshot_command` (snapshot
-com `turns` e `utterances`), `conversation_flush_turns_command`,
-`conversation_end_session_command` e `conversation_raw_segments_command`.
+`session_id`. Os eventos de fronteira `session_ended`/`session_started` marcam a troca de
+sessão, nessa ordem. A Timeline também expõe `conversation_timeline_snapshot_command`
+(snapshot com `turns` e `utterances`), `conversation_flush_turns_command`,
+`conversation_start_session_command`, `conversation_end_session_command` e
+`conversation_raw_segments_command`. Iniciar e encerrar sessão trocam o `SessionId`
+(`reset_for_new_session` limpa **todas** as coleções: segmentos brutos, utterances,
+turnos, aberturas por source e estado de timer) e propagam a fronteira para o
+`ResponseEngine` (`begin_session`/`end_session`) — ver `docs/response-suggestion.md`,
+seção "Isolamento por sessão". Um timer de utterance agendado na sessão anterior compara
+`session_id` e `revision` antes de finalizar qualquer coisa, então nunca finaliza nada na
+sessão nova.
 
 Os timestamps dos segmentos são convertidos pelo `CaptureEngine` para um relógio
 monotônico comum do processo antes de entrar na fila de transcrição, para que falas de
@@ -207,16 +215,34 @@ no mesmo turno cancela e substitui a geração em andamento, para nunca sugerir 
 uma fala que ainda não terminou; `ResponseEngine::finish_generation` roda em todo caminho
 de saída (completo, skip, erro ou cancelamento) e sempre libera o slot de geração daquele
 turno, para que uma geração seguinte nunca veja um estado "fantasma" de uma anterior já
-encerrada.
+encerrada. Finalizações que são consequência de teardown (`capture_stopped`,
+`session_ended`) nunca disparam geração (`engine::triggers_generation`).
+
+**Isolamento por sessão.** A unidade de isolamento é a sessão (`conversation::SessionId`,
+monotônico, de propriedade da `ConversationTimeline`; o `ResponseEngine` espelha o valor).
+Todo o estado mutável do motor vive num único `Mutex<SessionState>` (`session_id`, flag
+`ending`, `CancellationToken` raiz, histórico, gerações ativas). `begin_session` instala
+um estado inteiramente novo — token raiz novo (nunca um cancelado), histórico vazio; cada
+geração roda sob um token **filho** do raiz. `end_session` é atômico, ordenado e
+idempotente: marca `ending`, cancela o raiz, marca cada geração como já terminal e limpa
+o histórico, tudo sob o mesmo lock. O `session_id` é validado em quatro pontos — no
+gatilho, ao entrar/ler o histórico, antes de **cada** emissão de evento
+(`is_publishable`), e no timer de utterance da timeline. Evento de sessão encerrada é
+descartado no backend, com log `debug`, não no frontend. Provider e `reqwest::Client` são
+preservados entre sessões de propósito; conteúdo conversacional, nunca.
 
 O usuário escolhe o provedor de LLM: Ollama local (padrão) ou um provedor de nuvem
 (OpenAI, DeepSeek, Anthropic). A mesma chamada que gera a resposta também decide se deve
 responder, via um marcador `[SKIP]` no início do stream quando a fala não exige resposta
-— sem uma segunda chamada de classificação. API keys de provedores de nuvem ficam no
-keychain do SO via crate `keyring`, nunca em texto puro no disco. Eventos emitidos via
-`response://suggestion-event`: `started`, `delta`, `completed`, `skipped`, `cancelled` e
-`error`, todos carregando `turn_id` e `generation_id` para o frontend descartar eventos
-de uma geração já superada, além de `diagnostics` (ver abaixo). Ver
+— sem uma segunda chamada de classificação e sem detector por regex. O prompt separa
+fisicamente `CONTEXTO RECENTE:` / `FALA ATUAL DA OUTRA PESSOA:` / `INSTRUÇÃO:` para que a
+decisão seja sobre a fala atual, não sobre o turno inteiro, e o `SYSTEM_PROMPT` declara a
+política (em dúvida razoável, responder curto em vez de `[SKIP]`). API keys de provedores
+de nuvem ficam no keychain do SO via crate `keyring`, nunca em texto puro no disco.
+Eventos emitidos via `response://suggestion-event`: `started`, `delta`, `completed`,
+`skipped`, `cancelled` e `error`, todos carregando `session_id`, `turn_id` e
+`generation_id` para o frontend descartar eventos de uma geração já superada, além de
+`diagnostics` (ver abaixo). Ver
 `docs/response-suggestion.md` para a arquitetura completa, módulo por módulo, e
 `docs/session-experience.md` para o comportamento fim a fim durante uma sessão ao vivo.
 

@@ -6,38 +6,49 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tracing::warn;
 
-use crate::conversation::TurnId;
+use crate::conversation::{SessionId, TurnId, UtteranceId};
+use crate::response_provider::engine::GenerationId;
 
 pub const RESPONSE_SUGGESTION_EVENT: &str = "response://suggestion-event";
 
+/// Todo evento público carrega `session_id`: a identidade completa de uma geração é
+/// `session_id + turn_id + generation_id` (ver `docs/response-suggestion.md`). O backend
+/// já descarta eventos de sessões encerradas antes de emitir — o campo existe para o
+/// frontend poder auditar/validar, não como única linha de defesa.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseSuggestionEvent {
     Started {
+        session_id: SessionId,
         turn_id: TurnId,
-        generation_id: u64,
+        generation_id: GenerationId,
     },
     Delta {
+        session_id: SessionId,
         turn_id: TurnId,
-        generation_id: u64,
+        generation_id: GenerationId,
         text: String,
     },
     Completed {
+        session_id: SessionId,
         turn_id: TurnId,
-        generation_id: u64,
+        generation_id: GenerationId,
         text: String,
     },
     Skipped {
+        session_id: SessionId,
         turn_id: TurnId,
-        generation_id: u64,
+        generation_id: GenerationId,
     },
     Cancelled {
+        session_id: SessionId,
         turn_id: TurnId,
-        generation_id: u64,
+        generation_id: GenerationId,
     },
     Error {
+        session_id: SessionId,
         turn_id: TurnId,
-        generation_id: u64,
+        generation_id: GenerationId,
         message: String,
     },
     // `GenerationDiagnostics` carries a couple dozen fields (latency breakdown, trigger
@@ -48,13 +59,18 @@ pub enum ResponseSuggestionEvent {
 
 /// Registro de diagnóstico de uma geração completa, emitido sempre — independente de o
 /// resultado ser skip, erro, cancelamento ou conclusão — para permitir distinguir em modo
-/// dev os cinco estados finais possíveis (`event_emitted`): `skipped`, `error`,
-/// `cancelled`, `completed_empty`, `completed_with_text`. Sem isso, um skip e uma resposta
+/// dev os estados finais possíveis (`event_emitted`): `skipped`, `error`, `cancelled`,
+/// `completed_empty`, `completed_with_text` e `discarded_stale` (a geração terminou mas
+/// nada foi publicado porque a sessão já havia mudado). Sem isso, um skip e uma resposta
 /// vazia eram indistinguíveis a partir da UI.
 #[derive(Debug, Clone, Serialize)]
 pub struct GenerationDiagnostics {
-    pub generation_id: u64,
+    pub session_id: SessionId,
+    pub generation_id: GenerationId,
     pub turn_id: TurnId,
+    /// Utterance que disparou esta geração — junto com `session_id`/`turn_id` fecha a
+    /// identidade completa do gatilho.
+    pub utterance_id: UtteranceId,
     pub provider: String,
     pub model: String,
     /// Epoch ms de quando a requisição ao provedor começou.
@@ -85,6 +101,17 @@ pub struct GenerationDiagnostics {
     /// Silêncio efetivamente observado antes da finalização, quando mensurável — ver
     /// `ConversationTimelineEvent::UtteranceFinalized`.
     pub silence_detected_ms: Option<u64>,
+
+    // --- Contexto realmente enviado à LLM (auditoria de vazamento entre sessões) ---
+    /// Quantos turnos da sessão *ativa* entraram no prompt.
+    pub context_turn_count: usize,
+    /// Tamanho em caracteres do bloco de contexto enviado.
+    pub context_character_count: usize,
+    /// Prompt sanitizado (estrutura + trechos limitados), para inspeção em modo de
+    /// desenvolvedor. Nunca contém credenciais: o prompt é montado só a partir de
+    /// transcrição da sessão ativa, e nenhuma configuração de provedor (API key, URL
+    /// autenticada) entra aqui.
+    pub prompt_preview: String,
 
     // --- Latência de ponta a ponta, medida com relógio monotônico (`Instant`), não
     // epoch — ver `docs/response-suggestion.md`. `None` quando o marco correspondente

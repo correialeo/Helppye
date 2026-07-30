@@ -19,6 +19,13 @@ export function getConversationRawSegments(): Promise<unknown[]> {
   return invoke("conversation_raw_segments_command");
 }
 
+/** Abre uma sessão nova e vazia no backend. Chamado ao iniciar uma sessão, antes da
+ * captura: garante a fronteira mesmo que a sessão anterior tenha terminado por um caminho
+ * que não passou por `endConversationSession` (ex.: a janela foi fechada). */
+export function startConversationSession(): Promise<void> {
+  return invoke("conversation_start_session_command");
+}
+
 export function endConversationSession(): Promise<void> {
   return invoke("conversation_end_session_command");
 }

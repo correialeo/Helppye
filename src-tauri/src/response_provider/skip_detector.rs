@@ -21,6 +21,28 @@ enum Decision {
     NotSkip,
 }
 
+/// Decide o que o buffer acumulado já permite concluir. `None` = ainda ambíguo.
+///
+/// Tolerante de propósito a espaço em branco à esquerda e a maiúsculas/minúsculas: alguns
+/// modelos abrem o stream com `"\n"` ou emitem `"[skip]"`. Sem isso, um chunk único
+/// `"[SKIP]\n"` era classificado como resposta real e a UI mostrava o marcador cru. Isto
+/// é comparação de prefixo sobre um marcador fixo — não é um detector de perguntas por
+/// regras nem uma segunda chamada de classificação.
+fn classify(buffer: &str) -> Option<Decision> {
+    let trimmed = buffer.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if upper.starts_with(SKIP_MARKER) {
+        return Some(Decision::Skip);
+    }
+    if SKIP_MARKER.starts_with(&upper) {
+        return None;
+    }
+    Some(Decision::NotSkip)
+}
+
 #[derive(Debug, Default)]
 pub struct SkipDetector {
     buffer: String,
@@ -47,18 +69,19 @@ impl SkipDetector {
 
         self.buffer.push_str(delta);
 
-        if self.buffer == SKIP_MARKER {
-            self.decision = Some(Decision::Skip);
-            return SkipDecision::Skip;
+        match classify(&self.buffer) {
+            Some(Decision::Skip) => {
+                self.decision = Some(Decision::Skip);
+                self.buffer.clear();
+                SkipDecision::Skip
+            }
+            Some(Decision::NotSkip) => {
+                self.decision = Some(Decision::NotSkip);
+                let flush = std::mem::take(&mut self.buffer);
+                SkipDecision::NotSkip { flush }
+            }
+            None => SkipDecision::Pending,
         }
-
-        if self.buffer.len() < SKIP_MARKER.len() && SKIP_MARKER.starts_with(self.buffer.as_str()) {
-            return SkipDecision::Pending;
-        }
-
-        self.decision = Some(Decision::NotSkip);
-        let flush = std::mem::take(&mut self.buffer);
-        SkipDecision::NotSkip { flush }
     }
 
     /// Chamado quando o stream do provedor termina. Resolve qualquer decisão ainda
@@ -167,6 +190,36 @@ mod tests {
         let mut detector = SkipDetector::new();
         detector.push("[SKIP]");
         assert_eq!(detector.finish(), SkipDecision::Skip);
+    }
+
+    #[test]
+    fn marker_with_trailing_newline_in_one_chunk_is_skip() {
+        let mut detector = SkipDetector::new();
+        assert_eq!(detector.push("[SKIP]\n"), SkipDecision::Skip);
+    }
+
+    #[test]
+    fn marker_with_leading_whitespace_is_skip() {
+        let mut detector = SkipDetector::new();
+        assert_eq!(detector.push("\n [SKIP]"), SkipDecision::Skip);
+    }
+
+    #[test]
+    fn lowercase_marker_is_skip() {
+        let mut detector = SkipDetector::new();
+        assert_eq!(detector.push("[skip]"), SkipDecision::Skip);
+    }
+
+    #[test]
+    fn leading_whitespace_alone_stays_pending() {
+        let mut detector = SkipDetector::new();
+        assert_eq!(detector.push("\n"), SkipDecision::Pending);
+        assert_eq!(
+            detector.push("Claro,"),
+            SkipDecision::NotSkip {
+                flush: "\nClaro,".to_string()
+            }
+        );
     }
 
     #[test]

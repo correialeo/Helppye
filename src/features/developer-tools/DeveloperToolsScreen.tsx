@@ -121,7 +121,8 @@ export function DeveloperToolsScreen({ onBack }: { onBack: () => void }) {
               .map((d) => (
                 <div key={d.turn_id} className="rounded border border-white/10 bg-surface p-2 text-neutral-400">
                   <p className="text-neutral-300">
-                    turn #{d.turn_id} · geração #{d.generation_id} · {d.provider}/{d.model}
+                    sessão #{d.session_id} · turn #{d.turn_id} · utterance #{d.utterance_id} · geração #
+                    {d.generation_id} · {d.provider}/{d.model}
                   </p>
                   <p>
                     http_status: {d.http_status ?? "—"} · latency_ms: {d.latency_ms} · event_emitted:{" "}
@@ -140,6 +141,14 @@ export function DeveloperToolsScreen({ onBack }: { onBack: () => void }) {
                   </p>
                   <p>skip_detected: {String(d.skip_detected)} · cancel_reason: {d.cancel_reason ?? "—"}</p>
                   <p className="break-all">raw_prefix: {d.raw_prefix || "—"}</p>
+                  <p>
+                    context_turn_count: {d.context_turn_count} · context_character_count:{" "}
+                    {d.context_character_count}
+                  </p>
+                  <p className="whitespace-pre-wrap break-all text-neutral-500">
+                    prompt (sanitizado):{"\n"}
+                    {d.prompt_preview || "—"}
+                  </p>
                 </div>
               ))}
             {Object.keys(diagnostics).length === 0 && (

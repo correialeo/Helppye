@@ -9,25 +9,30 @@ escolha explicitamente um provedor de nuvem quando quiser.
 ## Visão geral do fluxo
 
 ```
-Conversation Timeline (turns/utterances)
+Conversation Timeline (turns/utterances) — dona do session_id
         │  silêncio ≥ same_speaker_utterance_gap_ms → timer dedicado finaliza a
         │  utterance sozinho (sem esperar novo segmento/flush/stop/turno fechar)
-        │  UtteranceFinalized (turno elegível)
+        │  UtteranceFinalized (turno elegível, com session_id)
         ▼
-process_conversation_events → GenerationTrigger (finalization_reason, gap_ms_used,
-        │  silence_detected_ms, utterance_finalized_at)
+process_conversation_events → GenerationTrigger (session_id, utterance_id,
+        │  utterance_revision, finalization_reason, gap_ms_used, silence_detected_ms,
+        │  utterance_finalized_at)
         ▼
 ResponseEngine::trigger_generation
-        │  cancela geração anterior do mesmo turno, se houver
+        │  rejeita gatilho de sessão não-ativa/encerrando (generation_rejected_wrong_session)
+        │  cancela geração anterior do mesmo turno, se houver (token filho do token raiz)
         ▼
-context::build_request (histórico limitado + turno atual)
-        │
+context::build_request (histórico **da sessão ativa** + fala atual isolada)
+        │  history_snapshot(session_id) → None se a sessão já mudou ⇒ aborta
         ▼
 ResponseProvider ativo (Ollama | OpenAI | DeepSeek | Anthropic)
         │  stream de ResponseChunk::Delta/Done
         ▼
 SkipDetector (decide [SKIP] vs. conteúdo real, sem segunda chamada ao LLM)
         │
+        ▼
+publish_stream_event / publish_terminal_event
+        │  revalida sessão + geração corrente antes de **cada** emissão
         ▼
 events::emit_response_suggestion_event → `response://suggestion-event` (frontend)
 ```
@@ -93,6 +98,200 @@ Igual à extinta detecção de perguntas: só turnos com `speaker = OtherPerson`
 `source = SystemOutput` disparam geração (`engine::is_eligible_turn`). O usuário nunca
 recebe uma "sugestão de resposta" para a própria fala.
 
+Além do turno ser elegível, o **motivo de finalização** da utterance precisa representar
+fim de fala, não desmontagem de estado (`engine::triggers_generation`):
+
+| `UtteranceFinalizationReason`                                                  | Dispara geração? |
+| ------------------------------------------------------------------------------ | ---------------- |
+| `inactivity_timeout`, `speaker_changed`, `source_changed`, `manual_flush`, `maximum_duration` | sim              |
+| `capture_stopped`, `session_ended`                                             | **não**          |
+
+Parar a captura e encerrar a sessão finalizam a utterance aberta — é correto que
+finalizem, mas essas finalizações são consequência do teardown, não de alguém ter
+terminado de falar. Antes desse gate, encerrar a sessão A disparava uma geração *pela
+própria finalização de encerramento*, cujo resultado chegava depois — parte visível do
+sintoma "a resposta da sessão anterior reaparece".
+
+## Isolamento por sessão
+
+A unidade de isolamento é a **sessão**, e ela é identificada por um `SessionId`
+monotônico (`conversation::SessionId`, `AtomicU64`). A `ConversationTimeline` é a dona
+desse ID; o `ResponseEngine` espelha o valor e o usa como chave de validade de tudo que
+faz. Nenhum estado conversacional atravessa a fronteira.
+
+### O que cada camada zera
+
+- **`ConversationTimeline` / `ConversationAssembler`** — `reset_for_new_session` aloca um
+  `SessionId` novo e limpa *todas* as coleções: segmentos brutos, utterances, turnos,
+  utterance/turno abertos por source e o estado de timer. `start_session` e `end_session`
+  devolvem um `SessionTransition { previous_session_id, session_id, events }`, e os
+  eventos de fronteira (`session_ended`, `session_started`) vão para o frontend na mesma
+  ordem em que ocorreram.
+- **`ResponseEngine`** — todo o estado mutável de sessão vive num único
+  `Mutex<SessionState>`: `session_id`, flag `ending`, `CancellationToken` raiz, `history`
+  (deque de turnos finalizados) e `generations` (mapa `TurnId → GenerationHandle`).
+  `begin_session` substitui o `SessionState` inteiro por um novo — token raiz novo,
+  histórico vazio, mapa de gerações vazio.
+
+**Provider e `reqwest::Client` são deliberadamente preservados** entre sessões:
+reaproveitar o pool de conexões HTTP é correto e é o que mantém a latência da primeira
+geração baixa. O que nunca é reaproveitado é conteúdo conversacional.
+
+### Identidade de uma geração
+
+Toda geração carrega um `GenerationContext`:
+
+```rust
+pub struct GenerationContext {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub utterance_id: UtteranceId,
+    pub utterance_revision: u64,
+    pub generation_id: GenerationId,
+}
+```
+
+Esses campos aparecem nos logs estruturados e — exceto `utterance_revision` — em todos os
+eventos públicos de `response://suggestion-event`, para que o frontend consiga descartar
+qualquer coisa que ainda escape.
+
+### Os quatro pontos de validação
+
+O `session_id` é comparado com a sessão ativa em quatro lugares distintos, e falhar em
+qualquer um deles é sempre um descarte silencioso com log `debug` — nunca um erro exibido
+ao usuário:
+
+1. **No gatilho** (`trigger_generation`): sessão diferente ou `ending = true` ⇒
+   `generation_rejected_wrong_session`, nada é iniciado.
+2. **No histórico** (`push_history` / `history_snapshot`): um turno finalizado que chegue
+   atrasado, de uma sessão encerrada, não entra no histórico; e uma geração cuja sessão
+   mudou entre o gatilho e a montagem do prompt recebe `None` de `history_snapshot` e
+   aborta antes de chamar o provedor. **É este o ponto que corrige a contaminação de
+   prompt na origem** — não existe snapshot "global" de histórico em lugar nenhum.
+3. **Antes de cada emissão** (`is_publishable` → `publish_stream_event` /
+   `publish_terminal_event`): `started`, cada `delta` e o estado terminal só são emitidos
+   se a sessão ainda for a ativa, não estiver encerrando, o token raiz não estiver
+   cancelado e o `generation_id` ainda for o corrente daquele turno. Um `delta` que chegue
+   depois do encerramento é descartado no **backend**, com `event_emitted =
+   "discarded_stale"` no diagnóstico.
+4. **No timer da utterance** (`ConversationTimeline::fire_utterance_timeout`): o timer
+   compara `session_id` *e* `ConversationUtterance::revision` antes de finalizar. Um timer
+   agendado na sessão A que expire depois de a sessão B começar encontra um estado que não
+   bate mais e vira no-op.
+
+### Cancelamento hierárquico
+
+Um `CancellationToken` raiz por sessão; cada geração roda sob um `child_token()` dele.
+Cancelar o raiz cancela toda geração em voo de uma vez, sem precisar percorrer o mapa
+para cancelar uma a uma (o mapa ainda é percorrido, mas para *marcar* estado terminal, não
+para propagar o cancelamento). Um token cancelado **nunca é reutilizado**: `begin_session`
+cria um `SessionState` novo com um token novo, e não há caminho que "descancele" um token
+existente.
+
+### Encerramento atômico e ordenado
+
+`ResponseEngine::end_session` roda inteiro sob o mesmo lock, nesta ordem:
+
+1. valida que `session_id` é a sessão ativa (senão, no-op logado);
+2. valida que ela ainda não está encerrando (senão, no-op logado — **idempotência**);
+3. `ending = true` — a partir daqui nenhum gatilho novo passa;
+4. cancela o token raiz;
+5. drena `generations`, fazendo `terminal_emitted.swap(true)` em cada handle antes de
+   cancelar seu token filho — assim, quando a task acordar do `select!`, ela verá que o
+   estado terminal já foi "consumido" e não publicará `cancelled`/`completed`/`error` de
+   uma sessão que não existe mais;
+6. limpa `history` e loga `session_state_cleared` com quantos turnos foram apagados.
+
+Como os passos 3–6 acontecem sob o mesmo `Mutex`, não existe janela em que uma geração
+consiga ler um estado meio-encerrado.
+
+`conversation_end_session_command` **não** realimenta suas próprias finalizações em
+`process_conversation_events`: ele emite os eventos de timeline para o frontend e chama
+`ResponseEngine::end_session`. Antes, o comando passava suas finalizações pelo mesmo
+caminho de um `UtteranceFinalized` normal, o que fazia o encerramento gerar trabalho novo
+em vez de encerrar o existente.
+
+### Estado terminal único
+
+`GenerationHandle` carrega um `Arc<AtomicBool>` (`terminal_emitted`). Todo caminho de
+saída — `Completed`, `Skipped`, `Cancelled`, `Error`, `Superseded`, `SessionEnded` —
+passa por `publish_terminal_event`, que faz `swap(true, SeqCst)` e só emite se o valor
+anterior era `false`. Isso é proteção explícita contra dupla finalização: antes, uma
+geração superada por uma nova utterance podia emitir `cancelled` duas vezes (uma pelo
+`trigger_generation` que a substituiu, outra pela própria task ao acordar cancelada).
+
+`finish_generation` continua rodando em **todo** caminho de saída, emite `Diagnostics`
+apenas se a sessão ainda estiver ativa, e sempre libera o slot daquele turno via
+`clear_if_current` — que só remove a entrada se o `generation_id` guardado ainda for o
+desta geração, para uma geração encerrada tarde não apagar o slot de sua substituta.
+
+## Estrutura do prompt e política de `[SKIP]`
+
+A decisão de responder é sobre a **fala atual**, não sobre o turno inteiro nem sobre o
+contexto. O prompt reflete isso fisicamente (`context.rs`):
+
+```
+CONTEXTO RECENTE:
+Outra pessoa: ...
+Você: ...
+
+FALA ATUAL DA OUTRA PESSOA:
+Me dá um exemplo disso.
+
+INSTRUÇÃO: Decida exclusivamente se a fala atual exige resposta. Use o contexto apenas
+para compreender referências.
+```
+
+Sem contexto (primeira fala da sessão), o bloco recebe
+`(nenhum — esta é a primeira fala da sessão)` em vez de sumir — a estrutura do prompt é
+sempre a mesma, o que evita que a ausência de contexto mude o formato que o modelo vê.
+
+O texto que o mesmo interlocutor já havia dito **neste turno**, antes da utterance atual,
+vai para o contexto (`preceding_text_in_turn`), nunca duplicado dentro da fala atual. Se
+a utterance atual não for encontrada como sufixo do texto do turno (caso patológico de
+normalização), o prefixo vira vazio em vez de reenviar o turno inteiro — duplicar a fala
+atual dentro do contexto embaralharia justamente a decisão de `[SKIP]`.
+
+O `SYSTEM_PROMPT` declara a política em vez de deixá-la implícita:
+
+- Exigem resposta: perguntas, pedidos de explicação, pedidos de exemplo, desafios de
+  entrevista, solicitações implícitas e frases no imperativo.
+- `[SKIP]` só quando claramente nenhuma resposta é necessária: saudação isolada,
+  confirmação breve, comentário sem pedido, ruído evidente, fragmento sem sentido.
+- **Em caso de dúvida razoável, gerar uma resposta curta em vez de `[SKIP]`.**
+- Fala que começa com confirmação/saudação mas contém pergunta ou pedido ⇒ responder ao
+  pedido.
+
+Continua valendo a restrição de arquitetura: **nenhum detector por regex e nenhuma segunda
+chamada de classificação**. A mesma chamada que gera a resposta decide, in-band, via o
+marcador `[SKIP]` no início do stream. O `SkipDetector` ganhou apenas robustez de
+parsing (`classify`): tolera espaço em branco à esquerda, marcador em caixa baixa e
+`[SKIP]` seguido de `\n` — antes, um `"[SKIP]\n"` num único chunk não era reconhecido
+como skip e vazava o marcador literal para a tela.
+
+## Logs estruturados
+
+Nomes fixos, para poder filtrar por evento em vez de por texto livre (nenhum deles
+registra API key, prompt completo ou credencial):
+
+| Log                                 | Onde                        | Quando                                            |
+| ----------------------------------- | --------------------------- | ------------------------------------------------- |
+| `session_started`                   | `begin_session` (engine) + `start_session` (timeline) | sessão nova instalada (com `previous_session_id`) |
+| `session_ending`                    | `end_session` (engine + timeline) | início do teardown (nº de gerações e turnos)    |
+| `session_state_cleared`             | `end_session` (engine) + `reset_for_new_session` (assembler) | histórico/coleções apagados, com quantidades |
+| `session_ended`                     | `ConversationTimeline::end_session` | fronteira fechada na timeline                 |
+| `generation_trigger_received`       | `process_conversation_events`   | `UtteranceFinalized` elegível chegou              |
+| `generation_rejected_wrong_session` | `trigger_generation`            | gatilho de sessão não-ativa/encerrando            |
+| `generation_cancelled_session_end`  | `end_session`                   | geração em voo cancelada pelo encerramento        |
+| `generation_event_discarded_stale`  | `publish_*` / `run_generation`  | evento suprimido por sessão/geração obsoleta      |
+| `context_built`                     | `run_generation`                | com `context_turn_count`/`context_character_count` |
+| `skip_detected`                     | `run_generation`                | `SkipDetector` decidiu `Skip`                     |
+| `terminal_state`                    | `publish_terminal_event`        | estado terminal único daquela geração             |
+
+O prompt sanitizado (`BuiltContext::sanitized_preview`, linhas truncadas em 120
+caracteres) não vai para o log: ele viaja só no evento `Diagnostics`, exibido apenas em
+`DeveloperToolsScreen`.
+
 ## Diagnóstico em modo dev
 
 Sem instrumentação, a UI só distinguia `streaming`/`skipped`/`cancelled`/`error`/
@@ -106,7 +305,13 @@ genuinamente vazia.
 Para isso, toda geração emite, ao final (`ResponseSuggestionEvent::Diagnostics`), um
 `GenerationDiagnostics` com:
 
-- `generation_id`, `turn_id`, `provider`, `model` — identificação da geração.
+- `session_id`, `turn_id`, `utterance_id`, `generation_id`, `provider`, `model` —
+  identificação completa da geração (ver "Isolamento por sessão"): permite conferir, na
+  própria UI de diagnóstico, a que sessão pertence cada resposta exibida.
+- `prompt_preview`, `context_turn_count`, `context_character_count` — o prompt
+  sanitizado que de fato foi enviado (linhas truncadas em 120 caracteres) e o tamanho do
+  bloco de contexto. É a forma de inspecionar visualmente que nenhum texto de uma sessão
+  anterior entrou no prompt, sem depender só dos testes.
 - `request_started` — epoch ms de quando a chamada ao provedor começou.
 - `http_status` — código HTTP da resposta bem-sucedida, `None` se a conexão falhou antes
   disso (hipótese "a requisição nem chega ao provedor").
@@ -120,11 +325,13 @@ Para isso, toda geração emite, ao final (`ResponseSuggestionEvent::Diagnostics
 - `latency_ms` — duração total da geração, do início da chamada ao provedor até o
   evento final.
 - `final_text_length` — tamanho (em caracteres) do texto final acumulado.
-- `event_emitted` — um dos cinco estados finais possíveis, como string:
-  `"skipped"`, `"error"`, `"cancelled"`, `"completed_empty"`, `"completed_with_text"`.
-  `completed_empty` e `completed_with_text` derivam de `Completed` conforme o texto final
-  estar vazio (ou só espaço em branco) ou não — este é justamente o par de estados que
-  antes colapsava, na UI, na mesma mensagem que `skipped`.
+- `event_emitted` — o estado final, como string: `"skipped"`, `"error"`, `"cancelled"`,
+  `"completed_empty"`, `"completed_with_text"` ou
+  `"discarded_stale"`. `completed_empty` e `completed_with_text` derivam de `Completed`
+  conforme o texto final estar vazio (ou só espaço em branco) ou não — este é justamente o
+  par de estados que antes colapsava, na UI, na mesma mensagem que `skipped`.
+  `discarded_stale` significa que a geração terminou mas nada foi publicado porque a
+  sessão já havia mudado.
 - `finalization_reason`, `gap_ms_used`, `silence_detected_ms` — contexto do gatilho
   (`GenerationTrigger`, montado a partir de `ConversationTimelineEvent::UtteranceFinalized`
   em `process_conversation_events`), para responder "por que essa geração começou agora".
@@ -157,36 +364,44 @@ inspeção manual durante o desenvolvimento.
   `http_status` da resposta bem-sucedida vai para `ResponseStreamMeta` porque, sem ele,
   não havia como o diagnóstico de uma geração confirmar que a requisição de fato chegou
   ao provedor e obteve `200` antes de o stream começar a produzir chunks.
-- **`context.rs`** — monta o `ResponseRequest` a partir do histórico de turnos e do
-  turno atual. Teto de 4 turnos e 5000 caracteres de histórico (`MAX_HISTORY_TURNS`,
-  `MAX_HISTORY_CHARS`), 160 tokens de saída (`MAX_OUTPUT_TOKENS`), `temperature = 0.2`
-  (`TEMPERATURE`) — contexto e saída limitados de propósito para manter prompt pequeno e
-  latência baixa em vez de reenviar a conversa inteira a cada geração; baixa
-  `temperature` favorece uma resposta direta e previsível em vez de variedade criativa,
-  o que também ajuda a manter a latência estável entre chamadas. O `SYSTEM_PROMPT`
-  instrui o modelo a responder com o marcador fixo `[SKIP]` quando a fala mais recente
-  não for uma pergunta/pedido que exija resposta — a mesma chamada que gera a resposta
-  também decide se deve responder, sem uma segunda chamada de classificação.
+- **`context.rs`** — monta o `ResponseRequest` a partir do histórico de turnos **da sessão
+  ativa** e da utterance que acabou de finalizar, devolvendo um `BuiltContext`
+  (`request`, `context_turn_count`, `context_character_count`, `sanitized_preview`). Teto
+  de 4 turnos e 5000 caracteres de histórico (`MAX_HISTORY_TURNS`, `MAX_HISTORY_CHARS`),
+  160 tokens de saída (`MAX_OUTPUT_TOKENS`), `temperature = 0.2` (`TEMPERATURE`) —
+  contexto e saída limitados de propósito para manter prompt pequeno e latência baixa em
+  vez de reenviar a conversa inteira a cada geração; baixa `temperature` favorece uma
+  resposta direta e previsível em vez de variedade criativa, o que também ajuda a manter a
+  latência estável entre chamadas. O módulo não conhece "a conversa": ele só vê a fatia
+  que o `ResponseEngine` entregou, o que torna a contaminação entre sessões impossível de
+  se originar aqui. Ver "Estrutura do prompt e política de `[SKIP]`" acima para o formato
+  em três blocos e o texto do `SYSTEM_PROMPT`.
 - **`skip_detector.rs`** — `SkipDetector` consome os deltas do stream incrementalmente e
-  decide, com o menor atraso possível, se o texto acumulado é exatamente `[SKIP]`
-  (suprime a resposta inteira) ou diverge dele (libera o texto acumulado como conteúdo
-  real, mais qualquer delta seguinte, direto). Máquina de estados simples: `Pending`
-  enquanto o buffer é um prefixo do marcador, decide `Skip`/`NotSkip` assim que diverge
-  ou completa o marcador.
-- **`engine.rs`** — `ResponseEngine`: mantém o provedor ativo, a configuração, um
-  histórico rolante de até 20 turnos finalizados (`MAX_HISTORY_TURNS`) e um mapa de
-  gerações em andamento por `TurnId`. `trigger_generation` cria um `generation_id`
-  monotônico e um `CancellationToken`; se já havia uma geração para aquele turno, ela é
-  cancelada e um evento `Cancelled` é emitido para a geração anterior antes de iniciar a
-  nova. `process_conversation_events` é o ponto de entrada chamado a cada lote de eventos
-  da timeline: acumula turnos finalizados no histórico e dispara geração em
-  `UtteranceFinalized` de turnos elegíveis, montando um `GenerationTrigger` (instante de
-  finalização com relógio monotônico, motivo, gap configurado, silêncio observado) a
-  partir do evento. `run_generation` monta um `GenerationDiagnostics` por geração —
-  incluindo as métricas de latência derivadas do `GenerationTrigger` e dos instantes
-  capturados durante o streaming (primeiro chunk HTTP, primeiro texto visível) — e o
-  fecha em `finish_generation`, chamado em **todo** caminho de saída (skip, erro,
-  cancelamento ou conclusão natural) via uma macro local (`finish!`) para garantir que
+  decide, com o menor atraso possível, se o texto acumulado começa com `[SKIP]` (suprime a
+  resposta inteira) ou diverge dele (libera o texto acumulado como conteúdo real, mais
+  qualquer delta seguinte, direto). Máquina de estados simples: `Pending` enquanto o buffer
+  ainda é um prefixo do marcador, decide `Skip`/`NotSkip` assim que diverge ou completa o
+  marcador. `classify` normaliza espaço em branco à esquerda e caixa, e trata `[SKIP]`
+  seguido de qualquer coisa (tipicamente `\n`) como skip — nenhum regex, nenhuma segunda
+  chamada ao LLM.
+- **`engine.rs`** — `ResponseEngine`: mantém o provedor ativo, a configuração e um único
+  `Mutex<SessionState>` com o `session_id` ativo, a flag `ending`, o `CancellationToken`
+  raiz, o histórico rolante de até 20 turnos finalizados (`MAX_HISTORY_TURNS`) e o mapa de
+  gerações em andamento por `TurnId`. `begin_session`/`end_session` são a fronteira
+  descrita em "Isolamento por sessão". `trigger_generation` valida a sessão, cria um
+  `generation_id` monotônico e um token **filho** do token raiz; se já havia uma geração
+  para aquele turno, ela é marcada como terminal (`Superseded`) e cancelada antes de
+  iniciar a nova. `process_conversation_events` é o ponto de entrada chamado a cada lote de
+  eventos da timeline: acumula turnos finalizados no histórico da sessão que os produziu e
+  dispara geração em `UtteranceFinalized` de turnos elegíveis cujo motivo de finalização
+  represente fim de fala, montando um `GenerationTrigger` (sessão, utterance, revisão,
+  instante de finalização com relógio monotônico, motivo, gap configurado, silêncio
+  observado). `run_generation` monta um `GenerationDiagnostics` por geração — incluindo as
+  métricas de latência derivadas do `GenerationTrigger` e dos instantes capturados durante
+  o streaming (primeiro chunk HTTP, primeiro texto visível) — publica cada evento via
+  `publish_stream_event`/`publish_terminal_event` (que revalidam sessão e geração corrente)
+  e fecha em `finish_generation`, chamado em **todo** caminho de saída (skip, erro,
+  cancelamento, supersessão, encerramento de sessão ou conclusão natural) para garantir que
   nenhum retorno adiantado esqueça de liberar o slot de `generations` daquele turno — é
   esse fechamento incondicional que garante que uma geração seguinte para o mesmo turno
   nunca veja um estado "fantasma" de uma anterior já encerrada (coberto por teste, ver
@@ -195,10 +410,13 @@ inspeção manual durante o desenvolvimento.
   janela/webview real.
 - **`events.rs`** — evento `response://suggestion-event`
   (`ResponseSuggestionEvent::{Started, Delta, Completed, Skipped, Cancelled, Error,
-  Diagnostics}`), cada variante carregando `turn_id` + `generation_id` para o frontend
-  descartar eventos de uma geração já superada. `Diagnostics` carrega um
-  `GenerationDiagnostics` completo (ver abaixo) e é emitido ao final de toda geração,
-  além do evento "de negócio" correspondente (`Skipped`/`Error`/`Cancelled`/`Completed`).
+  Diagnostics}`), cada variante carregando `session_id` + `turn_id` + `generation_id`. O
+  `generation_id` deixa o frontend descartar eventos de uma geração já superada; o
+  `session_id` é redundância defensiva e material de diagnóstico — o descarte de eventos de
+  sessão encerrada acontece no backend, antes da emissão, não no frontend. `Diagnostics`
+  carrega um `GenerationDiagnostics` completo (ver acima) e é emitido ao final de toda
+  geração cuja sessão ainda esteja ativa, além do evento "de negócio" correspondente
+  (`Skipped`/`Error`/`Cancelled`/`Completed`).
 - **`config_store.rs`** — configuração não-secreta persistida em JSON (mesmo padrão de
   escrita atômica via arquivo temporário + rename de `model_manager::config_store`):
   `ResponseProviderKind` (`ollama`/`open_ai`/`deep_seek`/`anthropic`), `model`, `base_url`
@@ -288,6 +506,17 @@ resposta à primeira pergunta ("Em qual situação você usaria monolitos?") per
 visível enquanto a segunda ("Em qual situação você usaria microsserviços?") ainda está
 sendo preparada, em vez de piscar para um painel vazio entre as duas.
 
+**Fronteira de sessão no frontend (fiação mínima, sem redesign).** Iniciar uma sessão em
+`app/router.tsx` agora chama `startConversationSession()`
+(`conversation_start_session_command`) depois de parar qualquer captura anterior e antes
+de iniciar a nova — é o que abre a fronteira no backend em vez de deixar a sessão anterior
+seguir ativa. `useConversationTimeline` e `useResponseSuggestions` escutam
+`session_started`/`session_ended` e zeram, respectivamente, turnos/utterances e
+sugestões/diagnósticos. Isso é limpeza de UI, **não** é o mecanismo de isolamento: mesmo
+sem essas linhas, o backend não constrói prompt, não executa geração e não emite evento de
+uma sessão encerrada. Elas existem para a tela não continuar exibindo o que já foi
+descartado na origem.
+
 `applyResponseSuggestionDiagnostics` reduz os eventos `diagnostics` separadamente, num
 `Record<TurnId, ResponseSuggestionDiagnostics>` só usado pelas ferramentas de
 desenvolvedor (`features/developer-tools/DeveloperToolsScreen.tsx`) — não afeta
@@ -313,18 +542,61 @@ Configurações.
   timer espera. Uma dica de implementação para quem for mexer nesses testes: um timer
   recém-`tokio::spawn`ado precisa ser `yield_now`ado *antes* de `advance` para registrar
   seu prazo na timer wheel — avançar o relógio antes disso não acorda nada.
+
+  Os testes de fronteira de sessão vivem no mesmo arquivo: encerrar a sessão limpa
+  **todas** as coleções (`ending_a_session_clears_every_conversational_collection`);
+  encerrar duas vezes é idempotente; `session_ended` e `session_started` aparecem nessa
+  ordem; eventos finalizados carregam a sessão que os produziu; utterances finalizadas
+  pelo encerramento são marcadas como `session_ended`; um timer agendado na sessão A não
+  finaliza nada depois de a sessão B começar
+  (`a_timer_from_the_previous_session_cannot_finalize_anything_in_the_new_one`) e a sessão
+  nova tem seu próprio timer funcionando (`the_new_session_has_its_own_working_timer`).
+- **`response_provider/context.rs`** — inspeciona o prompt montado, não só a API:
+  `prompt_contains_only_supplied_history` prova que texto de uma sessão anterior (isto é,
+  turnos não passados em `history`) não aparece em lugar nenhum do prompt;
+  `separates_context_from_current_speech` e `excludes_current_turn_from_context_section`
+  verificam os três blocos e que a fala atual não se duplica dentro do contexto;
+  `required_utterances_reach_the_model_isolated_as_current_speech` cobre as falas que
+  precisam obrigatoriamente chegar isoladas ao modelo (pergunta direta, pedido de exemplo,
+  pedido de explicação, imperativo, desafio de entrevista) e o contraste com um
+  `"Perfeito."` isolado; `system_prompt_states_skip_policy` fixa a política de `[SKIP]` no
+  texto do prompt.
+- **`response_provider/skip_detector.rs`** — além dos casos originais (marcador completo em
+  um chunk, partido entre chunks, divergência no meio, stream vazio), cobre `[SKIP]` com
+  `\n` no fim, com espaço em branco à esquerda, em caixa baixa, e espaço em branco isolado
+  ainda pendente.
 - **`response_provider/engine.rs`** — `ResponseEngine::for_test` injeta um
-  `ResponseProvider` fake (`FakeProvider`, com um modo que responde com texto fixo e um
-  modo `Hangs` que nunca produz nada, para testar cancelamento) sem tocar o
-  `config_store` real. Os testes usam `tauri::test::mock_app()` (por isso
+  `ResponseProvider` fake (`FakeProvider`) sem tocar o `config_store` real. Ele registra
+  **todo** `ResponseRequest` recebido (`prompts()`, `request_count()`), o que permite
+  afirmar tanto o que foi enviado quanto o que *não* foi enviado, e tem modos
+  `RepliesWith`/`Hangs`/`FailsRequest`/`FailsMidStream`/`Scripted` (este último dirigido
+  por um canal, para controlar o timing do stream a partir do teste). Os testes usam
+  `tauri::test::mock_app()` (por isso
   `trigger_generation`/`run_generation`/`finish_generation`/`process_conversation_events`
   são genéricas sobre `R: tauri::Runtime` em vez de fixas em `AppHandle<Wry>`) e um
-  listener (`app.listen_any`) capturando os eventos emitidos para verificar: só o turno
-  elegível dispara geração (fala do usuário nunca dispara); uma nova utterance no mesmo
-  turno cancela a geração ainda em andamento; o estado é liberado após uma conclusão
-  natural, então um disparo seguinte para o mesmo turno não vê cancelamento algum
-  "fantasma"; `end_of_speech_to_first_visible_token_ms` e os demais campos de latência
-  são de fato calculados a partir do `GenerationTrigger`.
+  listener (`app.listen_any`) capturando os eventos emitidos. Cobrem, por grupo:
+  - **Isolamento** — sessão nova começa com contexto vazio; gatilho de sessão anterior é
+    rejeitado; histórico de outra sessão é recusado; `history_snapshot` devolve `None`
+    para sessão obsoleta; encerrar a sessão suprime `delta` e estado terminal da geração
+    em voo; uma geração da sessão anterior não bloqueia o mesmo turno na sessão nova; o
+    prompt classifica a utterance atual, não o turno inteiro.
+  - **Ciclo de vida** — `end_session` cancela o token da geração ativa; sessão nova nunca
+    herda token cancelado; cada token de geração é filho do token da sessão; encerrar duas
+    vezes é no-op; gatilho durante o encerramento é rejeitado; finalizações de
+    `capture_stopped`/`session_ended` nunca disparam geração.
+  - **`[SKIP]` e estados terminais** — marcador termina como `skipped` e libera o estado;
+    texto real termina como `completed_with_text`; erro no meio do stream encerra a
+    geração exatamente uma vez; geração superada emite exatamente **um** evento terminal.
+  - **Concorrência** — gerações de turnos diferentes coexistem; nova utterance no mesmo
+    turno cancela a anterior; estado é liberado após conclusão natural (nenhum
+    cancelamento "fantasma" depois); `end_of_speech_to_first_visible_token_ms` e os demais
+    campos de latência são de fato calculados a partir do `GenerationTrigger`.
+  - **Roteiro A/B/C** — `sessions_a_b_and_c_script` automatiza o cenário de validação
+    manual: sessão A responde uma pergunta e faz `[SKIP]` numa confirmação; a fronteira
+    para B não emite nenhum evento de sugestão e o histórico volta a zero; o prompt de B
+    contém a pergunta de B e **não** contém nem `"monolito"` nem `"Perfeito."` de A; em C,
+    uma geração lenta é interrompida pelo encerramento e o delta que chega depois não
+    produz `delta`, `completed`, `error` nem `skipped` na sessão seguinte.
 - **`response_provider/ollama.rs`** — um servidor HTTP/1.1 mínimo, escrito à mão sobre
   `tokio::net::TcpListener` (sem crate de mock), captura o corpo bruto da requisição para
   confirmar que `keep_alive`, `options.num_predict`, `options.temperature` e
@@ -347,7 +619,7 @@ sem acesso de rede de teste contra os endpoints reais dos provedores.
   trabalho, `large_enum_variant` em `ResponseSuggestionEvent` depois de
   `GenerationDiagnostics` ganhar as novas métricas, foi corrigido colocando
   `Diagnostics(Box<GenerationDiagnostics>)`, não suprimido) e
-  `cargo test --target x86_64-unknown-linux-gnu` (143 testes, todos passando,
+  `cargo test --target x86_64-unknown-linux-gnu` (179 testes, todos passando,
   repetidamente, incluindo em paralelo — cobre parsing de streaming NDJSON/SSE
   (`net.rs`), montagem de contexto/prompt (`context.rs`), a máquina de estados do
   `SkipDetector` (marcador completo em um chunk, partido entre chunks, divergência no
@@ -357,6 +629,17 @@ sem acesso de rede de teste contra os endpoints reais dos provedores.
   ciclo de vida da geração com um provider fake e `tauri::test::mock_app`
   (`engine.rs`), e o corpo exato da requisição HTTP enviada ao Ollama
   (`ollama.rs`) — ver "Testes" acima para a lista completa por arquivo.
+- **Isolamento entre sessões, por teste e não por inspeção da UI:** com um provider fake
+  que registra todo prompt recebido, está verificado neste sandbox que, depois de
+  `end_session`, o backend (a) não monta prompt com conteúdo da sessão anterior
+  (`prompt_contains_only_supplied_history`, `sessions_a_b_and_c_script`), (b) não inicia
+  geração a partir de gatilho de sessão encerrada
+  (`a_trigger_from_a_previous_session_is_rejected`,
+  `a_trigger_while_the_session_is_ending_is_rejected`) e (c) não emite `started`/`delta`/
+  terminal de uma geração cuja sessão acabou
+  (`ending_a_session_suppresses_deltas_and_terminal_events_of_the_generation_in_flight`,
+  fim do roteiro A/B/C). O roteiro A/B/C foi executado **automatizado com provider fake**,
+  não contra um Ollama real.
 - `npm run typecheck`, `npm run lint`, `npm run build` — limpos, incluindo os reducers
   `applyResponseSuggestionEvent`/`applyResponseSuggestionDiagnostics` e seus testes
   manuais (`responseSuggestionViewModel.test.ts`, rodados via `npx tsx`), cobrindo a
@@ -390,7 +673,15 @@ sem acesso de rede de teste contra os endpoints reais dos provedores.
   provedor.
 - Qualidade da decisão de `[SKIP]` e da sugestão de resposta em conversas reais e longas
   (o prompt e o teto de contexto foram desenhados a partir dos requisitos, não ajustados
-  empiricamente contra transcrições reais).
+  empiricamente contra transcrições reais). Os testes provam que a fala atual chega ao
+  modelo isolada, com a política de `[SKIP]` explícita no `SYSTEM_PROMPT` e que o parser
+  de `[SKIP]` é robusto — **não** provam que um LLM real deixará de responder `[SKIP]` a
+  uma pergunta legítima. Essa parte do §6 só pode ser confirmada rodando contra um modelo
+  de verdade; se ainda ocorrer, o próximo passo é ler `raw_prefix` e `prompt_preview` no
+  painel de diagnóstico antes de mudar código.
+- O roteiro manual A/B/C contra um provedor real (Ollama ou nuvem), com áudio de verdade:
+  aqui ele existe apenas como teste automatizado com provider fake. Windows/WASAPI e
+  keychain real também não foram exercitados — este ambiente é WSL2/Linux.
 - Comportamento do cancelamento/substituição de geração (turno que continua sendo falado
   enquanto uma sugestão já está sendo gerada) sob timing real de fala humana, em vez de
   timers/eventos sintéticos de teste.

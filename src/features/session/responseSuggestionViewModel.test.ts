@@ -19,7 +19,7 @@ function run(name: string, fn: () => void): void {
 run("started resets text but keeps the previous completed answer visible", () => {
   const state = applyResponseSuggestionEvent(
     { 1: { generationId: 3, status: "completed_with_text", text: "old" } },
-    { type: "started", turn_id: 1, generation_id: 4 },
+    { type: "started", session_id: 1, turn_id: 1, generation_id: 4 },
   );
   assert(state[1]!.generationId === 4, "generation id updated");
   assert(state[1]!.status === "preparing", "status is preparing, not streaming, before any delta");
@@ -31,10 +31,10 @@ run("first delta with content clears previousText and switches to streaming", ()
   let state: Record<number, SuggestionState> = {
     1: { generationId: 3, status: "completed_with_text", text: "old" },
   };
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 4 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 4 });
   assert(state[1]!.previousText === "old", "previousText present while preparing");
   state = applyResponseSuggestionEvent(state, {
-    type: "delta",
+    type: "delta", session_id: 1,
     turn_id: 1,
     generation_id: 4,
     text: "novo",
@@ -48,8 +48,8 @@ run("a generation that ends up skipped keeps the previous completed answer visib
   let state: Record<number, SuggestionState> = {
     1: { generationId: 1, status: "completed_with_text", text: "resposta anterior" },
   };
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 2 });
-  state = applyResponseSuggestionEvent(state, { type: "skipped", turn_id: 1, generation_id: 2 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 2 });
+  state = applyResponseSuggestionEvent(state, { type: "skipped", session_id: 1, turn_id: 1, generation_id: 2 });
   assert(state[1]!.status === "skipped", "status reflects the new generation's outcome");
   assert(state[1]!.previousText === "resposta anterior", "previous answer still available for the UI to fall back to");
 });
@@ -58,9 +58,9 @@ run("a generation that completes with text clears any stale previousText", () =>
   let state: Record<number, SuggestionState> = {
     1: { generationId: 1, status: "completed_with_text", text: "resposta antiga" },
   };
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 2 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 2 });
   state = applyResponseSuggestionEvent(state, {
-    type: "completed",
+    type: "completed", session_id: 1,
     turn_id: 1,
     generation_id: 2,
     text: "resposta nova",
@@ -72,15 +72,15 @@ run("a generation that completes with text clears any stale previousText", () =>
 
 run("delta appends text for the current generation", () => {
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 1 });
   state = applyResponseSuggestionEvent(state, {
-    type: "delta",
+    type: "delta", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     text: "Olá",
   });
   state = applyResponseSuggestionEvent(state, {
-    type: "delta",
+    type: "delta", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     text: ", tudo bem?",
@@ -90,10 +90,10 @@ run("delta appends text for the current generation", () => {
 
 run("stale delta from a superseded generation is ignored", () => {
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 1 });
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 2 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 2 });
   state = applyResponseSuggestionEvent(state, {
-    type: "delta",
+    type: "delta", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     text: "texto antigo",
@@ -104,15 +104,15 @@ run("stale delta from a superseded generation is ignored", () => {
 
 run("completed with text replaces accumulated text and is completed_with_text", () => {
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 1 });
   state = applyResponseSuggestionEvent(state, {
-    type: "delta",
+    type: "delta", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     text: "parcial",
   });
   state = applyResponseSuggestionEvent(state, {
-    type: "completed",
+    type: "completed", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     text: "texto final completo",
@@ -123,9 +123,9 @@ run("completed with text replaces accumulated text and is completed_with_text", 
 
 run("completed with empty text is a distinct completed_empty status, not skipped", () => {
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 1 });
   state = applyResponseSuggestionEvent(state, {
-    type: "completed",
+    type: "completed", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     text: "",
@@ -136,9 +136,9 @@ run("completed with empty text is a distinct completed_empty status, not skipped
 
 run("completed with only whitespace text is treated as completed_empty", () => {
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 1 });
   state = applyResponseSuggestionEvent(state, {
-    type: "completed",
+    type: "completed", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     text: "   \n",
@@ -149,16 +149,16 @@ run("completed with only whitespace text is treated as completed_empty", () => {
 run("skipped, cancelled and error update status without an existing entry being a no-op", () => {
   const empty: Record<number, SuggestionState> = {};
   const afterSkip = applyResponseSuggestionEvent(empty, {
-    type: "skipped",
+    type: "skipped", session_id: 1,
     turn_id: 9,
     generation_id: 1,
   });
   assert(afterSkip[9] === undefined, "no entry for an unknown turn/generation");
 
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 2, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 2, generation_id: 1 });
   state = applyResponseSuggestionEvent(state, {
-    type: "error",
+    type: "error", session_id: 1,
     turn_id: 2,
     generation_id: 1,
     message: "falha de rede",
@@ -169,10 +169,10 @@ run("skipped, cancelled and error update status without an existing entry being 
 
 run("events for a different turn do not affect other turns", () => {
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 1 });
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 2, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 2, generation_id: 1 });
   state = applyResponseSuggestionEvent(state, {
-    type: "cancelled",
+    type: "cancelled", session_id: 1,
     turn_id: 1,
     generation_id: 1,
   });
@@ -182,10 +182,10 @@ run("events for a different turn do not affect other turns", () => {
 
 run("diagnostics event does not affect visible suggestion state", () => {
   let state: Record<number, SuggestionState> = {};
-  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 1 });
+  state = applyResponseSuggestionEvent(state, { type: "started", session_id: 1, turn_id: 1, generation_id: 1 });
   const before = state[1];
   state = applyResponseSuggestionEvent(state, {
-    type: "diagnostics",
+    type: "diagnostics", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     event_emitted: "skipped",
@@ -196,14 +196,14 @@ run("diagnostics event does not affect visible suggestion state", () => {
 run("applyResponseSuggestionDiagnostics records fields keyed by turn_id", () => {
   let diagnostics: Record<number, ResponseSuggestionDiagnostics> = {};
   diagnostics = applyResponseSuggestionDiagnostics(diagnostics, {
-    type: "started",
+    type: "started", session_id: 1,
     turn_id: 1,
     generation_id: 1,
   });
   assert(Object.keys(diagnostics).length === 0, "non-diagnostics events are ignored");
 
   diagnostics = applyResponseSuggestionDiagnostics(diagnostics, {
-    type: "diagnostics",
+    type: "diagnostics", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     provider: "ollama",
@@ -230,7 +230,7 @@ run("applyResponseSuggestionDiagnostics records fields keyed by turn_id", () => 
 run("applyResponseSuggestionDiagnostics fills missing optional fields with defaults", () => {
   let diagnostics: Record<number, ResponseSuggestionDiagnostics> = {};
   diagnostics = applyResponseSuggestionDiagnostics(diagnostics, {
-    type: "diagnostics",
+    type: "diagnostics", session_id: 1,
     turn_id: 5,
     generation_id: 1,
   });
@@ -250,7 +250,7 @@ run("applyResponseSuggestionDiagnostics fills missing optional fields with defau
 run("applyResponseSuggestionDiagnostics records the new latency and trigger fields", () => {
   let diagnostics: Record<number, ResponseSuggestionDiagnostics> = {};
   diagnostics = applyResponseSuggestionDiagnostics(diagnostics, {
-    type: "diagnostics",
+    type: "diagnostics", session_id: 1,
     turn_id: 1,
     generation_id: 1,
     finalization_reason: "inactivity_timeout",

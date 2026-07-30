@@ -3,21 +3,79 @@
 //! transmite os deltas como eventos. Cancela/substitui uma geração em andamento quando a
 //! mesma pessoa continua falando no mesmo turno, para nunca responder por cima de uma
 //! fala que ainda não terminou.
+//!
+//! **A sessão é uma fronteira rígida.** Todo estado conversacional (histórico usado no
+//! prompt, gerações ativas, token de cancelamento) pertence a uma `SessionId`; encerrar a
+//! sessão cancela tudo e apaga tudo, e qualquer trabalho em voo da sessão antiga é
+//! descartado em silêncio antes de virar evento. Ver `docs/response-suggestion.md`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
+use serde::Serialize;
 use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::types::AudioSource;
 use crate::conversation::{
-    ConversationSpeaker, ConversationTimelineEvent, ConversationTurn, TurnId,
+    ConversationSpeaker, ConversationTimelineEvent, ConversationTurn, SessionId, TurnId,
+    UtteranceFinalizationReason, UtteranceId,
 };
+
+/// Id de geração, monotônico por processo (nunca reiniciado, nem entre sessões): junto com
+/// `SessionId` forma uma identidade que nenhum evento atrasado consegue forjar por
+/// coincidência. Serializa como número puro — o frontend continua vendo `generation_id: 3`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct GenerationId(u64);
+
+impl GenerationId {
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+/// Identidade completa de uma geração. Nenhuma geração existe sem `session_id`: é o campo
+/// verificado antes de iniciar a requisição e antes de publicar qualquer evento.
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationContext {
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub utterance_id: UtteranceId,
+    pub utterance_revision: u64,
+    pub generation_id: GenerationId,
+}
+
+/// Estados terminais possíveis de uma geração. Exatamente um acontece por geração, e
+/// apenas os quatro primeiros viram evento para o frontend — `Superseded` já foi
+/// anunciado como `cancelled` por quem substituiu a geração, e `SessionEnded` não pode
+/// virar evento nenhum, porque a sessão dona daquele evento não existe mais.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalState {
+    Completed,
+    Skipped,
+    Cancelled,
+    Error,
+    Superseded,
+    SessionEnded,
+}
+
+impl TerminalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            TerminalState::Completed => "completed",
+            TerminalState::Skipped => "skipped",
+            TerminalState::Cancelled => "cancelled",
+            TerminalState::Error => "error",
+            TerminalState::Superseded => "superseded",
+            TerminalState::SessionEnded => "session_ended",
+        }
+    }
+}
 
 /// Contexto de disparo capturado no momento em que `process_conversation_events` recebe
 /// um `UtteranceFinalized` elegível. `utterance_finalized_at` é um `Instant` (não epoch)
@@ -26,6 +84,14 @@ use crate::conversation::{
 /// síncrona, isso equivale, na prática, ao instante real de finalização, sem precisar
 /// serializar `Instant` através do evento da timeline.
 pub struct GenerationTrigger {
+    pub session_id: SessionId,
+    pub utterance_id: UtteranceId,
+    pub utterance_revision: u64,
+    /// Texto **só da utterance** que acabou de finalizar — a "fala atual". Separado do
+    /// texto do turno de propósito: o turno acumula tudo que a pessoa disse enquanto teve
+    /// a palavra, e mandar isso como "fala mais recente" fazia o modelo decidir sobre uma
+    /// pergunta velha (ou responder `[SKIP]` por já ter "visto" tudo aquilo).
+    pub utterance_text: String,
     pub utterance_finalized_at: Instant,
     pub finalization_reason: String,
     pub gap_ms_used: u64,
@@ -62,8 +128,43 @@ fn epoch_ms() -> u64 {
 }
 
 struct GenerationHandle {
-    generation_id: u64,
+    generation_id: GenerationId,
     cancel: CancellationToken,
+    /// Marcado na primeira vez que um estado terminal é publicado para esta geração.
+    /// Compartilhado com a task que roda a geração, para que nem a substituição
+    /// (`cancelled` emitido por quem substituiu) nem a própria task publiquem um segundo
+    /// estado terminal.
+    terminal_emitted: Arc<AtomicBool>,
+}
+
+/// Todo o estado conversacional do motor, sempre atrás de um único mutex para que
+/// encerrar a sessão seja atômico: não existe instante em que a sessão já mudou mas o
+/// histórico antigo ainda está lá (ou vice-versa).
+struct SessionState {
+    session_id: SessionId,
+    /// Ligado no início do encerramento, antes de qualquer limpeza: bloqueia gatilhos
+    /// novos e publicação de eventos enquanto a sessão está sendo desmontada.
+    ending: bool,
+    /// Token raiz da sessão. Cada geração recebe um `child_token()` dele, então cancelar
+    /// a sessão cancela todas as gerações em voo de uma vez. Nunca é reutilizado depois de
+    /// cancelado: `begin_session` instala um token novo.
+    cancel: CancellationToken,
+    /// Histórico rolante usado para montar o prompt — **por sessão**. Era isto que
+    /// sobrevivia ao encerramento e fazia perguntas da sessão anterior reaparecerem.
+    history: VecDeque<ConversationTurn>,
+    generations: HashMap<TurnId, GenerationHandle>,
+}
+
+impl SessionState {
+    fn new(session_id: SessionId) -> Self {
+        SessionState {
+            session_id,
+            ending: false,
+            cancel: CancellationToken::new(),
+            history: VecDeque::with_capacity(MAX_HISTORY_TURNS),
+            generations: HashMap::new(),
+        }
+    }
 }
 
 struct MisconfiguredProvider {
@@ -145,12 +246,15 @@ pub struct ResponseEngine {
     provider: Mutex<Arc<dyn ResponseProvider>>,
     config: Mutex<ResponseProviderConfig>,
     config_path: PathBuf,
-    history: Mutex<VecDeque<ConversationTurn>>,
-    generations: Mutex<HashMap<TurnId, GenerationHandle>>,
+    session: Mutex<SessionState>,
     next_generation_id: AtomicU64,
 }
 
 impl ResponseEngine {
+    /// A sessão inicial é um placeholder: `lib.rs` chama `begin_session` com a sessão real
+    /// do `ConversationTimeline` logo depois de construir os dois, e todo gatilho é
+    /// comparado com ela. Enquanto isso não acontece, nenhum gatilho é aceito — preferível
+    /// a adotar silenciosamente a sessão de quem chamar primeiro.
     pub fn from_config_path(config_path: PathBuf) -> Self {
         let config = config_store::load(&config_path);
         let provider = build_provider(&config);
@@ -158,10 +262,89 @@ impl ResponseEngine {
             provider: Mutex::new(provider),
             config: Mutex::new(config),
             config_path,
-            history: Mutex::new(VecDeque::with_capacity(MAX_HISTORY_TURNS)),
-            generations: Mutex::new(HashMap::new()),
+            session: Mutex::new(SessionState::new(SessionId::new())),
             next_generation_id: AtomicU64::new(0),
         }
+    }
+
+    /// Sessão ativa do motor. Deve espelhar `ConversationTimeline::session_id`; as duas só
+    /// mudam juntas, nos comandos de início/fim de sessão. Só os testes precisam ler isso
+    /// diretamente — o código de produção compara sessões pelos caminhos que já validam
+    /// (`push_history`, `history_snapshot`, `is_publishable`, `session_is_active`).
+    #[cfg(test)]
+    pub fn active_session_id(&self) -> SessionId {
+        self.session
+            .lock()
+            .expect("response engine mutex poisoned")
+            .session_id
+    }
+
+    /// Instala uma sessão nova e vazia: token raiz novo (nunca um já cancelado), histórico
+    /// vazio, nenhuma geração ativa. Provider e `reqwest::Client` são deliberadamente
+    /// preservados — reaproveitar conexão é correto, reaproveitar conversa não.
+    pub fn begin_session(&self, session_id: SessionId) {
+        let mut state = self.session.lock().expect("response engine mutex poisoned");
+        let previous = state.session_id;
+        *state = SessionState::new(session_id);
+        tracing::info!(
+            session_id = session_id.value(),
+            previous_session_id = previous.value(),
+            "session_started"
+        );
+    }
+
+    /// Encerramento atômico e ordenado da sessão: marca como encerrando (nenhum gatilho
+    /// novo passa a partir daqui), cancela o token raiz (e com ele toda geração em voo),
+    /// marca as gerações ativas como já terminadas (para que a task, ao acordar, não
+    /// publique `cancelled`/`completed`/`error` de uma sessão que não existe mais) e apaga
+    /// o histórico usado no prompt. Idempotente: chamar com uma sessão que não é a ativa,
+    /// ou duas vezes seguidas, é um no-op registrado em log.
+    pub fn end_session(&self, session_id: SessionId) {
+        let mut state = self.session.lock().expect("response engine mutex poisoned");
+        if state.session_id != session_id {
+            tracing::debug!(
+                requested_session_id = session_id.value(),
+                active_session_id = state.session_id.value(),
+                "session end ignored: not the active session"
+            );
+            return;
+        }
+        if state.ending {
+            tracing::debug!(
+                session_id = session_id.value(),
+                "session end ignored: already ending"
+            );
+            return;
+        }
+        tracing::info!(
+            session_id = session_id.value(),
+            active_generations = state.generations.len(),
+            history_turns = state.history.len(),
+            "session_ending"
+        );
+        state.ending = true;
+        state.cancel.cancel();
+        for (turn_id, handle) in state.generations.drain() {
+            // `swap` e não `store`: se a geração já tinha publicado seu estado terminal,
+            // não há nada a cancelar — só evita que ela publique um segundo.
+            let already_terminal = handle.terminal_emitted.swap(true, Ordering::SeqCst);
+            handle.cancel.cancel();
+            if !already_terminal {
+                tracing::info!(
+                    session_id = session_id.value(),
+                    turn_id = turn_id.value(),
+                    generation_id = handle.generation_id.value(),
+                    "generation_cancelled_session_end"
+                );
+            }
+        }
+        let cleared_turns = state.history.len();
+        state.history.clear();
+        tracing::info!(
+            session_id = session_id.value(),
+            cleared_turns,
+            "session_state_cleared"
+        );
     }
 
     pub fn current_config(&self) -> ResponseProviderConfig {
@@ -196,31 +379,130 @@ impl ResponseEngine {
         }
     }
 
-    fn push_history(&self, turn: ConversationTurn) {
-        let mut history = self.history.lock().expect("response engine mutex poisoned");
-        history.retain(|existing| existing.id != turn.id);
-        history.push_back(turn);
-        while history.len() > MAX_HISTORY_TURNS {
-            history.pop_front();
+    /// Só aceita turnos da sessão ativa. Um turno finalizado que chegue atrasado, de uma
+    /// sessão já encerrada, é descartado — é ele que, antes, entrava no histórico e
+    /// contaminava o prompt da sessão seguinte.
+    fn push_history(&self, session_id: SessionId, turn: ConversationTurn) {
+        let mut state = self.session.lock().expect("response engine mutex poisoned");
+        if state.session_id != session_id || state.ending {
+            tracing::debug!(
+                turn_session_id = session_id.value(),
+                active_session_id = state.session_id.value(),
+                turn_id = turn.id.value(),
+                "history turn discarded: not the active session"
+            );
+            return;
+        }
+        state.history.retain(|existing| existing.id != turn.id);
+        state.history.push_back(turn);
+        while state.history.len() > MAX_HISTORY_TURNS {
+            state.history.pop_front();
         }
     }
 
-    fn history_snapshot(&self) -> Vec<ConversationTurn> {
-        self.history
-            .lock()
-            .expect("response engine mutex poisoned")
-            .iter()
-            .cloned()
-            .collect()
+    /// Histórico da sessão `session_id`, ou `None` se ela não for mais a sessão ativa —
+    /// nunca devolve um histórico "global".
+    fn history_snapshot(&self, session_id: SessionId) -> Option<Vec<ConversationTurn>> {
+        let state = self.session.lock().expect("response engine mutex poisoned");
+        if state.session_id != session_id || state.ending {
+            return None;
+        }
+        Some(state.history.iter().cloned().collect())
     }
 
-    fn clear_if_current(&self, turn_id: TurnId, generation_id: u64) {
-        let mut generations = self
-            .generations
-            .lock()
-            .expect("response engine mutex poisoned");
-        if generations.get(&turn_id).map(|h| h.generation_id) == Some(generation_id) {
-            generations.remove(&turn_id);
+    /// A geração ainda é a corrente para o turno, na sessão ativa, sem cancelamento?
+    /// Consultado antes de `started` e de cada `delta`.
+    fn is_publishable(&self, ctx: &GenerationContext) -> bool {
+        let state = self.session.lock().expect("response engine mutex poisoned");
+        state.session_id == ctx.session_id
+            && !state.ending
+            && !state.cancel.is_cancelled()
+            && state
+                .generations
+                .get(&ctx.turn_id)
+                .is_some_and(|handle| handle.generation_id == ctx.generation_id)
+    }
+
+    /// A sessão dona da geração ainda é a ativa? Condição mínima para publicar um estado
+    /// terminal (que, ao contrário de `delta`, é legítimo mesmo depois de a geração já ter
+    /// saído do mapa de gerações ativas).
+    fn session_is_active(&self, session_id: SessionId) -> bool {
+        let state = self.session.lock().expect("response engine mutex poisoned");
+        state.session_id == session_id && !state.ending
+    }
+
+    /// Publica um evento de streaming (`started`/`delta`). Silenciosamente descartado —
+    /// com log em `debug` — se a sessão mudou, está encerrando, ou a geração já foi
+    /// substituída/cancelada.
+    fn publish_stream_event<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        ctx: &GenerationContext,
+        event: ResponseSuggestionEvent,
+    ) -> bool {
+        if !self.is_publishable(ctx) {
+            tracing::debug!(
+                session_id = ctx.session_id.value(),
+                turn_id = ctx.turn_id.value(),
+                generation_id = ctx.generation_id.value(),
+                "generation_event_discarded_stale"
+            );
+            return false;
+        }
+        emit_response_suggestion_event(app, event);
+        true
+    }
+
+    /// Publica **o** estado terminal da geração, no máximo uma vez (`terminal_emitted`
+    /// funciona como trava de dupla finalização) e só se a sessão ainda for a ativa.
+    fn publish_terminal_event<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        ctx: &GenerationContext,
+        terminal_emitted: &AtomicBool,
+        terminal: TerminalState,
+        event: Option<ResponseSuggestionEvent>,
+    ) -> bool {
+        if terminal_emitted.swap(true, Ordering::SeqCst) {
+            tracing::debug!(
+                session_id = ctx.session_id.value(),
+                turn_id = ctx.turn_id.value(),
+                generation_id = ctx.generation_id.value(),
+                terminal_state = terminal.as_str(),
+                "generation_event_discarded_stale: terminal state already emitted"
+            );
+            return false;
+        }
+        if !self.session_is_active(ctx.session_id) {
+            tracing::info!(
+                session_id = ctx.session_id.value(),
+                turn_id = ctx.turn_id.value(),
+                generation_id = ctx.generation_id.value(),
+                terminal_state = TerminalState::SessionEnded.as_str(),
+                "terminal_state"
+            );
+            return false;
+        }
+        tracing::info!(
+            session_id = ctx.session_id.value(),
+            turn_id = ctx.turn_id.value(),
+            generation_id = ctx.generation_id.value(),
+            terminal_state = terminal.as_str(),
+            "terminal_state"
+        );
+        if let Some(event) = event {
+            emit_response_suggestion_event(app, event);
+        }
+        true
+    }
+
+    fn clear_if_current(&self, ctx: &GenerationContext) {
+        let mut state = self.session.lock().expect("response engine mutex poisoned");
+        if state.session_id != ctx.session_id {
+            return;
+        }
+        if state.generations.get(&ctx.turn_id).map(|h| h.generation_id) == Some(ctx.generation_id) {
+            state.generations.remove(&ctx.turn_id);
         }
     }
 
@@ -234,36 +516,77 @@ impl ResponseEngine {
         turn: ConversationTurn,
         trigger: GenerationTrigger,
     ) {
-        let generation_id = self.next_generation_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let cancel_token = CancellationToken::new();
+        let generation_id =
+            GenerationId(self.next_generation_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let ctx = GenerationContext {
+            session_id: trigger.session_id,
+            turn_id: turn.id,
+            utterance_id: trigger.utterance_id,
+            utterance_revision: trigger.utterance_revision,
+            generation_id,
+        };
+        let terminal_emitted = Arc::new(AtomicBool::new(false));
 
-        {
-            let mut generations = self
-                .generations
-                .lock()
-                .expect("response engine mutex poisoned");
-            if let Some(previous) = generations.insert(
-                turn.id,
+        // Reserva do slot, validação de sessão e cancelamento do que estava lá acontecem
+        // sob o mesmo lock: não existe janela em que a sessão acabou de encerrar e este
+        // gatilho ainda consegue registrar uma geração.
+        let (cancel_token, superseded) = {
+            let mut state = self.session.lock().expect("response engine mutex poisoned");
+            if state.session_id != ctx.session_id {
+                tracing::warn!(
+                    trigger_session_id = ctx.session_id.value(),
+                    active_session_id = state.session_id.value(),
+                    turn_id = ctx.turn_id.value(),
+                    "generation_rejected_wrong_session"
+                );
+                return;
+            }
+            if state.ending {
+                tracing::info!(
+                    session_id = ctx.session_id.value(),
+                    turn_id = ctx.turn_id.value(),
+                    "generation_rejected_wrong_session: session is ending"
+                );
+                return;
+            }
+            let cancel_token = state.cancel.child_token();
+            let previous = state.generations.insert(
+                ctx.turn_id,
                 GenerationHandle {
                     generation_id,
                     cancel: cancel_token.clone(),
+                    terminal_emitted: terminal_emitted.clone(),
                 },
-            ) {
-                previous.cancel.cancel();
-                emit_response_suggestion_event(
-                    &app,
-                    ResponseSuggestionEvent::Cancelled {
-                        turn_id: turn.id,
-                        generation_id: previous.generation_id,
-                    },
-                );
-            }
+            );
+            (cancel_token, previous)
+        };
+
+        if let Some(previous) = superseded {
+            previous.cancel.cancel();
+            // A geração substituída termina aqui, em `cancelled`: sua própria task, ao
+            // acordar cancelada, encontra `terminal_emitted` já marcado e não publica um
+            // segundo estado terminal.
+            let previous_ctx = GenerationContext {
+                generation_id: previous.generation_id,
+                ..ctx
+            };
+            self.publish_terminal_event(
+                &app,
+                &previous_ctx,
+                &previous.terminal_emitted,
+                TerminalState::Superseded,
+                Some(ResponseSuggestionEvent::Cancelled {
+                    session_id: previous_ctx.session_id,
+                    turn_id: previous_ctx.turn_id,
+                    generation_id: previous.generation_id,
+                }),
+            );
         }
 
         let engine = self.clone();
         tauri::async_runtime::spawn(async move {
             engine
-                .run_generation(app, turn, generation_id, cancel_token, trigger)
+                .run_generation(app, turn, ctx, terminal_emitted, cancel_token, trigger)
                 .await;
         });
     }
@@ -272,7 +595,8 @@ impl ResponseEngine {
         self: Arc<Self>,
         app: AppHandle<R>,
         turn: ConversationTurn,
-        generation_id: u64,
+        ctx: GenerationContext,
+        terminal_emitted: Arc<AtomicBool>,
         cancel_token: CancellationToken,
         trigger: GenerationTrigger,
     ) {
@@ -282,28 +606,54 @@ impl ResponseEngine {
             .expect("response engine mutex poisoned")
             .clone();
         let model = self.current_config().model;
-        let history = self.history_snapshot();
-        let request = build_request(&history, &turn);
+
+        // Contexto vem do histórico *da sessão desta geração*. Se a sessão já mudou entre
+        // o disparo e este ponto, não existe contexto legítimo a montar — a geração morre
+        // aqui, sem prompt, sem requisição e sem evento.
+        let Some(history) = self.history_snapshot(ctx.session_id) else {
+            tracing::debug!(
+                session_id = ctx.session_id.value(),
+                turn_id = ctx.turn_id.value(),
+                generation_id = ctx.generation_id.value(),
+                "generation_event_discarded_stale: session changed before context was built"
+            );
+            self.clear_if_current(&ctx);
+            return;
+        };
+        let built = build_request(&history, &turn, &trigger.utterance_text);
+
+        tracing::info!(
+            session_id = ctx.session_id.value(),
+            turn_id = ctx.turn_id.value(),
+            utterance_id = ctx.utterance_id.value(),
+            generation_id = ctx.generation_id.value(),
+            context_turn_count = built.context_turn_count,
+            context_character_count = built.context_character_count,
+            "context_built"
+        );
+        tracing::debug!(
+            session_id = ctx.session_id.value(),
+            generation_id = ctx.generation_id.value(),
+            prompt_preview = %built.sanitized_preview,
+            "context_built (sanitized prompt)"
+        );
 
         tracing::info!(
             provider = provider.provider_name(),
-            turn_id = turn.id.value(),
-            generation_id,
+            session_id = ctx.session_id.value(),
+            turn_id = ctx.turn_id.value(),
+            utterance_id = ctx.utterance_id.value(),
+            utterance_revision = ctx.utterance_revision,
+            generation_id = ctx.generation_id.value(),
             "starting response generation"
-        );
-
-        emit_response_suggestion_event(
-            &app,
-            ResponseSuggestionEvent::Started {
-                turn_id: turn.id,
-                generation_id,
-            },
         );
 
         let started_at = Instant::now();
         let mut diagnostics = GenerationDiagnostics {
-            generation_id,
-            turn_id: turn.id,
+            session_id: ctx.session_id,
+            generation_id: ctx.generation_id,
+            turn_id: ctx.turn_id,
+            utterance_id: ctx.utterance_id,
             provider: provider.provider_name().to_string(),
             model,
             request_started: epoch_ms(),
@@ -318,6 +668,9 @@ impl ResponseEngine {
             finalization_reason: trigger.finalization_reason.clone(),
             gap_ms_used: trigger.gap_ms_used,
             silence_detected_ms: trigger.silence_detected_ms,
+            context_turn_count: built.context_turn_count,
+            context_character_count: built.context_character_count,
+            prompt_preview: built.sanitized_preview.clone(),
             utterance_finalized_to_request_started_ms: None,
             request_to_first_http_chunk_ms: None,
             request_to_first_visible_token_ms: None,
@@ -334,8 +687,7 @@ impl ResponseEngine {
             ($diagnostics:expr) => {
                 self.finish_generation(
                     &app,
-                    &turn,
-                    generation_id,
+                    &ctx,
                     $diagnostics,
                     started_at,
                     utterance_finalized_at,
@@ -346,14 +698,39 @@ impl ResponseEngine {
             };
         }
 
+        if !self.publish_stream_event(
+            &app,
+            &ctx,
+            ResponseSuggestionEvent::Started {
+                session_id: ctx.session_id,
+                turn_id: ctx.turn_id,
+                generation_id: ctx.generation_id,
+            },
+        ) {
+            diagnostics.event_emitted = "discarded_stale".to_string();
+            finish!(diagnostics);
+            return;
+        }
+
         let stream_result = tokio::select! {
             _ = cancel_token.cancelled() => {
                 diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
                 diagnostics.event_emitted = "cancelled".to_string();
+                self.publish_terminal_event(
+                    &app,
+                    &ctx,
+                    &terminal_emitted,
+                    TerminalState::Cancelled,
+                    Some(ResponseSuggestionEvent::Cancelled {
+                        session_id: ctx.session_id,
+                        turn_id: ctx.turn_id,
+                        generation_id: ctx.generation_id,
+                    }),
+                );
                 finish!(diagnostics);
                 return;
             }
-            result = provider.stream_reply(request) => result,
+            result = provider.stream_reply(built.request) => result,
         };
 
         let mut stream = match stream_result {
@@ -363,13 +740,17 @@ impl ResponseEngine {
             }
             Err(e) => {
                 diagnostics.event_emitted = "error".to_string();
-                emit_response_suggestion_event(
+                self.publish_terminal_event(
                     &app,
-                    ResponseSuggestionEvent::Error {
-                        turn_id: turn.id,
-                        generation_id,
+                    &ctx,
+                    &terminal_emitted,
+                    TerminalState::Error,
+                    Some(ResponseSuggestionEvent::Error {
+                        session_id: ctx.session_id,
+                        turn_id: ctx.turn_id,
+                        generation_id: ctx.generation_id,
                         message: e.to_string(),
-                    },
+                    }),
                 );
                 finish!(diagnostics);
                 return;
@@ -384,9 +765,16 @@ impl ResponseEngine {
                 _ = cancel_token.cancelled() => {
                     diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
                     diagnostics.event_emitted = "cancelled".to_string();
-                    emit_response_suggestion_event(
+                    self.publish_terminal_event(
                         &app,
-                        ResponseSuggestionEvent::Cancelled { turn_id: turn.id, generation_id },
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Cancelled,
+                        Some(ResponseSuggestionEvent::Cancelled {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            generation_id: ctx.generation_id,
+                        }),
                     );
                     finish!(diagnostics);
                     return;
@@ -415,12 +803,22 @@ impl ResponseEngine {
                         SkipDecision::Skip => {
                             diagnostics.skip_detected = true;
                             diagnostics.event_emitted = "skipped".to_string();
-                            emit_response_suggestion_event(
+                            tracing::info!(
+                                session_id = ctx.session_id.value(),
+                                turn_id = ctx.turn_id.value(),
+                                generation_id = ctx.generation_id.value(),
+                                "skip_detected"
+                            );
+                            self.publish_terminal_event(
                                 &app,
-                                ResponseSuggestionEvent::Skipped {
-                                    turn_id: turn.id,
-                                    generation_id,
-                                },
+                                &ctx,
+                                &terminal_emitted,
+                                TerminalState::Skipped,
+                                Some(ResponseSuggestionEvent::Skipped {
+                                    session_id: ctx.session_id,
+                                    turn_id: ctx.turn_id,
+                                    generation_id: ctx.generation_id,
+                                }),
                             );
                             finish!(diagnostics);
                             return;
@@ -431,14 +829,22 @@ impl ResponseEngine {
                                     first_visible_text_at = Some(Instant::now());
                                 }
                                 full_text.push_str(&flush);
-                                emit_response_suggestion_event(
+                                if !self.publish_stream_event(
                                     &app,
+                                    &ctx,
                                     ResponseSuggestionEvent::Delta {
-                                        turn_id: turn.id,
-                                        generation_id,
+                                        session_id: ctx.session_id,
+                                        turn_id: ctx.turn_id,
+                                        generation_id: ctx.generation_id,
                                         text: flush,
                                     },
-                                );
+                                ) {
+                                    // Sessão encerrada ou geração substituída no meio do
+                                    // stream: para de consumir e não publica mais nada.
+                                    diagnostics.event_emitted = "discarded_stale".to_string();
+                                    finish!(diagnostics);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -446,13 +852,17 @@ impl ResponseEngine {
                 Ok(ResponseChunk::Done) => break,
                 Err(e) => {
                     diagnostics.event_emitted = "error".to_string();
-                    emit_response_suggestion_event(
+                    self.publish_terminal_event(
                         &app,
-                        ResponseSuggestionEvent::Error {
-                            turn_id: turn.id,
-                            generation_id,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Error,
+                        Some(ResponseSuggestionEvent::Error {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            generation_id: ctx.generation_id,
                             message: e.to_string(),
-                        },
+                        }),
                     );
                     finish!(diagnostics);
                     return;
@@ -464,12 +874,22 @@ impl ResponseEngine {
             SkipDecision::Skip => {
                 diagnostics.skip_detected = true;
                 diagnostics.event_emitted = "skipped".to_string();
-                emit_response_suggestion_event(
+                tracing::info!(
+                    session_id = ctx.session_id.value(),
+                    turn_id = ctx.turn_id.value(),
+                    generation_id = ctx.generation_id.value(),
+                    "skip_detected"
+                );
+                self.publish_terminal_event(
                     &app,
-                    ResponseSuggestionEvent::Skipped {
-                        turn_id: turn.id,
-                        generation_id,
-                    },
+                    &ctx,
+                    &terminal_emitted,
+                    TerminalState::Skipped,
+                    Some(ResponseSuggestionEvent::Skipped {
+                        session_id: ctx.session_id,
+                        turn_id: ctx.turn_id,
+                        generation_id: ctx.generation_id,
+                    }),
                 );
             }
             SkipDecision::NotSkip { flush } => {
@@ -478,11 +898,13 @@ impl ResponseEngine {
                         first_visible_text_at = Some(Instant::now());
                     }
                     full_text.push_str(&flush);
-                    emit_response_suggestion_event(
+                    self.publish_stream_event(
                         &app,
+                        &ctx,
                         ResponseSuggestionEvent::Delta {
-                            turn_id: turn.id,
-                            generation_id,
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            generation_id: ctx.generation_id,
                             text: flush,
                         },
                     );
@@ -492,13 +914,17 @@ impl ResponseEngine {
                 } else {
                     "completed_with_text".to_string()
                 };
-                emit_response_suggestion_event(
+                self.publish_terminal_event(
                     &app,
-                    ResponseSuggestionEvent::Completed {
-                        turn_id: turn.id,
-                        generation_id,
+                    &ctx,
+                    &terminal_emitted,
+                    TerminalState::Completed,
+                    Some(ResponseSuggestionEvent::Completed {
+                        session_id: ctx.session_id,
+                        turn_id: ctx.turn_id,
+                        generation_id: ctx.generation_id,
                         text: full_text.clone(),
-                    },
+                    }),
                 );
             }
             SkipDecision::Pending => {
@@ -507,13 +933,17 @@ impl ResponseEngine {
                 } else {
                     "completed_with_text".to_string()
                 };
-                emit_response_suggestion_event(
+                self.publish_terminal_event(
                     &app,
-                    ResponseSuggestionEvent::Completed {
-                        turn_id: turn.id,
-                        generation_id,
+                    &ctx,
+                    &terminal_emitted,
+                    TerminalState::Completed,
+                    Some(ResponseSuggestionEvent::Completed {
+                        session_id: ctx.session_id,
+                        turn_id: ctx.turn_id,
+                        generation_id: ctx.generation_id,
                         text: full_text.clone(),
-                    },
+                    }),
                 );
             }
         }
@@ -523,15 +953,16 @@ impl ResponseEngine {
     }
 
     /// Fecha uma geração: registra `latency_ms`, computa as métricas de latência de ponta
-    /// a ponta (relógio monotônico, não epoch), emite o evento de diagnóstico e libera o
-    /// slot de `generations` se ainda for a geração corrente para o turno. Chamada em todo
-    /// caminho de saída de `run_generation` (skip, erro, cancelamento ou conclusão).
+    /// a ponta (relógio monotônico, não epoch), emite o evento de diagnóstico (só se a
+    /// sessão dona ainda for a ativa) e libera o slot de `generations` se ainda for a
+    /// geração corrente para o turno. Chamada em todo caminho de saída de
+    /// `run_generation` (skip, erro, cancelamento, descarte por sessão ou conclusão), para
+    /// que uma geração seguinte nunca veja um estado "fantasma" da anterior.
     #[allow(clippy::too_many_arguments)]
     fn finish_generation<R: tauri::Runtime>(
         &self,
         app: &AppHandle<R>,
-        turn: &ConversationTurn,
-        generation_id: u64,
+        ctx: &GenerationContext,
         mut diagnostics: GenerationDiagnostics,
         started_at: Instant,
         utterance_finalized_at: Instant,
@@ -554,17 +985,47 @@ impl ResponseEngine {
                 .as_millis() as u64
         });
         tracing::debug!(?diagnostics, "response generation diagnostics");
-        emit_response_suggestion_event(
-            app,
-            ResponseSuggestionEvent::Diagnostics(Box::new(diagnostics)),
-        );
-        self.clear_if_current(turn.id, generation_id);
+        if self.session_is_active(ctx.session_id) {
+            emit_response_suggestion_event(
+                app,
+                ResponseSuggestionEvent::Diagnostics(Box::new(diagnostics)),
+            );
+        } else {
+            tracing::debug!(
+                session_id = ctx.session_id.value(),
+                generation_id = ctx.generation_id.value(),
+                "generation_event_discarded_stale: diagnostics for a finished session"
+            );
+        }
+        self.clear_if_current(ctx);
+    }
+}
+
+/// Motivos de finalização que **nunca** disparam geração: são consequência de a sessão ou
+/// a captura estar terminando, não de a outra pessoa ter parado de falar esperando uma
+/// resposta. Gerar aqui era uma das rotas pelas quais a última pergunta de uma sessão
+/// aparecia respondida já dentro da sessão seguinte (o frontend para a captura antes de
+/// encerrar a sessão, então `CaptureStopped` chegava primeiro).
+fn triggers_generation(reason: UtteranceFinalizationReason) -> bool {
+    match reason {
+        UtteranceFinalizationReason::InactivityTimeout
+        | UtteranceFinalizationReason::SpeakerChanged
+        | UtteranceFinalizationReason::SourceChanged
+        | UtteranceFinalizationReason::ManualFlush
+        | UtteranceFinalizationReason::MaximumDuration => true,
+        UtteranceFinalizationReason::CaptureStopped | UtteranceFinalizationReason::SessionEnded => {
+            false
+        }
     }
 }
 
 /// Chamado a cada lote de eventos da Conversation Timeline. Mantém o histórico rolante
 /// e dispara geração quando uma utterance de um turno elegível finaliza. Genérica sobre
 /// `R: tauri::Runtime` pelo mesmo motivo de `trigger_generation`.
+///
+/// Todo evento carrega a sessão dona; nada aqui é aceito "no escuro". Turnos de uma sessão
+/// que não é mais a ativa não entram no histórico, e utterances de uma sessão encerrada não
+/// disparam geração.
 pub fn process_conversation_events<R: tauri::Runtime>(
     app: &AppHandle<R>,
     engine: Arc<ResponseEngine>,
@@ -574,7 +1035,7 @@ pub fn process_conversation_events<R: tauri::Runtime>(
     for event in events {
         match event {
             ConversationTimelineEvent::TurnUpdated { turn }
-            | ConversationTimelineEvent::TurnFinalized { turn } => {
+            | ConversationTimelineEvent::TurnFinalized { turn, .. } => {
                 latest_turns.insert(turn.id, turn.clone());
             }
             _ => {}
@@ -589,29 +1050,53 @@ pub fn process_conversation_events<R: tauri::Runtime>(
 
     for event in events {
         match event {
-            ConversationTimelineEvent::TurnFinalized { turn } => {
-                engine.push_history(turn.clone());
+            ConversationTimelineEvent::TurnFinalized { turn, session_id } => {
+                engine.push_history(*session_id, turn.clone());
             }
             ConversationTimelineEvent::UtteranceFinalized {
                 turn_id,
+                utterance,
                 finalization_reason,
                 gap_ms_used,
                 silence_detected_ms,
-                ..
+                session_id,
             } => {
-                if let Some(turn) = latest_turns.get(turn_id) {
-                    if is_eligible_turn(turn) {
-                        let trigger = GenerationTrigger {
-                            utterance_finalized_at,
-                            finalization_reason: finalization_reason.as_str().to_string(),
-                            gap_ms_used: *gap_ms_used,
-                            silence_detected_ms: *silence_detected_ms,
-                        };
-                        engine
-                            .clone()
-                            .trigger_generation(app.clone(), turn.clone(), trigger);
-                    }
+                tracing::debug!(
+                    session_id = session_id.value(),
+                    turn_id = turn_id.value(),
+                    utterance_id = utterance.id.value(),
+                    utterance_revision = utterance.revision,
+                    reason = finalization_reason.as_str(),
+                    "generation_trigger_received"
+                );
+                if !triggers_generation(*finalization_reason) {
+                    tracing::debug!(
+                        session_id = session_id.value(),
+                        turn_id = turn_id.value(),
+                        reason = finalization_reason.as_str(),
+                        "generation trigger ignored: finalization caused by session/capture teardown"
+                    );
+                    continue;
                 }
+                let Some(turn) = latest_turns.get(turn_id) else {
+                    continue;
+                };
+                if !is_eligible_turn(turn) {
+                    continue;
+                }
+                let trigger = GenerationTrigger {
+                    session_id: *session_id,
+                    utterance_id: utterance.id,
+                    utterance_revision: utterance.revision,
+                    utterance_text: utterance.text.clone(),
+                    utterance_finalized_at,
+                    finalization_reason: finalization_reason.as_str().to_string(),
+                    gap_ms_used: *gap_ms_used,
+                    silence_detected_ms: *silence_detected_ms,
+                };
+                engine
+                    .clone()
+                    .trigger_generation(app.clone(), turn.clone(), trigger);
             }
             _ => {}
         }
@@ -641,10 +1126,35 @@ mod tests {
                 provider: Mutex::new(provider),
                 config: Mutex::new(ResponseProviderConfig::default()),
                 config_path: PathBuf::from("unused-in-tests.json"),
-                history: Mutex::new(VecDeque::new()),
-                generations: Mutex::new(HashMap::new()),
+                session: Mutex::new(SessionState::new(SessionId::new())),
                 next_generation_id: AtomicU64::new(0),
             })
+        }
+
+        /// Token raiz da sessão ativa — só os testes precisam olhar para ele diretamente,
+        /// para provar que uma sessão nova nunca recebe um token já cancelado.
+        fn session_token_for_test(&self) -> CancellationToken {
+            self.session
+                .lock()
+                .expect("response engine mutex poisoned")
+                .cancel
+                .clone()
+        }
+
+        fn active_generation_count(&self) -> usize {
+            self.session
+                .lock()
+                .expect("response engine mutex poisoned")
+                .generations
+                .len()
+        }
+
+        fn history_len_for_test(&self) -> usize {
+            self.session
+                .lock()
+                .expect("response engine mutex poisoned")
+                .history
+                .len()
         }
     }
 
@@ -658,23 +1168,65 @@ mod tests {
         /// cancels it (via a new trigger for the same turn) or the test drops it. Used to
         /// test cancellation/replacement of an active generation.
         Hangs,
+        /// A requisição em si falha (nem chega a abrir stream).
+        FailsRequest,
+        /// Erro no meio do stream, depois de um delta.
+        FailsMidStream(String),
+        /// Stream dirigido pelo teste: cada `send` do canal vira um chunk. Permite manter
+        /// uma geração "lenta" aberta e injetar deltas *depois* de a sessão ter sido
+        /// encerrada, que é exatamente o cenário C da validação manual.
+        Scripted(Mutex<Option<mpsc::UnboundedReceiver<ResponseChunk>>>),
     }
 
     struct FakeProvider {
         behavior: FakeBehavior,
+        /// Todo prompt efetivamente enviado ao "provedor", em ordem. É sobre isto que os
+        /// testes de isolamento provam que nenhum texto de uma sessão anterior entrou.
+        requests: Mutex<Vec<ResponseRequest>>,
     }
 
     impl FakeProvider {
-        fn with_text(text: &str) -> Arc<Self> {
+        fn new(behavior: FakeBehavior) -> Arc<Self> {
             Arc::new(FakeProvider {
-                behavior: FakeBehavior::RepliesWith(text.to_string()),
+                behavior,
+                requests: Mutex::new(Vec::new()),
             })
         }
 
+        fn with_text(text: &str) -> Arc<Self> {
+            FakeProvider::new(FakeBehavior::RepliesWith(text.to_string()))
+        }
+
         fn hanging() -> Arc<Self> {
-            Arc::new(FakeProvider {
-                behavior: FakeBehavior::Hangs,
-            })
+            FakeProvider::new(FakeBehavior::Hangs)
+        }
+
+        fn scripted() -> (Arc<Self>, mpsc::UnboundedSender<ResponseChunk>) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            (
+                FakeProvider::new(FakeBehavior::Scripted(Mutex::new(Some(rx)))),
+                tx,
+            )
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| {
+                    request
+                        .messages
+                        .iter()
+                        .map(|m| m.content.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .collect()
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
         }
     }
 
@@ -686,24 +1238,51 @@ mod tests {
 
         async fn stream_reply(
             &self,
-            _request: ResponseRequest,
+            request: ResponseRequest,
         ) -> Result<(ResponseStream, ResponseStreamMeta), ResponseProviderError> {
+            self.requests.lock().unwrap().push(request);
             let stream: ResponseStream = match &self.behavior {
                 FakeBehavior::RepliesWith(text) => {
                     Box::pin(stream::iter(vec![Ok(ResponseChunk::Delta(text.clone()))]))
                 }
                 FakeBehavior::Hangs => Box::pin(stream::pending()),
+                FakeBehavior::FailsRequest => {
+                    return Err(ResponseProviderError::Network("falha simulada".to_string()))
+                }
+                FakeBehavior::FailsMidStream(text) => Box::pin(stream::iter(vec![
+                    Ok(ResponseChunk::Delta(text.clone())),
+                    Err(ResponseProviderError::Network("stream quebrou".to_string())),
+                ])),
+                FakeBehavior::Scripted(slot) => {
+                    let rx = slot
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("scripted provider only supports one generation per test");
+                    Box::pin(stream::unfold(rx, |mut rx| async move {
+                        rx.recv().await.map(|chunk| (Ok(chunk), rx))
+                    }))
+                }
             };
             Ok((stream, ResponseStreamMeta { http_status: 200 }))
         }
     }
 
     fn turn(id: u64, speaker: ConversationSpeaker, source: AudioSource) -> ConversationTurn {
+        turn_with_text(id, speaker, source, "texto do turno")
+    }
+
+    fn turn_with_text(
+        id: u64,
+        speaker: ConversationSpeaker,
+        source: AudioSource,
+        text: &str,
+    ) -> ConversationTurn {
         ConversationTurn {
             id: TurnId::from_raw(id),
             speaker,
             source,
-            text: "texto do turno".to_string(),
+            text: text.to_string(),
             utterances: Vec::new(),
             started_at: AudioTimestamp(0),
             ended_at: AudioTimestamp(1_000),
@@ -711,12 +1290,40 @@ mod tests {
         }
     }
 
-    fn utterance_finalized_batch(turn: &ConversationTurn) -> Vec<ConversationTimelineEvent> {
+    fn remote_turn(id: u64, text: &str) -> ConversationTurn {
+        turn_with_text(
+            id,
+            ConversationSpeaker::OtherPerson,
+            AudioSource::SystemOutput,
+            text,
+        )
+    }
+
+    /// Lote de eventos equivalente ao que a timeline emite quando uma utterance finaliza
+    /// por silêncio, na sessão `session_id`.
+    fn utterance_finalized_batch_in(
+        turn: &ConversationTurn,
+        session_id: SessionId,
+    ) -> Vec<ConversationTimelineEvent> {
+        utterance_finalized_batch_full(
+            turn,
+            session_id,
+            &turn.text,
+            UtteranceFinalizationReason::InactivityTimeout,
+        )
+    }
+
+    fn utterance_finalized_batch_full(
+        turn: &ConversationTurn,
+        session_id: SessionId,
+        utterance_text: &str,
+        reason: UtteranceFinalizationReason,
+    ) -> Vec<ConversationTimelineEvent> {
         let utterance = ConversationUtterance {
             id: UtteranceId::from_raw(1),
             speaker: turn.speaker,
             source: turn.source,
-            text: turn.text.clone(),
+            text: utterance_text.to_string(),
             segments: vec![SegmentId::next()],
             started_at: turn.started_at,
             ended_at: turn.ended_at,
@@ -727,10 +1334,10 @@ mod tests {
             ConversationTimelineEvent::UtteranceFinalized {
                 turn_id: turn.id,
                 utterance,
-                finalization_reason: UtteranceFinalizationReason::InactivityTimeout,
+                finalization_reason: reason,
                 gap_ms_used: 1_800,
                 silence_detected_ms: Some(1_800),
-                session_id: SessionId::new(),
+                session_id,
             },
             ConversationTimelineEvent::TurnUpdated { turn: turn.clone() },
         ]
@@ -751,15 +1358,19 @@ mod tests {
         rx
     }
 
+    /// Rede de segurança contra um teste genuinamente travado — não modela nenhuma regra
+    /// de negócio. Folgado de propósito: as gerações rodam no runtime global do Tauri,
+    /// compartilhado por toda a suíte, então uma máquina carregada pode atrasar a entrega
+    /// de um evento sem que nada esteja errado.
+    const EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Waits for the next captured event whose `type` matches `event_type`, ignoring any
-    /// others in between (e.g. `delta` events before a `completed`). Bounded by a real
-    /// timeout only as a safety net against a genuinely hung test, not to simulate
-    /// business-logic timing.
+    /// others in between (e.g. `delta` events before a `completed`).
     async fn wait_for_event_type(
         rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
         event_type: &str,
     ) -> serde_json::Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENT_WAIT_TIMEOUT, async {
             loop {
                 let value = rx.recv().await.expect("event channel closed unexpectedly");
                 if value["type"] == event_type {
@@ -779,7 +1390,7 @@ mod tests {
         rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
         event_types: &[&str],
     ) -> serde_json::Value {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(EVENT_WAIT_TIMEOUT, async {
             loop {
                 let value = rx.recv().await.expect("event channel closed unexpectedly");
                 if event_types.iter().any(|t| value["type"] == *t) {
@@ -790,6 +1401,32 @@ mod tests {
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for one of {event_types:?}"))
     }
+
+    /// Drena o canal por `window` e devolve todos os eventos recebidos. Usado para provar
+    /// ausência (nenhum evento de sessão encerrada aparece), o que só pode ser verificado
+    /// esperando uma janela de tempo real.
+    async fn drain_for(
+        rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+        window: Duration,
+    ) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + window;
+        while let Ok(Some(value)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            events.push(value);
+        }
+        events
+    }
+
+    fn types_of(events: &[serde_json::Value]) -> Vec<String> {
+        events
+            .iter()
+            .map(|e| e["type"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// Janela curta o suficiente para não tornar a suíte lenta, longa o suficiente para que
+    /// uma task que fosse publicar algo (ela já está acordada e pronta) tivesse publicado.
+    const QUIET_WINDOW: Duration = Duration::from_millis(150);
 
     #[test]
     fn only_other_person_system_output_turns_are_eligible() {
@@ -803,18 +1440,40 @@ mod tests {
         assert!(!is_eligible_turn(&user));
     }
 
+    #[test]
+    fn session_and_capture_teardown_finalizations_never_trigger_generation() {
+        assert!(triggers_generation(
+            UtteranceFinalizationReason::InactivityTimeout
+        ));
+        assert!(triggers_generation(
+            UtteranceFinalizationReason::SpeakerChanged
+        ));
+        assert!(triggers_generation(
+            UtteranceFinalizationReason::SourceChanged
+        ));
+        assert!(triggers_generation(
+            UtteranceFinalizationReason::ManualFlush
+        ));
+        assert!(triggers_generation(
+            UtteranceFinalizationReason::MaximumDuration
+        ));
+        assert!(!triggers_generation(
+            UtteranceFinalizationReason::SessionEnded
+        ));
+        assert!(!triggers_generation(
+            UtteranceFinalizationReason::CaptureStopped
+        ));
+    }
+
     #[tokio::test]
     async fn eligible_utterance_triggers_generation_and_user_speech_does_not() {
         let engine = ResponseEngine::for_test(FakeProvider::with_text("resposta sugerida"));
+        let session = engine.active_session_id();
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
         let mut rx = capture_events(&handle);
 
-        let remote_turn = turn(
-            1,
-            ConversationSpeaker::OtherPerson,
-            AudioSource::SystemOutput,
-        );
+        let remote = remote_turn(1, "e como você faria isso?");
         let user_turn = turn(2, ConversationSpeaker::User, AudioSource::Microphone);
 
         // Fala do usuário nunca deveria disparar uma sugestão de resposta — processada
@@ -823,12 +1482,12 @@ mod tests {
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch(&user_turn),
+            &utterance_finalized_batch_in(&user_turn, session),
         );
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch(&remote_turn),
+            &utterance_finalized_batch_in(&remote, session),
         );
 
         let started = wait_for_event_type(&mut rx, "started").await;
@@ -836,25 +1495,23 @@ mod tests {
             started["turn_id"], 1,
             "only the eligible (remote) turn generated a suggestion"
         );
+        assert_eq!(started["session_id"], session.value());
         wait_for_event_type(&mut rx, "completed").await;
     }
 
     #[tokio::test]
     async fn a_new_trigger_for_the_same_turn_cancels_the_generation_still_in_flight() {
         let engine = ResponseEngine::for_test(FakeProvider::hanging());
+        let session = engine.active_session_id();
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
         let mut rx = capture_events(&handle);
 
-        let remote_turn = turn(
-            1,
-            ConversationSpeaker::OtherPerson,
-            AudioSource::SystemOutput,
-        );
+        let remote = remote_turn(1, "primeira fala");
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch(&remote_turn),
+            &utterance_finalized_batch_in(&remote, session),
         );
         let first_started = wait_for_event_type(&mut rx, "started").await;
         let first_generation_id = first_started["generation_id"].clone();
@@ -865,7 +1522,7 @@ mod tests {
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch(&remote_turn),
+            &utterance_finalized_batch_in(&remote, session),
         );
 
         let cancelled = wait_for_event_type(&mut rx, "cancelled").await;
@@ -881,23 +1538,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_state_is_released_after_completion_no_leftover_cancellation_later() {
-        let engine = ResponseEngine::for_test(FakeProvider::with_text("ok"));
+    async fn superseded_generation_emits_exactly_one_terminal_event() {
+        let engine = ResponseEngine::for_test(FakeProvider::hanging());
+        let session = engine.active_session_id();
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
         let mut rx = capture_events(&handle);
 
-        let remote_turn = turn(
-            1,
-            ConversationSpeaker::OtherPerson,
-            AudioSource::SystemOutput,
-        );
+        let remote = remote_turn(1, "fala");
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch(&remote_turn),
+            &utterance_finalized_batch_in(&remote, session),
+        );
+        let first = wait_for_event_type(&mut rx, "started").await;
+        let first_generation_id = first["generation_id"].clone();
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote, session),
+        );
+
+        let events = drain_for(&mut rx, QUIET_WINDOW).await;
+        let terminals: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e["generation_id"] == first_generation_id
+                    && matches!(
+                        e["type"].as_str(),
+                        Some("cancelled") | Some("completed") | Some("skipped") | Some("error")
+                    )
+            })
+            .collect();
+        assert_eq!(
+            terminals.len(),
+            1,
+            "a substituição publica exatamente um estado terminal para a geração antiga, \
+             e a task cancelada não publica um segundo: {:?}",
+            types_of(&events)
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_state_is_released_after_completion_no_leftover_cancellation_later() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text("ok"));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        let remote = remote_turn(1, "fala");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote, session),
         );
         wait_for_event_type(&mut rx, "diagnostics").await; // last event of the first generation
+        assert_eq!(engine.active_generation_count(), 0);
 
         // A primeira geração já terminou naturalmente (não foi cancelada) — se o estado em
         // `generations` não tivesse sido liberado em `finish_generation`, este novo
@@ -906,7 +1603,7 @@ mod tests {
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch(&remote_turn),
+            &utterance_finalized_batch_in(&remote, session),
         );
         let mut saw_cancelled = false;
         loop {
@@ -925,21 +1622,618 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_of_speech_to_first_visible_token_ms_is_computed_from_the_trigger() {
-        let engine = ResponseEngine::for_test(FakeProvider::with_text("resposta útil"));
+    async fn state_is_released_after_an_error_terminal_state() {
+        let engine = ResponseEngine::for_test(FakeProvider::new(FakeBehavior::FailsRequest));
+        let session = engine.active_session_id();
         let app = tauri::test::mock_app();
         let handle = app.handle().clone();
         let mut rx = capture_events(&handle);
 
-        let remote_turn = turn(
-            1,
-            ConversationSpeaker::OtherPerson,
-            AudioSource::SystemOutput,
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "fala"), session),
         );
-        let batch = utterance_finalized_batch(&remote_turn);
-        process_conversation_events(&handle, engine.clone(), &batch);
+        wait_for_event_type(&mut rx, "error").await;
+        wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(engine.active_generation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_ends_the_generation_exactly_once() {
+        let engine = ResponseEngine::for_test(FakeProvider::new(FakeBehavior::FailsMidStream(
+            "começo da resposta".to_string(),
+        )));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "fala"), session),
+        );
+        wait_for_event_type(&mut rx, "diagnostics").await;
+        let all = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            !types_of(&all).contains(&"completed".to_string()),
+            "um erro no meio do stream não pode ser seguido de um completed"
+        );
+        assert_eq!(engine.active_generation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn skip_marker_ends_as_skipped_and_releases_state() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text("[SKIP]"));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "Perfeito."), session),
+        );
+        wait_for_event_type(&mut rx, "skipped").await;
+        let diagnostics = wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(diagnostics["event_emitted"], "skipped");
+        assert_eq!(diagnostics["skip_detected"], true);
+        assert_eq!(engine.active_generation_count(), 0);
+
+        let after = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            !types_of(&after).contains(&"delta".to_string()),
+            "nada é exibido depois de um skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_text_ends_as_completed_with_text() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text(
+            "Já usei monolito quando o time era pequeno e o domínio ainda estava mudando.",
+        ));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(
+                &remote_turn(
+                    1,
+                    "Me conta um caso real em que você optou por usar monolito.",
+                ),
+                session,
+            ),
+        );
+        let completed = wait_for_event_type(&mut rx, "completed").await;
+        assert!(completed["text"]
+            .as_str()
+            .unwrap()
+            .contains("time era pequeno"));
+        let diagnostics = wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(diagnostics["event_emitted"], "completed_with_text");
+        assert_eq!(diagnostics["skip_detected"], false);
+    }
+
+    #[tokio::test]
+    async fn prompt_classifies_the_current_utterance_not_the_whole_turn() {
+        let provider = FakeProvider::with_text("resposta");
+        let engine = ResponseEngine::for_test(provider.clone());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        // O turno acumulou uma confirmação anterior e, agora, um pedido explícito. O que é
+        // classificado tem que ser o pedido (a utterance que acabou de finalizar), não o
+        // texto inteiro do turno.
+        let turn = remote_turn(
+            1,
+            "Perfeito. Me conta um caso real em que você optou por usar monolito.",
+        );
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_full(
+                &turn,
+                session,
+                "Me conta um caso real em que você optou por usar monolito.",
+                UtteranceFinalizationReason::InactivityTimeout,
+            ),
+        );
+        wait_for_event_type(&mut rx, "diagnostics").await;
+
+        let prompt = provider.prompts().pop().expect("um prompt foi montado");
+        let speech_start = prompt
+            .find(super::super::context::CURRENT_SPEECH_HEADER)
+            .unwrap();
+        let instruction_start = prompt
+            .find(super::super::context::INSTRUCTION_HEADER)
+            .unwrap();
+        let current_speech = &prompt[speech_start..instruction_start];
+        assert!(current_speech.contains("Me conta um caso real"));
+        let context_block =
+            &prompt[prompt.find(super::super::context::CONTEXT_HEADER).unwrap()..speech_start];
+        assert!(
+            context_block.contains("Perfeito."),
+            "o que veio antes na mesma fala continua disponível como contexto"
+        );
+        assert!(
+            !context_block.contains("Me conta um caso real"),
+            "a fala a classificar não pode aparecer também dentro do contexto"
+        );
+    }
+
+    // --- Isolamento entre sessões ---
+
+    #[tokio::test]
+    async fn history_from_another_session_is_rejected() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text("ok"));
+        let stale_session = SessionId::new();
+
+        engine.push_history(stale_session, remote_turn(1, "fala da sessão anterior"));
+        assert_eq!(engine.history_len_for_test(), 0);
+
+        let active = engine.active_session_id();
+        engine.push_history(active, remote_turn(2, "fala da sessão ativa"));
+        assert_eq!(engine.history_len_for_test(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_snapshot_is_none_for_a_stale_session() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text("ok"));
+        let first = engine.active_session_id();
+        engine.push_history(first, remote_turn(1, "fala"));
+        assert!(engine.history_snapshot(first).is_some());
+
+        engine.end_session(first);
+        engine.begin_session(SessionId::new());
+        assert!(
+            engine.history_snapshot(first).is_none(),
+            "o histórico da sessão encerrada não é acessível nem por quem tem o id dela"
+        );
+        assert!(engine
+            .history_snapshot(engine.active_session_id())
+            .is_some());
+        assert_eq!(engine.history_len_for_test(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_session_starts_with_an_empty_context() {
+        let provider = FakeProvider::with_text("resposta");
+        let engine = ResponseEngine::for_test(provider.clone());
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        // --- Sessão A ---
+        let session_a = engine.active_session_id();
+        let turn_a = remote_turn(1, "Em qual situação você escolheria usar monolitos?");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &[ConversationTimelineEvent::TurnFinalized {
+                turn: turn_a.clone(),
+                session_id: session_a,
+            }],
+        );
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&turn_a, session_a),
+        );
+        wait_for_event_type(&mut rx, "diagnostics").await;
+        assert!(provider.prompts()[0].contains("monolitos"));
+
+        // --- Fronteira ---
+        engine.end_session(session_a);
+        let session_b = SessionId::new();
+        engine.begin_session(session_b);
+
+        // --- Sessão B ---
+        let turn_b = remote_turn(
+            9,
+            "Me conta um caso real em que você resolveu um problema de escalabilidade.",
+        );
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&turn_b, session_b),
+        );
+        wait_for_event_type(&mut rx, "diagnostics").await;
+
+        let prompt_b = provider.prompts().pop().expect("prompt da sessão B");
+        assert!(prompt_b.contains("problema de escalabilidade"));
+        assert!(
+            !prompt_b.contains("monolito"),
+            "nenhum texto da sessão A pode aparecer no prompt da sessão B:\n{prompt_b}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trigger_from_a_previous_session_is_rejected() {
+        let provider = FakeProvider::with_text("resposta");
+        let engine = ResponseEngine::for_test(provider.clone());
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        let session_a = engine.active_session_id();
+        engine.end_session(session_a);
+        engine.begin_session(SessionId::new());
+
+        // Evento atrasado da sessão A chegando depois da fronteira.
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "pergunta da sessão A"), session_a),
+        );
+
+        let events = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            events.is_empty(),
+            "nenhum evento pode ser emitido por um gatilho de sessão encerrada: {:?}",
+            types_of(&events)
+        );
+        assert_eq!(
+            provider.request_count(),
+            0,
+            "nem sequer um prompt é montado para uma sessão encerrada"
+        );
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_suppresses_deltas_and_terminal_events_of_the_generation_in_flight() {
+        let (provider, chunks) = FakeProvider::scripted();
+        let engine = ResponseEngine::for_test(provider.clone());
+        let session_a = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "pergunta lenta"), session_a),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+        chunks
+            .send(ResponseChunk::Delta("primeira parte ".to_string()))
+            .unwrap();
+        wait_for_event_type(&mut rx, "delta").await;
+
+        // Usuário encerra a sessão com a geração ainda em andamento e abre outra na
+        // sequência (cenário C da validação manual).
+        engine.end_session(session_a);
+        engine.begin_session(SessionId::new());
+
+        // O provedor "atrasado" continua produzindo — nada disso pode chegar ao frontend.
+        let _ = chunks.send(ResponseChunk::Delta("segunda parte".to_string()));
+        let _ = chunks.send(ResponseChunk::Done);
+        drop(chunks);
+
+        let events = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            events.is_empty(),
+            "depois da fronteira, a geração da sessão A não emite mais nada: {:?}",
+            types_of(&events)
+        );
+        assert_eq!(engine.active_generation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_generation_of_the_previous_session_does_not_block_the_same_turn_in_the_new_session()
+    {
+        let engine = ResponseEngine::for_test(FakeProvider::hanging());
+        let session_a = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        let same_turn = remote_turn(1, "fala");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&same_turn, session_a),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+
+        engine.end_session(session_a);
+        let session_b = SessionId::new();
+        engine.begin_session(session_b);
+        assert_eq!(
+            engine.active_generation_count(),
+            0,
+            "o slot de geração do turno não sobrevive à fronteira"
+        );
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&same_turn, session_b),
+        );
+        let started = wait_for_event_type(&mut rx, "started").await;
+        assert_eq!(started["session_id"], session_b.value());
+    }
+
+    // --- Ciclo de vida da sessão ---
+
+    #[tokio::test]
+    async fn end_session_cancels_the_active_generation_token() {
+        let engine = ResponseEngine::for_test(FakeProvider::hanging());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        let root = engine.session_token_for_test();
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "fala"), session),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+        assert_eq!(engine.active_generation_count(), 1);
+
+        engine.end_session(session);
+        assert!(root.is_cancelled());
+        assert_eq!(engine.active_generation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_session_never_inherits_a_cancelled_token() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text("ok"));
+        let session_a = engine.active_session_id();
+        let root_a = engine.session_token_for_test();
+        engine.end_session(session_a);
+        assert!(root_a.is_cancelled());
+
+        engine.begin_session(SessionId::new());
+        let root_b = engine.session_token_for_test();
+        assert!(
+            !root_b.is_cancelled(),
+            "a sessão nova tem um token raiz próprio, não o token já cancelado da anterior"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_generation_token_is_a_child_of_the_session_token() {
+        let engine = ResponseEngine::for_test(FakeProvider::hanging());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "fala"), session),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+        let generation_token = {
+            let state = engine.session.lock().unwrap();
+            state
+                .generations
+                .values()
+                .next()
+                .expect("uma geração ativa")
+                .cancel
+                .clone()
+        };
+        assert!(!generation_token.is_cancelled());
+
+        engine.session_token_for_test().cancel();
+        assert!(
+            generation_token.is_cancelled(),
+            "cancelar a sessão cancela toda geração em voo de uma vez"
+        );
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_twice_is_a_no_op() {
+        let engine = ResponseEngine::for_test(FakeProvider::hanging());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "fala"), session),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+
+        engine.end_session(session);
+        engine.end_session(session);
+        engine.end_session(SessionId::new()); // sessão que nunca foi ativa
+
+        let events = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            events.is_empty(),
+            "encerrar de novo não pode publicar nada: {:?}",
+            types_of(&events)
+        );
+        assert_eq!(engine.active_generation_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_trigger_while_the_session_is_ending_is_rejected() {
+        let provider = FakeProvider::with_text("resposta");
+        let engine = ResponseEngine::for_test(provider.clone());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        // Encerrada, mas sem `begin_session` ainda: é a janela entre parar a captura e
+        // abrir a próxima sessão.
+        engine.end_session(session);
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "fala tardia"), session),
+        );
+
+        let events = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(events.is_empty(), "{:?}", types_of(&events));
+        assert_eq!(provider.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn generations_for_different_turns_coexist() {
+        let engine = ResponseEngine::for_test(FakeProvider::hanging());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "primeira pergunta"), session),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(2, "segunda pergunta"), session),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+
+        assert_eq!(engine.active_generation_count(), 2);
+        let events = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            !types_of(&events).contains(&"cancelled".to_string()),
+            "turnos diferentes não se cancelam entre si"
+        );
+    }
+
+    /// O roteiro A/B/C do requisito de validação, automatizado com um provedor falso: a
+    /// parte que depende de um LLM real (a *qualidade* da decisão de responder) não é
+    /// afirmada aqui; o que é afirmado é o comportamento de sessão, que é o que estava
+    /// quebrado.
+    #[tokio::test]
+    async fn sessions_a_b_and_c_script() {
+        let (scripted, chunks) = FakeProvider::scripted();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+
+        // --- Sessão A: uma pergunta gera resposta, uma confirmação vira skip, encerra sem
+        // geração ativa.
+        let answering = FakeProvider::with_text("Escolheria monolito com time pequeno.");
+        let engine = ResponseEngine::for_test(answering.clone());
+        let mut rx = capture_events(&handle);
+        let session_a = engine.active_session_id();
+
+        let question = remote_turn(1, "Em qual situação você escolheria usar monolitos?");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&question, session_a),
+        );
+        wait_for_event_type(&mut rx, "completed").await;
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &[ConversationTimelineEvent::TurnFinalized {
+                turn: question.clone(),
+                session_id: session_a,
+            }],
+        );
+
+        *engine.provider.lock().unwrap() = FakeProvider::with_text("[SKIP]");
+        let ack = remote_turn(2, "Perfeito.");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&ack, session_a),
+        );
+        wait_for_event_type(&mut rx, "skipped").await;
+        wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(engine.active_generation_count(), 0);
+
+        engine.end_session(session_a);
+        let session_b = SessionId::new();
+        engine.begin_session(session_b);
+
+        // --- Sessão B: começa vazia; a nova pergunta é respondida sem nenhum resquício de A.
+        let answering_b = FakeProvider::with_text("Reduzi o custo por request com cache.");
+        *engine.provider.lock().unwrap() = answering_b.clone();
+        let boundary_events = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            boundary_events.is_empty(),
+            "a fronteira não emite eventos de sugestão: {:?}",
+            types_of(&boundary_events)
+        );
+        assert_eq!(engine.history_len_for_test(), 0);
+
+        let question_b = remote_turn(
+            3,
+            "Me conta um caso real em que você resolveu um problema de escalabilidade.",
+        );
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&question_b, session_b),
+        );
+        wait_for_event_type(&mut rx, "completed").await;
+        let prompt_b = answering_b.prompts().pop().expect("prompt da sessão B");
+        assert!(prompt_b.contains("problema de escalabilidade"));
+        assert!(
+            !prompt_b.contains("monolito") && !prompt_b.contains("Perfeito."),
+            "o prompt da sessão B não pode conter nada da sessão A:\n{prompt_b}"
+        );
+
+        // --- Sessão C: geração lenta interrompida pelo encerramento; a sessão seguinte não
+        // vê delta, completed, error nem skipped da anterior.
+        engine.end_session(session_b);
+        let session_c = SessionId::new();
+        engine.begin_session(session_c);
+        *engine.provider.lock().unwrap() = scripted.clone();
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(4, "pergunta longa"), session_c),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+        engine.end_session(session_c);
+        engine.begin_session(SessionId::new());
+        let _ = chunks.send(ResponseChunk::Delta("resposta atrasada".to_string()));
+        let _ = chunks.send(ResponseChunk::Done);
+        drop(chunks);
+
+        let leftovers = drain_for(&mut rx, QUIET_WINDOW).await;
+        assert!(
+            leftovers.is_empty(),
+            "nada da sessão C pode aparecer na sessão seguinte: {:?}",
+            types_of(&leftovers)
+        );
+    }
+
+    #[tokio::test]
+    async fn end_of_speech_to_first_visible_token_ms_is_computed_from_the_trigger() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text("resposta útil"));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        let remote = remote_turn(1, "e como você resolveria isso?");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote, session),
+        );
 
         let diagnostics = wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(diagnostics["session_id"], session.value());
         assert_eq!(diagnostics["finalization_reason"], "inactivity_timeout");
         assert_eq!(diagnostics["gap_ms_used"], 1_800);
         assert_eq!(diagnostics["silence_detected_ms"], 1_800);
@@ -951,5 +2245,10 @@ mod tests {
         assert!(diagnostics["request_to_first_visible_token_ms"].is_u64());
         assert!(diagnostics["utterance_finalized_to_request_started_ms"].is_u64());
         assert_eq!(diagnostics["event_emitted"], "completed_with_text");
+        assert!(diagnostics["prompt_preview"]
+            .as_str()
+            .unwrap()
+            .contains(super::super::context::CURRENT_SPEECH_HEADER));
+        assert!(diagnostics["context_character_count"].is_u64());
     }
 }
