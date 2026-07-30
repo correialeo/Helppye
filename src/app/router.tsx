@@ -2,7 +2,7 @@ import { useState } from "react";
 import { nextOnboardingScreen, previousOnboardingScreen, type AppScreen } from "./appFlow";
 import { useOnboardingStore } from "../stores/useOnboardingStore";
 import { startCapture, stopCapture } from "../services/audioService";
-import { endConversationSession } from "../services/conversationService";
+import { endConversationSession, startConversationSession } from "../services/conversationService";
 
 import { WelcomeScreen } from "../features/welcome/WelcomeScreen";
 import { CloudLoginScreen } from "../features/welcome/CloudLoginScreen";
@@ -55,6 +55,9 @@ export function AppRouter() {
 
   const startSession = async () => {
     await stopAllCapture();
+    // A fronteira é aberta antes da captura: nenhum áudio da nova sessão pode chegar à
+    // timeline enquanto o backend ainda estiver com o estado da sessão anterior.
+    await startConversationSession().catch(() => {});
     await Promise.allSettled([startCapture("microphone"), startCapture("system_output")]);
     setSessionStartedAt(Date.now());
     setScreen("session");

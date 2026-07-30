@@ -85,10 +85,19 @@ export function useConversationTimeline() {
         return;
       }
 
-      // utterance_finalized: carries the full ConversationUtterance already.
-      setUtterances((current) =>
-        sortByStart([...current.filter((u) => u.id !== event.utterance.id), event.utterance]),
-      );
+      if (event.type === "utterance_finalized") {
+        // Carries the full ConversationUtterance already.
+        setUtterances((current) =>
+          sortByStart([...current.filter((u) => u.id !== event.utterance.id), event.utterance]),
+        );
+        return;
+      }
+
+      // session_ended / session_started: a sessão anterior deixou de existir no backend
+      // (turnos, utterances e contexto apagados). A tela acompanha em vez de continuar
+      // mostrando uma conversa que já não é mais consultável.
+      setTurns([]);
+      setUtterances([]);
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());

@@ -9,6 +9,9 @@ export type ResponseSuggestionEventType =
 
 export interface ResponseSuggestionEventRef {
   type: ResponseSuggestionEventType;
+  /** Sessão dona da geração. O backend já descarta eventos de sessões encerradas antes de
+   * emitir (ver docs/response-suggestion.md); aqui o campo serve para diagnóstico. */
+  session_id: number;
   turn_id: number;
   generation_id: number;
   text?: string;
@@ -29,6 +32,10 @@ export interface ResponseSuggestionEventRef {
   finalization_reason?: string;
   gap_ms_used?: number;
   silence_detected_ms?: number | null;
+  utterance_id?: number;
+  context_turn_count?: number;
+  context_character_count?: number;
+  prompt_preview?: string;
   utterance_finalized_to_request_started_ms?: number | null;
   request_to_first_http_chunk_ms?: number | null;
   request_to_first_visible_token_ms?: number | null;
@@ -131,8 +138,15 @@ export function applyResponseSuggestionEvent(
 }
 
 export interface ResponseSuggestionDiagnostics {
+  session_id: number;
   turn_id: number;
+  utterance_id: number;
   generation_id: number;
+  /** Prompt sanitizado (estrutura + trechos limitados) realmente enviado ao provedor.
+   * Só aparece em modo de desenvolvedor — nunca contém credenciais. */
+  prompt_preview: string;
+  context_turn_count: number;
+  context_character_count: number;
   provider: string;
   model: string;
   request_started: number;
@@ -168,8 +182,13 @@ export function applyResponseSuggestionDiagnostics(
   return {
     ...current,
     [event.turn_id]: {
+      session_id: event.session_id,
       turn_id: event.turn_id,
+      utterance_id: event.utterance_id ?? 0,
       generation_id: event.generation_id,
+      prompt_preview: event.prompt_preview ?? "",
+      context_turn_count: event.context_turn_count ?? 0,
+      context_character_count: event.context_character_count ?? 0,
       provider: event.provider ?? "",
       model: event.model ?? "",
       request_started: event.request_started ?? 0,
