@@ -4,7 +4,9 @@ Este documento descreve o comportamento *observável pelo usuário* durante uma 
 captura contínua — o que dispara a sugestão de resposta, quando ela aparece na tela, e o
 que acontece quando a conversa continua. É o complemento de UX de
 `docs/response-suggestion.md` (arquitetura interna, módulo por módulo) e
-`CLAUDE.md` (visão geral do projeto).
+`CLAUDE.md` (visão geral do projeto). Para a aparência e estrutura da janela de sessão
+em si (`features/session/SessionScreen.tsx` e componentes), ver `docs/design-system.md`
+§Janela de sessão — este documento foca no *comportamento*, não no layout.
 
 ## Gatilho real da sugestão de resposta
 
@@ -108,19 +110,27 @@ Fala do usuário (`speaker = User`, `source = Microphone`) **nunca** dispara ger
 
 ## O que a UI mostra, e quando
 
-| Evento do backend | Estado na UI (`SuggestionState.status`) |
-|---|---|
-| `started` | `preparing` — "Analisando fala..."; a resposta anterior (se houver) continua visível, esmaecida |
-| primeiro `delta` com conteúdo | `streaming` — a resposta anterior é substituída pelo texto chegando |
-| `completed` (texto não vazio) | `completed_with_text` |
-| `completed` (texto vazio) | `completed_empty` — "Resposta gerada veio vazia" |
-| `skipped` | `skipped` — "Nenhuma resposta sugerida"; mantém a resposta anterior visível, se houver |
-| `cancelled` | `cancelled` |
-| `error` | `error`, com a mensagem |
+| Evento do backend | Estado na UI (`SuggestionState.status`) | Texto em `SuggestionPanel` |
+|---|---|---|
+| `started` | `preparing` | "Preparando uma sugestão..." (shimmer discreto); resposta anterior continua visível por baixo até haver algo melhor |
+| primeiro `delta` com conteúdo | `streaming` | o texto chegando, com um cursor pulsante no fim |
+| `completed` (texto não vazio) | `completed_with_text` | o texto final, com ações Copiar/Regenerar/Ocultar |
+| `completed` (texto vazio) | `completed_empty` | "Nenhuma nova sugestão" (discreto, não ocupa o painel inteiro) |
+| `skipped` | `skipped` | "Nenhuma nova sugestão"; mantém a resposta anterior visível, se houver |
+| `cancelled` | `cancelled` | sem mensagem própria — é um estado de transição, a próxima geração já está a caminho |
+| `error` | `error` | "Não foi possível gerar a sugestão." + [Tentar novamente] |
 
 A UI nunca espera `completed` para começar a renderizar — o streaming aparece assim que
 o primeiro delta com conteúdo chega, e a resposta concluída anterior nunca "pisca" para
-um painel vazio entre uma geração e a próxima.
+um painel vazio entre uma geração e a próxima. Ver `features/session/SuggestionPanel.tsx`
+e `features/session/responseSuggestionViewModel.ts` (o reducer, movido de
+`src/responseSuggestionViewModel.ts` para dentro de `features/session/` na reformulação
+de UI — mesma lógica, só reorganizada por pasta de domínio).
+
+"Regenerar" (botão, ou Ctrl/Cmd+Shift+Enter — ver `docs/shortcuts.md`) dispara
+manualmente uma nova geração para o turno elegível mais recente, sem esperar uma nova
+utterance real. É o único gatilho de geração que não vem da Conversation Timeline —
+ver `docs/frontend-architecture.md` §Um comando novo no backend, e por quê.
 
 ## Latência: o que é medido e o que se espera
 
@@ -140,11 +150,23 @@ As duas métricas mais importantes:
 
 ## Configuração de desenvolvimento
 
-Em modo dev (`import.meta.env.DEV`), a UI expõe:
+Diferente da versão anterior (gated só por `import.meta.env.DEV`, sempre visível em
+build de desenvolvimento), o painel técnico agora é um toggle explícito e persistido —
+"Modo de desenvolvedor" em Configurações (`useOnboardingStore.devMode`) — desligado por
+padrão em qualquer build, inclusive `npm run dev`. Ligado, ele expõe
+`DeveloperToolsScreen` (acessível por Configurações ou pelo menu ⋯ da sessão):
 
-- `UtteranceGapDevControl` — troca `same_speaker_utterance_gap_ms` em runtime, sem
-  rebuild, com atalhos para 1200/1500/1800/2200ms. Valores muito baixos arriscam
-  responder no meio de uma pergunta ainda incompleta — não é o padrão de produção.
-- O painel "Diagnóstico de sugestão de resposta", com todos os campos de
-  `GenerationDiagnostics` por turno, incluindo `finalization_reason`, `gap_ms_used`,
-  `silence_detected_ms` e a decomposição de latência acima.
+- Controle de `same_speaker_utterance_gap_ms` em runtime, sem rebuild, com atalhos para
+  1200/1500/1800/2200ms — mesmo propósito do antigo `UtteranceGapDevControl`, agora
+  dentro de `DeveloperToolsScreen` em vez de um card solto na tela principal. Valores
+  muito baixos arriscam responder no meio de uma pergunta ainda incompleta — não é o
+  padrão de produção.
+- Turnos e utterances consolidados (IDs, revisão, segmentos, texto).
+- Diagnóstico por geração, com todos os campos de `GenerationDiagnostics`, incluindo
+  `finalization_reason`, `gap_ms_used`, `silence_detected_ms` e a decomposição de
+  latência acima.
+- "Copiar diagnóstico" — serializa turnos/utterances/diagnósticos correntes como JSON
+  para a área de transferência, para colar num relato de bug.
+
+Ver `docs/design-system.md` §Complexidade ocultada para a lista completa do que só
+existe aqui.

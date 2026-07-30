@@ -37,14 +37,27 @@ timeline) ainda **não** está implementado.
 
 ## Layout
 
-- `src/` — frontend React/TypeScript. `App.tsx` é a UI atual: onboarding/download do
-  modelo de transcrição, configurações avançadas de modelo local, dois painéis de
-  captura (microfone e saída do sistema) e a visualização consolidada da Conversation
-  Timeline.
+- `src/` — frontend React/TypeScript, organizado por domínio (não um `App.tsx` único):
+  `app/` (App.tsx só faz init/providers/error boundary; `router.tsx` decide qual tela
+  renderizar a partir de `useOnboardingStore.screen`; `appFlow.ts` define o tipo
+  `AppScreen` e a lógica pura de sequência/resumo do onboarding), `components/ui|
+  layout|feedback` (primitivos visuais), `features/` (uma pasta por tela: welcome,
+  profile, language, permissions, audio-setup, ai-provider, onboarding-review, ready,
+  session, settings, developer-tools), `hooks/`, `services/` (wrappers tipados sobre
+  `invoke`/`listen`), `stores/` (Zustand), `types/`, `utils/`. Ver
+  `docs/frontend-architecture.md` para a estrutura completa e `docs/design-system.md`
+  para os princípios visuais. Fluxo: boas-vindas → perfil → idioma → permissões →
+  teste de áudio (que também cobre o download do modelo de transcrição, sem baixar
+  nada silenciosamente) → provedor de IA → revisão → pronto → sessão (janela compacta
+  focada na sugestão) — ver `docs/onboarding.md` e `docs/session-experience.md`.
+  Diagnósticos técnicos (turnos, latência, eventos brutos) só aparecem atrás de "Modo
+  de desenvolvedor" em Configurações, nunca na experiência normal.
 - `src-tauri/` — núcleo Rust (comandos Tauri, pipeline de áudio). Ver seção "Módulo de
   áudio" abaixo.
-- `docs/` — auditoria de arquitetura, notas de design, roadmap. Ler antes de tocar em
-  captura de áudio ou em qualquer coisa relacionada ao Meetily.
+- `docs/` — auditoria de arquitetura, notas de design, roadmap, incluindo
+  `frontend-architecture.md`, `design-system.md`, `onboarding.md` e `shortcuts.md`. Ler
+  antes de tocar em captura de áudio, no frontend ou em qualquer coisa relacionada ao
+  Meetily.
 - `prompts/` — templates de prompt para LLM, usados a partir da Fase 4 (integração
   Ollama). Vazio por enquanto.
 - `tests/` — testes cross-cutting/integração entre frontend e core Rust. Testes
@@ -152,7 +165,8 @@ continua aberto para agrupamento conversacional até seu próprio timeout (ainda
 só reativamente) ou outro evento de fechamento. `same_speaker_utterance_gap_ms` é
 configurável em runtime via `ConversationTimeline::set_utterance_gap_ms` (comandos
 `conversation_get_utterance_gap_ms_command`/`conversation_set_utterance_gap_ms_command`,
-expostos no frontend só em modo dev) para testar valores diferentes sem rebuild.
+expostos no frontend só atrás de "Modo de desenvolvedor", em Configurações →
+`DeveloperToolsScreen`) para testar valores diferentes sem rebuild.
 
 Ao unir texto, a camada remove apenas espaços duplicados, adiciona um espaço entre
 trechos e preserva a pontuação produzida pelo transcritor. Não há correção semântica,

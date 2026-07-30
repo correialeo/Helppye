@@ -2,6 +2,17 @@
 @tailwind components;
 @tailwind utilities;
 
+/*
+ * Helppye design tokens — see docs/design-system.md for the full rationale.
+ * A sober near-black hierarchy (app < surface < surface-raised) plus one accent
+ * (brand, defined in tailwind.config.js). No competing hues, no heavy glassmorphism.
+ */
+:root {
+  --color-app: 9 9 11;
+  --color-surface: 17 17 20;
+  --color-surface-raised: 26 26 31;
+}
+
 html,
 body,
 #root {
@@ -9,5 +20,59 @@ body,
 }
 
 body {
-  @apply bg-neutral-950 text-neutral-100;
+  @apply bg-app text-neutral-100 antialiased;
+  font-feature-settings: "cv11", "ss01";
+}
+
+/* A single consistent focus ring everywhere, including custom (non-native) controls —
+   full keyboard navigation is a hard requirement (see docs/design-system.md §Acessibilidade). */
+:focus-visible {
+  outline: 2px solid rgb(140 111 255 / 0.85);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Compact scrollbars everywhere — a visible default scrollbar reads as "web app", not
+   "desktop app", inside a small session window. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 0.15) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: rgb(255 255 255 / 0.15);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Discrete shimmer used only for the "preparing suggestion" placeholder — never a loud
+   spinner, never longer than the 150–250ms motion budget for one visible cycle segment. */
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    rgb(255 255 255 / 0.35) 25%,
+    rgb(255 255 255 / 0.75) 50%,
+    rgb(255 255 255 / 0.35) 75%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 1.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }

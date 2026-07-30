@@ -261,7 +261,9 @@ configuração.
 
 ## Frontend
 
-`src/responseSuggestionViewModel.ts` reduz os eventos de
+`features/session/responseSuggestionViewModel.ts` (movido de `src/` para dentro de
+`features/session/` na reformulação de UI documentada em `docs/frontend-architecture.md`
+— mesma lógica, só reorganizada por domínio) reduz os eventos de
 `response://suggestion-event` num `Record<TurnId, SuggestionState>` via
 `applyResponseSuggestionEvent`. Segue a mesma semântica de supersessão do backend:
 eventos que não sejam `started` só são aplicados se o `generation_id` do evento ainda
@@ -270,9 +272,10 @@ cancelada são descartados silenciosamente. `SuggestionStatus` tem sete valores:
 `preparing`, `streaming`, `completed_with_text`, `completed_empty`, `skipped`,
 `cancelled`, `error` — o evento `completed` do backend vira `completed_with_text` ou
 `completed_empty` conforme o texto final (`.trim()`) estar vazio ou não. A sugestão é
-renderizada em `App.tsx` (`ConversationTimelineView`) como um painel anexado abaixo da
-última utterance do turno elegível ao qual pertence, não como reescrita/destaque do
-texto transcrito do turno.
+renderizada em `features/session/SuggestionPanel.tsx`, o elemento com maior destaque
+tipográfico da janela de sessão (ver `docs/design-system.md` §Janela de sessão) — texto
+editorial correndo, não um balão de chat, não uma reescrita do texto transcrito do
+turno.
 
 **A resposta anterior não desaparece assim que uma nova geração começa.** `started` não
 zera mais o texto visível: se havia uma sugestão `completed_with_text` para o turno, ela
@@ -286,12 +289,17 @@ visível enquanto a segunda ("Em qual situação você usaria microsserviços?")
 sendo preparada, em vez de piscar para um painel vazio entre as duas.
 
 `applyResponseSuggestionDiagnostics` reduz os eventos `diagnostics` separadamente, num
-`Record<TurnId, ResponseSuggestionDiagnostics>` só usado pelo painel de depuração — não
-afeta `SuggestionState`. `ResponseProviderSettings` (também em `App.tsx`) permite
-escolher provedor/modelo/URL base/`ollama_keep_alive` e gerenciar a API key, seguindo o
-mesmo padrão visual de `AdvancedTranscriptionSettings`. `UtteranceGapDevControl` (só em
-`import.meta.env.DEV`) permite trocar `same_speaker_utterance_gap_ms` em runtime sem
-rebuild, com atalhos para 1200/1500/1800/2200ms.
+`Record<TurnId, ResponseSuggestionDiagnostics>` só usado pelas ferramentas de
+desenvolvedor (`features/developer-tools/DeveloperToolsScreen.tsx`) — não afeta
+`SuggestionState`, e não aparece na experiência normal (ver
+`docs/design-system.md` §Complexidade ocultada). Escolher provedor/modelo/URL base/
+`ollama_keep_alive` e gerenciar a API key acontece em
+`features/ai-provider/{OllamaPanel,CloudProviderPanel}.tsx` (onboarding) e
+`features/settings/SettingsScreen.tsx` (reentrante, mesmos componentes). O controle de
+`same_speaker_utterance_gap_ms` em runtime (atalhos para 1200/1500/1800/2200ms) mudou de
+um card sempre visível em modo dev (`import.meta.env.DEV`) para dentro de
+`DeveloperToolsScreen`, atrás do toggle explícito "Modo de desenvolvedor" em
+Configurações.
 
 ## Testes
 

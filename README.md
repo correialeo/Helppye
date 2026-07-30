@@ -22,9 +22,17 @@ Audio capture and local transcription foundations implemented:
   (Ollama local by default, or a user-chosen cloud provider) that streams a suggested
   reply — or a `[SKIP]` marker when the speech doesn't need one — back to the frontend.
   See `docs/response-suggestion.md`.
+- A full desktop-app onboarding flow (welcome → profile → language → permissions →
+  guided audio test → AI provider → review → ready) and a compact session window
+  focused on the suggestion, with technical diagnostics (turn/utterance IDs, latency
+  breakdown, raw events) moved behind an explicit "developer mode" toggle instead of
+  living in the main window. See `docs/onboarding.md`, `docs/design-system.md`, and
+  `docs/frontend-architecture.md`.
 
-Answer overlay (a floating window outside the timeline) and persistent conversation
-history (SQLite) are not implemented yet.
+Answer overlay as a separate floating OS window (the session window is already a
+compact, focused view within the single app window — see `docs/design-system.md`
+§Janela de sessão) and persistent conversation history (SQLite) are not implemented
+yet.
 
 ## Stack
 
@@ -37,14 +45,20 @@ history (SQLite) are not implemented yet.
 
 ## Layout
 
-- `src/` — React/TypeScript frontend
+- `src/` — React/TypeScript frontend, organized by domain: `app/` (init, routing,
+  the `AppScreen` state machine), `components/` (UI primitives), `features/` (one
+  folder per screen), `hooks/`, `services/` (typed Tauri command/event wrappers),
+  `stores/` (Zustand), `types/`, `utils/`. See `docs/frontend-architecture.md`.
 - `src-tauri/` — Rust core (Tauri commands, audio pipeline, transcription,
   model manager, conversation timeline, response suggestion)
 - `docs/` — architecture audit, design notes, roadmap, including
-  `docs/response-suggestion.md` and `docs/session-experience.md`
+  `docs/response-suggestion.md`, `docs/session-experience.md`,
+  `docs/frontend-architecture.md`, `docs/design-system.md`, `docs/onboarding.md`, and
+  `docs/shortcuts.md`
 - `prompts/` — LLM prompt templates (added in Ollama integration phase)
 - `tests/` — cross-cutting/integration tests; Rust unit tests live alongside
-  modules under `src-tauri/src`
+  modules under `src-tauri/src`; a few lightweight frontend logic tests
+  (`*.test.ts`, run via `npx tsx`) live alongside the modules they cover under `src/`
 
 ## Relationship Meetily
 

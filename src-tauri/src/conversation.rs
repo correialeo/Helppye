@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -16,7 +16,9 @@ use tracing::{info, warn};
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
 use crate::audio::types::{AudioCaptureEvent, AudioSource};
-use crate::response_provider::engine::process_conversation_events;
+use crate::response_provider::engine::{
+    is_eligible_turn, process_conversation_events, GenerationTrigger,
+};
 use crate::response_provider::ResponseEngineState;
 use crate::transcription::types::{Transcript, TranscriptEvent};
 
@@ -972,6 +974,43 @@ pub async fn conversation_end_session_command(
     let events = state.0.end_session();
     emit_conversation_events(&app, events.clone());
     process_conversation_events(&app, response_state.0.clone(), &events);
+    Ok(())
+}
+
+/// Dispara manualmente uma sugestão de resposta para `turn_id` (botão "Regenerar" e
+/// atalho Ctrl/Cmd+Shift+Enter no frontend — ver `docs/shortcuts.md`). Não é lógica de
+/// geração nova: reusa exatamente `ResponseEngine::trigger_generation`, o mesmo caminho
+/// que `process_conversation_events` já chama automaticamente em `UtteranceFinalized`
+/// (cancela uma geração em andamento para o turno do mesmo jeito, emite os mesmos
+/// eventos, aparece com `finalization_reason: "manual_regenerate"` no diagnóstico). Só
+/// existe porque, sem geração automática nova para se ancorar, o usuário precisa de uma
+/// forma explícita de pedir uma sugestão de novo.
+#[tauri::command]
+pub async fn conversation_regenerate_suggestion_command(
+    app: AppHandle,
+    turn_id: u64,
+    state: State<'_, ConversationTimelineState>,
+    response_state: State<'_, ResponseEngineState>,
+) -> Result<(), String> {
+    let snapshot = state.0.snapshot();
+    let turn = snapshot
+        .turns
+        .into_iter()
+        .find(|t| t.id.value() == turn_id)
+        .ok_or_else(|| "turno não encontrado".to_string())?;
+    if !is_eligible_turn(&turn) {
+        return Err("turno não é elegível para sugestão de resposta".to_string());
+    }
+    let trigger = GenerationTrigger {
+        utterance_finalized_at: Instant::now(),
+        finalization_reason: "manual_regenerate".to_string(),
+        gap_ms_used: 0,
+        silence_detected_ms: None,
+    };
+    response_state
+        .0
+        .clone()
+        .trigger_generation(app, turn, trigger);
     Ok(())
 }
 

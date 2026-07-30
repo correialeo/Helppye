@@ -3,5 +3,9 @@
   "identifier": "default",
   "description": "Default capabilities for the main Helppye window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-size",
+    "core:window:allow-set-min-size"
+  ]
 }

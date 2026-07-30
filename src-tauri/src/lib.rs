@@ -96,6 +96,7 @@ pub fn run() {
             conversation::conversation_raw_segments_command,
             conversation::conversation_get_utterance_gap_ms_command,
             conversation::conversation_set_utterance_gap_ms_command,
+            conversation::conversation_regenerate_suggestion_command,
             response_provider::response_provider_status_command,
             response_provider::response_set_provider_config_command,
             response_provider::response_set_api_key_command,
