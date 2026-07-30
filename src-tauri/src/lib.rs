@@ -13,6 +13,7 @@ use conversation::{emit_conversation_events, ConversationTimeline, ConversationT
 use response_provider::engine::process_conversation_events;
 use transcription::provider::TranscriptionProvider;
 use transcription::queue::TranscriptionQueue;
+use transcription::types::TranscriptEvent;
 use transcription::whisper_provider::WhisperCppProvider;
 use transcription::{TranscriptionState, TRANSCRIPTION_EVENT};
 
@@ -57,6 +58,25 @@ pub fn run() {
             let timeline_for_queue = timeline.clone();
             let response_engine_for_queue = response_engine.clone();
             let queue = Arc::new(TranscriptionQueue::spawn(provider.clone(), move |event| {
+                // Uma transcrição que falha não pode sumir sem deixar rastro. `Failed` é
+                // descartado silenciosamente por `ingest_transcript_event` (só `Ready`
+                // vira segmento), então sem este log um provider sem modelo carregado
+                // produz falha para *todo* segmento e o app fica em silêncio absoluto:
+                // captura ativa, medidor de nível se mexendo, nada na timeline e nenhuma
+                // linha no terminal explicando o porquê.
+                if let TranscriptEvent::Failed {
+                    segment_id,
+                    source,
+                    ref message,
+                } = event
+                {
+                    tracing::warn!(
+                        ?segment_id,
+                        ?source,
+                        %message,
+                        "transcription failed for segment"
+                    );
+                }
                 if let Err(e) = app_handle.emit(TRANSCRIPTION_EVENT, &event) {
                     tracing::warn!(%e, "failed to emit transcription event to frontend");
                 }
@@ -80,6 +100,25 @@ pub fn run() {
             app.manage(TranscriptionState::new(provider.clone(), queue));
 
             let model_manager_state = model_manager::build(app.handle(), provider)?;
+            // O arquivo do modelo sobrevive a um restart do app; o estado carregado dentro
+            // do provider não. Restaurá-lo era efeito colateral de `model_status_command`,
+            // invocado só pela tela de teste de áudio do onboarding — que deixa de ser
+            // montada assim que o onboarding é concluído. A partir da segunda execução,
+            // portanto, nada carregava o modelo e toda transcrição falhava com "no
+            // transcription model configured". O ciclo de vida do modelo é do backend, não
+            // de uma tela: a restauração acontece aqui, uma vez, no boot.
+            let model_manager_for_restore = model_manager_state.0.clone();
+            tauri::async_runtime::spawn(async move {
+                match model_manager_for_restore.status_snapshot().await {
+                    Ok(status) => tracing::info!(
+                        state = ?status.state,
+                        "transcription model state restored at startup"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(%e, "failed to restore transcription model at startup")
+                    }
+                }
+            });
             app.manage(model_manager_state);
 
             Ok(())
