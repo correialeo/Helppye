@@ -2260,8 +2260,11 @@ mod tests {
         wait_for_event_type(&mut rx, "completed").await;
         let prompt_b = answering_b.prompts().pop().expect("prompt da sessão B");
         assert!(prompt_b.contains("problema de escalabilidade"));
+        // Sentinelas de conteúdo *da sessão A* — "Perfeito." não serve mais como sentinela
+        // porque aparece literalmente no `SYSTEM_PROMPT` fixo, como exemplo de calibração
+        // da política de `[SKIP]` (ver `context.rs`); casaria sem nenhum vazamento real.
         assert!(
-            !prompt_b.contains("monolito") && !prompt_b.contains("Perfeito."),
+            !prompt_b.contains("monolito") && !prompt_b.contains("Em qual situação"),
             "o prompt da sessão B não pode conter nada da sessão A:\n{prompt_b}"
         );
 

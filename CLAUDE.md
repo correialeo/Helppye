@@ -254,9 +254,15 @@ O usuário escolhe o provedor de LLM: Ollama local (padrão) ou um provedor de n
 responder, via um marcador `[SKIP]` no início do stream quando a fala não exige resposta
 — sem uma segunda chamada de classificação e sem detector por regex. O prompt separa
 fisicamente `CONTEXTO RECENTE:` / `FALA ATUAL DA OUTRA PESSOA:` / `INSTRUÇÃO:` para que a
-decisão seja sobre a fala atual, não sobre o turno inteiro, e o `SYSTEM_PROMPT` declara a
-política (em dúvida razoável, responder curto em vez de `[SKIP]`). API keys de provedores
-de nuvem ficam no keychain do SO via crate `keyring`, nunca em texto puro no disco.
+decisão seja sobre a fala atual, não sobre o turno inteiro. O `SYSTEM_PROMPT` declara a
+política: responder é o padrão, `[SKIP]` tem uma lista fechada de casos, a pontuação da
+transcrição não conta na decisão (o transcritor quase nunca produz "?", então "Me conta um
+caso real..." é um pedido sem interrogação), confirmação seguida de pedido se responde, e
+em qualquer dúvida responde-se curto. Contra alucinação, o mesmo prompt proíbe fabricar
+específicos ausentes do contexto (nome, número, data, empresa, tecnologia) e pede resposta
+de 2 a 4 frases — ver `docs/response-suggestion.md`, seção "Estrutura do prompt e política
+de `[SKIP]`". API keys de provedores de nuvem ficam no keychain do SO via crate `keyring`,
+nunca em texto puro no disco.
 Eventos emitidos via `response://suggestion-event`: `started`, `delta`, `completed`,
 `skipped`, `cancelled` e `error`, todos carregando `session_id`, `turn_id`,
 `utterance_id` e `generation_id` — o `generation_id` para o frontend descartar eventos de

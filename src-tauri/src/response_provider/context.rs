@@ -14,6 +14,15 @@
 //!    `FALA ATUAL DA OUTRA PESSOA:` e instrui o modelo a usar o contexto apenas para
 //!    resolver referências ("isso", "esse problema"). Sem essa separação, um "Perfeito."
 //!    isolado e um "Perfeito. Me conta um caso real..." se pareciam demais no prompt.
+//!
+//! A separação sozinha não bastou: modelos locais menores continuavam devolvendo `[SKIP]`
+//! para pedidos claros no imperativo. Duas causas conhecidas, ambas endereçadas no
+//! `SYSTEM_PROMPT`: a transcrição raramente produz "?" (então "Me conta um caso real"
+//! chega sem nenhuma marca sintática de pergunta), e a política de skip era descrita por
+//! adjetivos ("claramente não pedir resposta") em vez de uma lista fechada. Hoje o prompt
+//! diz explicitamente que a pontuação não é confiável, enumera os únicos casos de skip e
+//! traz exemplos curtos — inclusive o padrão exato que falhava, confirmação seguida de
+//! pedido.
 
 use crate::conversation::{ConversationSpeaker, ConversationTurn};
 
@@ -44,29 +53,63 @@ pub const INSTRUCTION_HEADER: &str = "INSTRUÇÃO:";
 /// contradizia o `SYSTEM_PROMPT` e fazia modelos locais menores devolverem a análise da
 /// fala — ou a própria pergunta reformulada — em vez da resposta. A tarefa é escrever a
 /// resposta; `[SKIP]` é a exceção, não o objetivo.
+///
+/// Ela repete, em forma curta, as três regras do `SYSTEM_PROMPT` que mais falhavam na
+/// prática (pontuação não confiável, lista fechada de `[SKIP]`, proibição de inventar
+/// específicos) porque um modelo pequeno tende a seguir o que leu por último — não é
+/// redundância acidental.
 const INSTRUCTION: &str = "INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do \
-usuário à fala atual. Vá direto ao conteúdo: nada de repetir ou reformular a pergunta, \
-nada de comentar se ela exige resposta, nada de preâmbulo. \
-Use o contexto apenas para resolver referências. \
-Se, e somente se, a fala atual claramente não pedir resposta, escreva apenas [SKIP].";
+usuário à fala atual, em 2 a 4 frases. Vá direto ao conteúdo: nada de repetir ou \
+reformular a pergunta, nada de comentar se ela exige resposta, nada de preâmbulo. \
+Use o contexto apenas para resolver referências, e não invente nome, número, data, \
+empresa ou tecnologia que não esteja nele. \
+A pontuação da transcrição não é confiável: um pedido ou pergunta sem \"?\" continua \
+sendo um pedido. \
+Escreva apenas [SKIP] se a fala atual for somente saudação, somente uma confirmação \
+isolada, ou um fragmento sem sentido.";
 
 const NO_CONTEXT_PLACEHOLDER: &str = "(nenhum — esta é a primeira fala da sessão)";
 
 const SYSTEM_PROMPT: &str = "Você é um copiloto que ajuda o usuário durante uma reunião ao vivo. \
-Você recebe o contexto recente da conversa e a fala atual da outra pessoa. \
+Você recebe o contexto recente da conversa e a fala atual da outra pessoa, e escreve a \
+resposta que o usuário daria agora, em primeira pessoa. \
 Sua decisão é sempre sobre a fala atual: o contexto serve apenas para entender referências \
 como \"isso\", \"esse problema\" ou \"essa decisão\".\n\
-Perguntas, pedidos de explicação, pedidos de exemplo, desafios de entrevista, solicitações \
-implícitas e frases no imperativo exigem resposta. \
-Use [SKIP] apenas quando claramente nenhuma resposta for necessária: uma saudação isolada, \
-uma confirmação breve, um comentário sem pedido, ruído evidente ou um fragmento sem sentido. \
-Em caso de dúvida razoável, gere uma resposta curta em vez de usar [SKIP].\n\
-Se a fala atual começar com uma confirmação ou saudação mas contiver também uma pergunta ou \
-um pedido, responda ao pedido — não use [SKIP].\n\
+\n\
+O texto vem de transcrição automática de fala: a pontuação é pouco confiável e o ponto de \
+interrogação quase sempre falta. Nunca decida pela pontuação, decida pelo conteúdo. \
+\"Me conta como foi\", \"explica melhor\", \"e como você resolveu isso\" são pedidos, mesmo \
+escritos sem \"?\".\n\
+\n\
+Responder é o padrão. Use [SKIP] apenas nestes casos, e em nenhum outro:\n\
+- saudação isolada;\n\
+- confirmação ou reação isolada, sem nada depois (\"perfeito\", \"entendi\", \"faz sentido\");\n\
+- fragmento truncado, ruído ou fala sem sentido;\n\
+- fala que claramente não é dirigida ao usuário.\n\
+Se a fala contiver qualquer pergunta, pedido, imperativo ou convite a falar — inclusive \
+logo depois de uma confirmação, como em \"Perfeito. Me conta como foi\" — responda ao \
+pedido. Em qualquer dúvida, responda curto em vez de usar [SKIP].\n\
+\n\
+Como responder:\n\
+- primeira pessoa, tom natural de fala, 2 a 4 frases;\n\
+- direto ao conteúdo, sem se apresentar e sem repetir a pergunta antes de responder;\n\
+- não invente fatos específicos que não estejam no contexto: nomes de empresa, clientes, \
+produtos, datas, números, métricas ou tecnologias;\n\
+- se o pedido exigir um detalhe pessoal que você não tem, responda pelo raciocínio e pela \
+estrutura da experiência, deixando o específico em aberto para o usuário completar, em vez \
+de fabricar um caso;\n\
+- se não houver base para responder, dê a resposta mais curta e honesta possível — nunca \
+preencha com detalhe inventado.\n\
+\n\
+Exemplos, só para calibrar a decisão (não copie este formato na resposta):\n\
+- \"Perfeito. Me conta um caso em que isso deu errado\" → responder (é um pedido, mesmo \
+vindo depois de uma confirmação);\n\
+- \"E quais foram as limitações disso\" → responder (é pergunta, mesmo sem \"?\");\n\
+- \"Beleza, faz sentido.\" → [SKIP];\n\
+- \"Bom dia, tudo bem?\" → [SKIP].\n\
+\n\
 Para pular, responda apenas com o texto exato [SKIP] e nada mais, sem explicações e sem \
-pontuação extra. Caso contrário, responda de forma breve, direta e natural, como se você \
-fosse o usuário respondendo à outra pessoa agora, sem se apresentar e sem repetir a \
-pergunta antes de responder.";
+pontuação extra.";
 
 /// Resultado de `build_request`: a requisição em si mais os números que os diagnósticos e
 /// os logs (`context_built`, `context_turn_count`, `context_character_count`) precisam.
@@ -351,9 +394,59 @@ mod tests {
         let current = turn(1, ConversationSpeaker::OtherPerson, "pode explicar melhor?");
         let built = build_request(&[], &current, "pode explicar melhor?");
         let system = &built.request.messages[0].content;
-        assert!(system.contains("exigem resposta"));
-        assert!(system.contains("Em caso de dúvida razoável"));
+        assert!(system.contains("Responder é o padrão"));
+        assert!(system.contains("Em qualquer dúvida, responda curto"));
         assert!(system.contains("[SKIP]"));
+    }
+
+    /// A transcrição quase nunca produz "?", então a decisão não pode depender de
+    /// pontuação — foi assim que "Me conta um caso real em que você optou por usar
+    /// monolito." virou `[SKIP]` na prática. Tanto o prompt de sistema quanto a instrução
+    /// final precisam dizer isso, porque um modelo pequeno segue melhor o que leu por
+    /// último.
+    #[test]
+    fn prompt_tells_the_model_that_transcription_punctuation_is_unreliable() {
+        let current = turn(1, ConversationSpeaker::OtherPerson, "me conta como foi");
+        let built = build_request(&[], &current, "me conta como foi");
+        let system = &built.request.messages[0].content;
+        let user = &built.request.messages.last().unwrap().content;
+
+        assert!(system.contains("a pontuação é pouco confiável"));
+        assert!(system.contains("Nunca decida pela pontuação"));
+        assert!(user.contains("A pontuação da transcrição não é confiável"));
+    }
+
+    /// O caso que o usuário reportou: confirmação seguida de pedido, tudo numa fala só.
+    /// A política precisa citar esse padrão explicitamente, não deixá-lo implícito numa
+    /// regra genérica de "em dúvida, responda".
+    #[test]
+    fn skip_policy_is_a_closed_list_and_covers_confirmation_followed_by_a_request() {
+        let speech = "Perfeito. Me conta um caso real em que você optou por usar monolito.";
+        let current = turn(1, ConversationSpeaker::OtherPerson, speech);
+        let system = build_request(&[], &current, speech).request.messages[0]
+            .content
+            .clone();
+
+        assert!(system.contains("Use [SKIP] apenas nestes casos, e em nenhum outro"));
+        assert!(system.contains("logo depois de uma confirmação"));
+        assert!(system.contains("saudação isolada"));
+        assert!(system.contains("fragmento truncado"));
+    }
+
+    /// Segunda metade do pedido do usuário: menos alucinação. A regra é sobre *específicos*
+    /// (nome, número, data, empresa), não sobre responder menos — a resposta continua
+    /// obrigatória, só não pode fabricar o detalhe que o modelo não tem como saber.
+    #[test]
+    fn prompt_forbids_inventing_specifics_absent_from_the_context() {
+        let speech = "Me conta um caso real de migração que você tocou.";
+        let current = turn(1, ConversationSpeaker::OtherPerson, speech);
+        let built = build_request(&[], &current, speech);
+        let system = &built.request.messages[0].content;
+        let user = &built.request.messages.last().unwrap().content;
+
+        assert!(system.contains("não invente fatos específicos que não estejam no contexto"));
+        assert!(system.contains("nunca preencha com detalhe inventado"));
+        assert!(user.contains("não invente nome, número, data, empresa ou tecnologia"));
     }
 
     /// As falas que o produto **precisa** responder e a que precisa pular, do requisito.

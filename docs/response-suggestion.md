@@ -249,10 +249,13 @@ Você: ...
 FALA ATUAL DA OUTRA PESSOA:
 Me dá um exemplo disso.
 
-INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do usuário à fala atual. Vá
-direto ao conteúdo: nada de repetir ou reformular a pergunta, nada de comentar se ela
-exige resposta, nada de preâmbulo. Use o contexto apenas para resolver referências.
-Se, e somente se, a fala atual claramente não pedir resposta, escreva apenas [SKIP].
+INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do usuário à fala atual, em 2 a
+4 frases. Vá direto ao conteúdo: nada de repetir ou reformular a pergunta, nada de
+comentar se ela exige resposta, nada de preâmbulo. Use o contexto apenas para resolver
+referências, e não invente nome, número, data, empresa ou tecnologia que não esteja nele.
+A pontuação da transcrição não é confiável: um pedido ou pergunta sem "?" continua sendo
+um pedido. Escreva apenas [SKIP] se a fala atual for somente saudação, somente uma
+confirmação isolada, ou um fragmento sem sentido.
 ```
 
 A instrução é a **última coisa que o modelo lê antes de gerar**, e é a que mais pesa na
@@ -274,13 +277,35 @@ atual dentro do contexto embaralharia justamente a decisão de `[SKIP]`.
 
 O `SYSTEM_PROMPT` declara a política em vez de deixá-la implícita:
 
-- Exigem resposta: perguntas, pedidos de explicação, pedidos de exemplo, desafios de
-  entrevista, solicitações implícitas e frases no imperativo.
-- `[SKIP]` só quando claramente nenhuma resposta é necessária: saudação isolada,
-  confirmação breve, comentário sem pedido, ruído evidente, fragmento sem sentido.
-- **Em caso de dúvida razoável, gerar uma resposta curta em vez de `[SKIP]`.**
+- **Responder é o padrão.** `[SKIP]` tem uma **lista fechada** de casos — saudação
+  isolada; confirmação/reação isolada sem nada depois; fragmento truncado, ruído ou fala
+  sem sentido; fala que claramente não é dirigida ao usuário — e nenhum outro.
+- **A pontuação da transcrição não conta.** O transcritor quase nunca produz "?", então
+  decidir por pontuação é decidir por um sinal que não existe: "me conta como foi",
+  "explica melhor" e "e como você resolveu isso" são pedidos escritos sem interrogação.
 - Fala que começa com confirmação/saudação mas contém pergunta ou pedido ⇒ responder ao
-  pedido.
+  pedido (**o caso citado explicitamente**, com exemplo, porque é o que falhava na
+  prática: "Perfeito. Me conta um caso real..." voltava como `[SKIP]`).
+- **Em qualquer dúvida, responder curto em vez de `[SKIP]`.**
+- Exemplos curtos de calibração no fim do prompt de sistema — dois que devem responder
+  (um imperativo depois de confirmação, uma pergunta sem "?") e dois que devem pular.
+  Modelos locais pequenos seguem exemplo melhor do que seguem política declarada.
+
+Contra alucinação, o mesmo prompt separa **responder** de **inventar**: a resposta
+continua obrigatória, mas não pode fabricar o específico que o modelo não tem como saber
+— nomes de empresa, clientes, produtos, datas, números, métricas ou tecnologias que não
+apareceram no contexto. Quando o pedido exige um detalhe pessoal ausente ("me conta um
+caso real em que você..."), a política é responder pelo raciocínio e pela estrutura da
+experiência, deixando o específico em aberto para o usuário completar em voz alta, em vez
+de fabricar um caso — e, sem base nenhuma, dar a resposta mais curta e honesta possível.
+O teto de saída (`MAX_OUTPUT_TOKENS` = 160) e a instrução de 2 a 4 frases também são
+anti-alucinação, não só latência: resposta longa é onde o detalhe inventado aparece.
+
+Nada disso é verificável por teste automatizado além da estrutura: os testes de
+`context.rs` provam que cada fala chega isolada sob `FALA ATUAL DA OUTRA PESSOA:` e que a
+política, os exemplos e as regras anti-invenção estão no prompt — **não** que um modelo
+específico decida certo. Isso só se observa rodando um provedor real (ver a seção de
+validação no fim deste documento).
 
 Continua valendo a restrição de arquitetura: **nenhum detector por regex e nenhuma segunda
 chamada de classificação**. A mesma chamada que gera a resposta decide, in-band, via o
