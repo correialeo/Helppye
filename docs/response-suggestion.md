@@ -81,10 +81,10 @@ utterance mais recente termina.
 (`conversation::UtteranceFinalizationReason`: `inactivity_timeout`, `speaker_changed`,
 `source_changed`, `capture_stopped`, `manual_flush`, `session_ended`,
 `maximum_duration`), `gap_ms_used` (`same_speaker_utterance_gap_ms` vigente no momento),
-`silence_detected_ms` (quando mensurável) e `session_id`. A geração automática do
-`ResponseEngine` funciona para qualquer motivo, mas os três esperados no dia a dia são
-`inactivity_timeout` (o caso comum: silêncio após a fala), `speaker_changed` e
-`source_changed` (a pessoa terminou de falar porque alguém mais começou).
+`silence_detected_ms` (quando mensurável) e `session_id`. O motivo esperado no dia a dia
+é `inactivity_timeout` — silêncio após a fala, detectado pelo timer dedicado da utterance.
+`speaker_changed`/`source_changed` também finalizam a utterance, mas deliberadamente
+**não** disparam geração (ver "Elegibilidade" abaixo).
 
 `same_speaker_utterance_gap_ms` (default 1800ms) é configurável em runtime, sem rebuild,
 via `conversation_get_utterance_gap_ms_command`/`conversation_set_utterance_gap_ms_command`
@@ -101,10 +101,21 @@ recebe uma "sugestão de resposta" para a própria fala.
 Além do turno ser elegível, o **motivo de finalização** da utterance precisa representar
 fim de fala, não desmontagem de estado (`engine::triggers_generation`):
 
-| `UtteranceFinalizationReason`                                                  | Dispara geração? |
-| ------------------------------------------------------------------------------ | ---------------- |
-| `inactivity_timeout`, `speaker_changed`, `source_changed`, `manual_flush`, `maximum_duration` | sim              |
-| `capture_stopped`, `session_ended`                                             | **não**          |
+| `UtteranceFinalizationReason`                              | Dispara geração? |
+| ---------------------------------------------------------- | ---------------- |
+| `inactivity_timeout`, `manual_flush`, `maximum_duration`   | sim              |
+| `speaker_changed`, `source_changed`                        | **não**          |
+| `capture_stopped`, `session_ended`                         | **não**          |
+
+**`speaker_changed`/`source_changed` — o usuário tomou a palavra.** Numa utterance da
+outra pessoa, esses dois motivos só podem significar que o microfone começou a produzir
+fala. O usuário já está respondendo; uma sugestão nesse instante chega tarde por
+definição. Pior, o efeito era ativamente destrutivo: enquanto ele lia a sugestão em voz
+alta, a própria leitura entrava pelo microfone, finalizava a utterance da outra pessoa por
+troca de speaker e disparava uma geração nova — que ia substituindo, token a token,
+exatamente a resposta que estava sendo lida. E como a fala dele acabara de entrar no
+contexto como `Você: ...`, o modelo com frequência devolvia a fala dele de volta. O
+disparo legítimo é o silêncio, que o timer dedicado da utterance já cobre.
 
 Parar a captura e encerrar a sessão finalizam a utterance aberta — é correto que
 finalizem, mas essas finalizações são consequência do teardown, não de alguém ter

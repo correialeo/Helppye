@@ -228,8 +228,13 @@ no mesmo turno cancela e substitui a geração em andamento, para nunca sugerir 
 uma fala que ainda não terminou; `ResponseEngine::finish_generation` roda em todo caminho
 de saída (completo, skip, erro ou cancelamento) e sempre libera o slot de geração daquele
 turno, para que uma geração seguinte nunca veja um estado "fantasma" de uma anterior já
-encerrada. Finalizações que são consequência de teardown (`capture_stopped`,
-`session_ended`) nunca disparam geração (`engine::triggers_generation`).
+encerrada. Só `inactivity_timeout`, `manual_flush` e `maximum_duration` disparam geração
+(`engine::triggers_generation`): teardown (`capture_stopped`, `session_ended`) nunca
+dispara, e `speaker_changed`/`source_changed` também não — numa utterance da outra pessoa
+esses dois motivos significam que o microfone começou a falar, ou seja, **o usuário tomou
+a palavra**. Ele já está respondendo, e gerar aí substituía token a token a sugestão que
+ele estava lendo em voz alta (com a fala dele recém-entrada no contexto como `Você: ...`,
+o modelo costumava devolvê-la de volta).
 
 **Isolamento por sessão.** A unidade de isolamento é a sessão (`conversation::SessionId`,
 monotônico, de propriedade da `ConversationTimeline`; o `ResponseEngine` espelha o valor).

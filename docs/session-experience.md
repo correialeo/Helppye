@@ -66,6 +66,10 @@ dependência.
 | Flush manual / parar captura / fim de sessão | Sim | Sim |
 | Duração máxima da utterance/turno | Sim | Sim (só se o turno também estourou) |
 
+Fechar a utterance e disparar uma sugestão são coisas diferentes: `speaker_changed` e
+`source_changed` fecham a utterance mas **não** geram sugestão, porque significam que o
+usuário tomou a palavra — ver `docs/response-suggestion.md`, seção "Elegibilidade".
+
 A geração de sugestão escuta `utterance_finalized`, não `turn_finalized`. O turno acima
 da utterance pode continuar aberto por até 20 segundos agrupando a conversa (útil para a
 Timeline mostrar "a outra pessoa falou isso tudo seguido"), mas isso nunca atrasa a
