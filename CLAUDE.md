@@ -120,11 +120,24 @@ com inferência CPU-only. `TranscriptionQueue` recebe `AudioSegment`s do pipelin
 em uma fila limitada e não bloqueante; se a transcrição ficar atrasada, segmentos novos
 são descartados e contabilizados, sem aplicar backpressure à captura.
 
+O whisper anota trechos **sem fala** em vez de devolver texto vazio (`[Música]`,
+`[BLANK_AUDIO]`, `[Aplausos]`, `♪`). `strip_non_speech_annotations` remove essas marcações
+ainda no provider — é lá que o vocabulário de anotação de um transcritor específico é
+conhecido, não na timeline. Sem isso a marcação vira segmento, abre uma utterance nova no
+mesmo turno, cancela a geração de resposta em andamento da pergunta anterior e é então
+classificada como `[SKIP]`: o usuário via "Nenhuma sugestão" justamente na fala que pedia
+resposta. Ver `docs/response-suggestion.md`, seção "Ruído do transcritor não pode virar
+fala".
+
 `model_manager` implementa o fluxo guiado de primeiro uso: status do modelo, download
 explícito, progresso, cancelamento, verificação de SHA-256, instalação atômica,
 persistência da seleção e carregamento real no provider. O modelo padrão é o Whisper Base
 Multilíngue; modelos personalizados podem ser selecionados por caminho local e são
-validados antes de persistir.
+validados antes de persistir. **O carregamento do modelo no provider acontece uma vez no
+boot** (`lib.rs`, `.setup()`), não como efeito colateral de uma tela: o arquivo sobrevive
+ao restart, o estado em memória do provider não, e amarrar essa restauração ao
+`AudioSetupScreen` fazia toda transcrição falhar em silêncio a partir da segunda execução
+do app.
 
 ## Conversation Timeline (`src-tauri/src/conversation.rs`)
 

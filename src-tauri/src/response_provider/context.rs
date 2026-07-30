@@ -39,8 +39,16 @@ pub const CONTEXT_HEADER: &str = "CONTEXTO RECENTE:";
 pub const CURRENT_SPEECH_HEADER: &str = "FALA ATUAL DA OUTRA PESSOA:";
 pub const INSTRUCTION_HEADER: &str = "INSTRUÇÃO:";
 
-const INSTRUCTION: &str = "INSTRUÇÃO: Decida exclusivamente se a fala atual exige resposta. \
-Use o contexto apenas para compreender referências.";
+/// A instrução é a última coisa que o modelo lê antes de gerar, e é a que mais pesa. Ela
+/// pedia só uma *decisão* ("Decida exclusivamente se a fala atual exige resposta"), o que
+/// contradizia o `SYSTEM_PROMPT` e fazia modelos locais menores devolverem a análise da
+/// fala — ou a própria pergunta reformulada — em vez da resposta. A tarefa é escrever a
+/// resposta; `[SKIP]` é a exceção, não o objetivo.
+const INSTRUCTION: &str = "INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do \
+usuário à fala atual. Vá direto ao conteúdo: nada de repetir ou reformular a pergunta, \
+nada de comentar se ela exige resposta, nada de preâmbulo. \
+Use o contexto apenas para resolver referências. \
+Se, e somente se, a fala atual claramente não pedir resposta, escreva apenas [SKIP].";
 
 const NO_CONTEXT_PLACEHOLDER: &str = "(nenhum — esta é a primeira fala da sessão)";
 
@@ -380,7 +388,10 @@ mod tests {
                 speech.contains(text),
                 "{text:?} deve chegar como fala atual, não diluída no contexto"
             );
-            assert!(user.contains("Decida exclusivamente se a fala atual exige resposta"));
+            // A instrução final tem que pedir a resposta, não uma classificação: pedir
+            // "decida se exige resposta" fazia o modelo devolver a análise/pergunta.
+            assert!(user.contains("Escreva agora, em primeira pessoa, a resposta do usuário"));
+            assert!(!user.contains("Decida exclusivamente"));
         }
     }
 

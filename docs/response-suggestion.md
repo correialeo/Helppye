@@ -238,9 +238,18 @@ Você: ...
 FALA ATUAL DA OUTRA PESSOA:
 Me dá um exemplo disso.
 
-INSTRUÇÃO: Decida exclusivamente se a fala atual exige resposta. Use o contexto apenas
-para compreender referências.
+INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do usuário à fala atual. Vá
+direto ao conteúdo: nada de repetir ou reformular a pergunta, nada de comentar se ela
+exige resposta, nada de preâmbulo. Use o contexto apenas para resolver referências.
+Se, e somente se, a fala atual claramente não pedir resposta, escreva apenas [SKIP].
 ```
+
+A instrução é a **última coisa que o modelo lê antes de gerar**, e é a que mais pesa na
+saída. A versão anterior pedia só uma decisão ("Decida exclusivamente se a fala atual
+exige resposta"), o que contradizia o `SYSTEM_PROMPT` — que já mandava responder — e
+fazia modelos locais menores devolverem a análise da fala, ou a própria pergunta
+reformulada, em vez de uma resposta. A tarefa pedida é escrever a resposta; `[SKIP]` é a
+exceção, não o objetivo.
 
 Sem contexto (primeira fala da sessão), o bloco recebe
 `(nenhum — esta é a primeira fala da sessão)` em vez de sumir — a estrutura do prompt é
@@ -268,6 +277,24 @@ marcador `[SKIP]` no início do stream. O `SkipDetector` ganhou apenas robustez 
 parsing (`classify`): tolera espaço em branco à esquerda, marcador em caixa baixa e
 `[SKIP]` seguido de `\n` — antes, um `"[SKIP]\n"` num único chunk não era reconhecido
 como skip e vazava o marcador literal para a tela.
+
+### Ruído do transcritor não pode virar fala
+
+O whisper não devolve texto vazio para trechos sem fala: ele **anota** o trecho —
+`[Música]`, `[BLANK_AUDIO]`, `[Aplausos]`, `♪`. Como qualquer outro texto, essas marcações
+viravam segmento, e um segmento abre utterance. O efeito na sugestão era duplo e
+silencioso: a marcação que chega logo depois de uma pergunta real (a) abre uma utterance
+nova no mesmo turno, o que **cancela a geração já em andamento** para a pergunta, e (b) é
+então corretamente classificada como `[SKIP]` — o usuário via "Nenhuma sugestão"
+exatamente na fala que mais precisava de resposta.
+
+A filtragem mora em `transcription::whisper_provider::strip_non_speech_annotations`, que é
+onde o vocabulário de anotação é conhecido — não na timeline, que não deve saber quais
+marcações um transcritor específico inventa. Regra conservadora: colchetes e notas musicais
+são removidos em qualquer posição do texto (o whisper nunca envolve fala real em
+colchetes); `(...)` só é descartado quando é o segmento inteiro, porque parênteses
+aparecem em fala transcrita de verdade. Se o que sobra é vazio, `TranscriptSegment::
+from_transcript` já devolve `None` e nada entra na timeline.
 
 ## Logs estruturados
 
