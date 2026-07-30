@@ -2243,4 +2243,49 @@ mod tests {
             "cancelar a sessão anterior não pode desligar o timer da sessão nova"
         );
     }
+
+    /// Replica exatamente a sequência que `AppRouter::startSession` produz: abrir a
+    /// fronteira de sessão e só então começar a receber áudio. A tela de sessão decide
+    /// entre "Ouvindo a conversa..." e a sugestão a partir de existir ou não um turno
+    /// elegível (`other_person` + `system_output`), então se esta sequência não produzir
+    /// `TurnStarted` a janela fica presa no estado de espera para sempre.
+    #[tokio::test]
+    async fn starting_a_session_then_capturing_still_produces_an_eligible_turn() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+
+        timeline.start_session();
+
+        let events = timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Em qual situação você usaria monolitos?",
+            0,
+            1_500,
+        )));
+
+        let started = events.iter().any(|event| {
+            matches!(
+                event,
+                ConversationTimelineEvent::TurnStarted {
+                    speaker: ConversationSpeaker::OtherPerson,
+                    source: AudioSource::SystemOutput,
+                    ..
+                }
+            )
+        });
+        assert!(
+            started,
+            "a primeira fala da outra pessoa depois de start_session tem que abrir um turno \
+             elegível: {events:?}"
+        );
+
+        let snapshot = timeline.snapshot();
+        assert!(
+            snapshot.turns.iter().any(|turn| {
+                turn.speaker == ConversationSpeaker::OtherPerson
+                    && turn.source == AudioSource::SystemOutput
+            }),
+            "o snapshot que a janela de sessão lê ao montar precisa conter o turno elegível"
+        );
+    }
 }

@@ -57,7 +57,12 @@ export function AppRouter() {
     await stopAllCapture();
     // A fronteira é aberta antes da captura: nenhum áudio da nova sessão pode chegar à
     // timeline enquanto o backend ainda estiver com o estado da sessão anterior.
-    await startConversationSession().catch(() => {});
+    // A falha não impede a sessão de começar, mas não pode ser engolida em silêncio: sem
+    // a fronteira o backend segue na sessão anterior, e isso precisa aparecer em algum
+    // lugar em vez de virar um sintoma inexplicável na tela.
+    await startConversationSession().catch((e) => {
+      console.error("falha ao abrir a fronteira de sessão", e);
+    });
     await Promise.allSettled([startCapture("microphone"), startCapture("system_output")]);
     setSessionStartedAt(Date.now());
     setScreen("session");
