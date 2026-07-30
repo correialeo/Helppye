@@ -7,9 +7,10 @@ import {
   type SuggestionState,
 } from "../features/session/responseSuggestionViewModel";
 
-/** Live response-suggestion state per turn (visible text) plus, separately, the raw
- * per-generation diagnostics (developer tools only) — see
- * responseSuggestionViewModel.ts for why these are two different reducers. */
+/** Live response-suggestion state per **utterance** (visible text) plus, separately, the
+ * raw diagnostics keyed by turn (developer tools only) — see
+ * responseSuggestionViewModel.ts for why these are two different reducers, and why the
+ * visible state cannot be keyed by turn. */
 export function useResponseSuggestions() {
   const [suggestions, setSuggestions] = useState<Record<number, SuggestionState>>({});
   const [diagnostics, setDiagnostics] = useState<Record<number, ResponseSuggestionDiagnostics>>({});

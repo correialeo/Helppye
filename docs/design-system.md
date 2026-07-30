@@ -78,7 +78,7 @@ lista é um desvio do sistema, não uma opção de estilo:
 1. Botão principal (`PrimaryButton` usa preenchimento sólido `bg-brand-600` hoje —
    reservado para uma versão futura com leve gradiente, se necessário).
 2. Brilho de fundo (`shadow-glow-brand` em `BrandMark`).
-3. Estado de geração (o cursor pulsante em `SuggestionPanel` durante streaming).
+3. Estado de geração (o cursor pulsante em `ExchangeItem` durante streaming).
 4. Detalhe de identidade (`BrandMark`).
 
 Medidores de nível de áudio e barras de progresso (`AudioLevelMeter`, `ProgressBar`)
@@ -123,9 +123,9 @@ mantida por um conjunto de assets frágil e sem consistência visual entre si.
 `PasswordInput`, `Select`, `Toggle`, `ProgressDots`, `StepHeader`, `InlineNotice`,
 `Dialog`, `Tooltip`, `Kbd`, `BrandMark`, `ProviderOption`, `DeviceOption`.
 `layout/`: `OnboardingLayout`, `AppShell`. `feedback/`: `StatusIndicator`,
-`AudioLevelMeter`, `ProgressBar`. Sessão-específicos (`SuggestionPanel`,
-`SessionHeader`, `SessionFooter`, `TranscriptPeek`, `TranscriptDrawer`) vivem em
-`features/session/` — não são primitivos reutilizáveis fora dali.
+`AudioLevelMeter`, `ProgressBar`. Sessão-específicos (`SuggestionFeed`, `ExchangeItem`,
+`SessionHeader`, `SessionFooter`, `TranscriptDrawer`) vivem em `features/session/` — não
+são primitivos reutilizáveis fora dali.
 
 Nenhum destes é construído sobre um "design system" abstrato (sem `cva`, sem tema
 runtime, sem tokens indiretos além do que o Tailwind já oferece) — são componentes
@@ -147,10 +147,14 @@ Redimensionada (`hooks/useWindowMode.ts`) para ser visivelmente mais compacta qu
 resto do app: ~380×620px lógicos contra ~420×760px do app principal, com tamanho
 mínimo próprio (~320×420px) para continuar utilizável quando o usuário encolhe a
 janela manualmente. Estrutura de cima para baixo: `SessionHeader` (mark + status +
-menu — a barra mais fina do app), a última fala da outra pessoa (`TranscriptPeek`,
-secundária: `text-sm text-neutral-400`, `line-clamp-2`), a sugestão
-(`SuggestionPanel`, ocupa o espaço restante, `text-[15px]` — a única coisa em destaque
-tipográfico real na tela), `SessionFooter` (dois indicadores de status + cronômetro).
+menu — a barra mais fina do app), o feed da conversa (`SuggestionFeed`, ocupa o espaço
+restante) e `SessionFooter` (dois indicadores de status + cronômetro). Cada entrada do
+feed (`ExchangeItem`) repete a mesma hierarquia internamente: a fala da outra pessoa
+como contexto secundário (`text-sm text-neutral-400`) e, abaixo, a sugestão
+(`text-[15px]` — a única coisa em destaque tipográfico real na tela). O feed é
+cronológico e cresce para baixo: uma pergunta nova entra abaixo da anterior, nunca por
+cima de uma resposta que o usuário ainda pode estar lendo (ver
+`docs/response-suggestion.md` §Frontend).
 Sem timeline completa visível por padrão (ver `TranscriptDrawer`, sob demanda), sem
 menu lateral, sem diagnóstico visível — ver §Complexidade ocultada.
 

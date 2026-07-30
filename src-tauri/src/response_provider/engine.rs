@@ -578,6 +578,7 @@ impl ResponseEngine {
                 Some(ResponseSuggestionEvent::Cancelled {
                     session_id: previous_ctx.session_id,
                     turn_id: previous_ctx.turn_id,
+                    utterance_id: previous_ctx.utterance_id,
                     generation_id: previous.generation_id,
                 }),
             );
@@ -704,6 +705,7 @@ impl ResponseEngine {
             ResponseSuggestionEvent::Started {
                 session_id: ctx.session_id,
                 turn_id: ctx.turn_id,
+                utterance_id: ctx.utterance_id,
                 generation_id: ctx.generation_id,
             },
         ) {
@@ -713,25 +715,26 @@ impl ResponseEngine {
         }
 
         let stream_result = tokio::select! {
-            _ = cancel_token.cancelled() => {
-                diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                diagnostics.event_emitted = "cancelled".to_string();
-                self.publish_terminal_event(
-                    &app,
-                    &ctx,
-                    &terminal_emitted,
-                    TerminalState::Cancelled,
-                    Some(ResponseSuggestionEvent::Cancelled {
-                        session_id: ctx.session_id,
-                        turn_id: ctx.turn_id,
-                        generation_id: ctx.generation_id,
-                    }),
-                );
-                finish!(diagnostics);
-                return;
-            }
-            result = provider.stream_reply(built.request) => result,
-        };
+                    _ = cancel_token.cancelled() => {
+                        diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                        diagnostics.event_emitted = "cancelled".to_string();
+                        self.publish_terminal_event(
+                            &app,
+                            &ctx,
+                            &terminal_emitted,
+                            TerminalState::Cancelled,
+                            Some(ResponseSuggestionEvent::Cancelled {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+        utterance_id: ctx.utterance_id,
+                                generation_id: ctx.generation_id,
+                            }),
+                        );
+                        finish!(diagnostics);
+                        return;
+                    }
+                    result = provider.stream_reply(built.request) => result,
+                };
 
         let mut stream = match stream_result {
             Ok((s, meta)) => {
@@ -748,6 +751,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Error {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                         message: e.to_string(),
                     }),
@@ -762,25 +766,26 @@ impl ResponseEngine {
 
         loop {
             let next = tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                    diagnostics.event_emitted = "cancelled".to_string();
-                    self.publish_terminal_event(
-                        &app,
-                        &ctx,
-                        &terminal_emitted,
-                        TerminalState::Cancelled,
-                        Some(ResponseSuggestionEvent::Cancelled {
-                            session_id: ctx.session_id,
-                            turn_id: ctx.turn_id,
-                            generation_id: ctx.generation_id,
-                        }),
-                    );
-                    finish!(diagnostics);
-                    return;
-                }
-                item = stream.next() => item,
-            };
+                            _ = cancel_token.cancelled() => {
+                                diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                                diagnostics.event_emitted = "cancelled".to_string();
+                                self.publish_terminal_event(
+                                    &app,
+                                    &ctx,
+                                    &terminal_emitted,
+                                    TerminalState::Cancelled,
+                                    Some(ResponseSuggestionEvent::Cancelled {
+                                        session_id: ctx.session_id,
+                                        turn_id: ctx.turn_id,
+            utterance_id: ctx.utterance_id,
+                                        generation_id: ctx.generation_id,
+                                    }),
+                                );
+                                finish!(diagnostics);
+                                return;
+                            }
+                            item = stream.next() => item,
+                        };
 
             let Some(item) = next else {
                 break;
@@ -817,6 +822,7 @@ impl ResponseEngine {
                                 Some(ResponseSuggestionEvent::Skipped {
                                     session_id: ctx.session_id,
                                     turn_id: ctx.turn_id,
+                                    utterance_id: ctx.utterance_id,
                                     generation_id: ctx.generation_id,
                                 }),
                             );
@@ -835,6 +841,7 @@ impl ResponseEngine {
                                     ResponseSuggestionEvent::Delta {
                                         session_id: ctx.session_id,
                                         turn_id: ctx.turn_id,
+                                        utterance_id: ctx.utterance_id,
                                         generation_id: ctx.generation_id,
                                         text: flush,
                                     },
@@ -860,6 +867,7 @@ impl ResponseEngine {
                         Some(ResponseSuggestionEvent::Error {
                             session_id: ctx.session_id,
                             turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
                             generation_id: ctx.generation_id,
                             message: e.to_string(),
                         }),
@@ -888,6 +896,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Skipped {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                     }),
                 );
@@ -904,6 +913,7 @@ impl ResponseEngine {
                         ResponseSuggestionEvent::Delta {
                             session_id: ctx.session_id,
                             turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
                             generation_id: ctx.generation_id,
                             text: flush,
                         },
@@ -922,6 +932,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Completed {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                         text: full_text.clone(),
                     }),
@@ -941,6 +952,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Completed {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                         text: full_text.clone(),
                     }),

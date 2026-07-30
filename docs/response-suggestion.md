@@ -520,29 +520,35 @@ configuração.
 `features/session/responseSuggestionViewModel.ts` (movido de `src/` para dentro de
 `features/session/` na reformulação de UI documentada em `docs/frontend-architecture.md`
 — mesma lógica, só reorganizada por domínio) reduz os eventos de
-`response://suggestion-event` num `Record<TurnId, SuggestionState>` via
+`response://suggestion-event` num `Record<UtteranceId, SuggestionState>` via
 `applyResponseSuggestionEvent`. Segue a mesma semântica de supersessão do backend:
 eventos que não sejam `started` só são aplicados se o `generation_id` do evento ainda
-casar com o `generationId` armazenado para aquele turno — eventos de uma geração já
+casar com o `generationId` armazenado para aquela fala — eventos de uma geração já
 cancelada são descartados silenciosamente. `SuggestionStatus` tem sete valores:
 `preparing`, `streaming`, `completed_with_text`, `completed_empty`, `skipped`,
 `cancelled`, `error` — o evento `completed` do backend vira `completed_with_text` ou
-`completed_empty` conforme o texto final (`.trim()`) estar vazio ou não. A sugestão é
-renderizada em `features/session/SuggestionPanel.tsx`, o elemento com maior destaque
-tipográfico da janela de sessão (ver `docs/design-system.md` §Janela de sessão) — texto
-editorial correndo, não um balão de chat, não uma reescrita do texto transcrito do
-turno.
+`completed_empty` conforme o texto final (`.trim()`) estar vazio ou não.
 
-**A resposta anterior não desaparece assim que uma nova geração começa.** `started` não
-zera mais o texto visível: se havia uma sugestão `completed_with_text` para o turno, ela
-migra para `previousText` e o status vira `preparing` ("Analisando fala..." na UI). O
-primeiro `delta` com conteúdo real limpa `previousText` e substitui o que está na tela;
-se a nova geração terminar sem conteúdo (skip, vazia, erro, cancelada), `previousText`
-continua disponível para a UI não regredir para "nenhuma sugestão" quando havia uma boa
-resposta momentos atrás. Isso cobre o caso de continuação de fala descrito acima: a
-resposta à primeira pergunta ("Em qual situação você usaria monolitos?") permanece
-visível enquanto a segunda ("Em qual situação você usaria microsserviços?") ainda está
-sendo preparada, em vez de piscar para um painel vazio entre as duas.
+**A chave é a utterance, não o turno — e é por isso que todo evento público carrega
+`utterance_id`.** Um `ConversationTurn` agrupa tudo que a outra pessoa falou enquanto
+manteve a palavra (até `turn_inactivity_timeout_ms`, 20s por padrão) e pode conter
+várias perguntas seguidas. Indexando por turno, a resposta à segunda pergunta
+sobrescrevia, no mesmo lugar, a resposta à primeira — que o usuário podia ainda estar
+lendo. A utterance é a unidade que de fato corresponde a uma sugestão (uma pergunta, uma
+resposta), então cada uma tem seu próprio registro e nada é substituído. O `turn_id`
+continua no estado, mas só como o argumento de `regenerate_suggestion_command`, que é
+por turno.
+
+A tela é um **feed cronológico**, não um slot único: `features/session/SuggestionFeed.tsx`
+empilha um `features/session/ExchangeItem.tsx` por fala elegível da outra pessoa (a fala,
+secundária, e logo abaixo a sua sugestão — o elemento com maior destaque tipográfico da
+janela, ver `docs/design-system.md` §Janela de sessão). O que é novo entra **embaixo**;
+nada acima é apagado ou trocado. O auto-scroll só acompanha o fim quando o usuário já
+está no fim — se ele rolou para cima para reler uma resposta anterior, uma fala nova não
+arranca a tela dele. Isso substitui o antigo `SuggestionPanel`/`TranscriptPeek` (painel
+único + última fala) e, com ele, o mecanismo de `previousText`, que existia só para
+disfarçar a sobrescrita: com uma entrada por fala, a resposta anterior continua
+literalmente na tela, não numa cópia de fallback.
 
 **Fronteira de sessão no frontend (fiação mínima, sem redesign).** Iniciar uma sessão em
 `app/router.tsx` agora chama `startConversationSession()`
@@ -640,9 +646,11 @@ Configurações.
   confirmar que `keep_alive`, `options.num_predict`, `options.temperature` e
   `think: false` realmente vão no JSON enviado ao Ollama — e que `keep_alive` fica
   totalmente ausente (não `null`) quando não configurado.
-- **`src/responseSuggestionViewModel.test.ts`** — cobre a transição `started` →
-  `preparing` com `previousText`, a limpeza de `previousText` no primeiro delta com
-  conteúdo, e a permanência de `previousText` quando a nova geração termina sem conteúdo.
+- **`src/features/session/responseSuggestionViewModel.test.ts`** — cobre o chaveamento
+  por `utterance_id` (inclusive o caso central: duas perguntas no **mesmo turno**
+  produzem duas entradas coexistentes, nenhuma sobrescrita), o descarte de eventos sem
+  `utterance_id`, a supersessão por `generation_id` e a distinção
+  `completed_with_text`/`completed_empty`.
 
 ## O que foi verificado neste ambiente vs. o que ainda precisa de confirmação manual
 
@@ -681,9 +689,9 @@ sem acesso de rede de teste contra os endpoints reais dos provedores.
 - `npm run typecheck`, `npm run lint`, `npm run build` — limpos, incluindo os reducers
   `applyResponseSuggestionEvent`/`applyResponseSuggestionDiagnostics` e seus testes
   manuais (`responseSuggestionViewModel.test.ts`, rodados via `npx tsx`), cobrindo a
-  distinção `completed_with_text`/`completed_empty`, a transição `preparing`/
-  `previousText` e o preenchimento de `ResponseSuggestionDiagnostics` a partir do
-  evento bruto.
+  distinção `completed_with_text`/`completed_empty`, o chaveamento por `utterance_id`
+  (duas perguntas no mesmo turno coexistindo) e o preenchimento de
+  `ResponseSuggestionDiagnostics` a partir do evento bruto.
 
 **Ainda precisa de confirmação manual (não fabricado aqui):**
 - A causa raiz real do sintoma que motivou o diagnóstico original ("Gerando

@@ -258,9 +258,13 @@ decisão seja sobre a fala atual, não sobre o turno inteiro, e o `SYSTEM_PROMPT
 política (em dúvida razoável, responder curto em vez de `[SKIP]`). API keys de provedores
 de nuvem ficam no keychain do SO via crate `keyring`, nunca em texto puro no disco.
 Eventos emitidos via `response://suggestion-event`: `started`, `delta`, `completed`,
-`skipped`, `cancelled` e `error`, todos carregando `session_id`, `turn_id` e
-`generation_id` para o frontend descartar eventos de uma geração já superada, além de
-`diagnostics` (ver abaixo). Ver
+`skipped`, `cancelled` e `error`, todos carregando `session_id`, `turn_id`,
+`utterance_id` e `generation_id` — o `generation_id` para o frontend descartar eventos de
+uma geração já superada, o `utterance_id` porque a sugestão pertence a uma **fala**, não
+ao turno: um turno pode conter várias perguntas, e indexando por turno a resposta à
+segunda sobrescrevia a resposta à primeira. A janela de sessão é um feed cronológico com
+uma entrada por fala elegível (`features/session/SuggestionFeed.tsx`), crescendo para
+baixo; nada já exibido é substituído no lugar. Há também `diagnostics` (ver abaixo). Ver
 `docs/response-suggestion.md` para a arquitetura completa, módulo por módulo, e
 `docs/session-experience.md` para o comportamento fim a fim durante uma sessão ao vivo.
 

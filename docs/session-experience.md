@@ -106,30 +106,41 @@ Fala do usuário (`speaker = User`, `source = Microphone`) **nunca** dispara ger
 - o usuário começar a falar não inicia uma nova geração;
 - a fala do usuário entra no histórico de contexto normalmente (via
   `ConversationTimelineEvent::TurnFinalized` alimentando `ResponseEngine::push_history`);
+- a fala do usuário **não entra no feed** da janela de sessão (ela aparece só na
+  transcrição completa, sob demanda, em `TranscriptDrawer`);
 - uma sugestão já concluída **permanece visível** enquanto o usuário fala — nada a
-  apaga automaticamente;
+  apaga, substitui ou empurra para fora automaticamente;
 - uma geração ainda em andamento quando o usuário começa a falar também permanece ativa
   — só é cancelada se uma nova fala *remota* (da outra pessoa) a substituir, nunca por a
   fala do usuário sozinha.
 
 ## O que a UI mostra, e quando
 
-| Evento do backend | Estado na UI (`SuggestionState.status`) | Texto em `SuggestionPanel` |
+A tela de sessão é um **feed cronológico**: cada fala da outra pessoa vira uma entrada
+própria (`ExchangeItem`) com a sua sugestão logo abaixo, e o que é novo entra no fim da
+lista. Uma segunda pergunta **não** substitui a resposta da primeira — mesmo que as duas
+pertençam ao mesmo `ConversationTurn`, que pode ficar aberto por até 20s agrupando várias
+perguntas. Nada que já apareceu é apagado ou trocado no lugar enquanto a sessão dura.
+
+A tabela abaixo descreve o estado de **uma** entrada do feed:
+
+| Evento do backend | Estado na UI (`SuggestionState.status`) | Texto na entrada |
 |---|---|---|
-| `started` | `preparing` | "Preparando uma sugestão..." (shimmer discreto); resposta anterior continua visível por baixo até haver algo melhor |
+| `started` | `preparing` | "Preparando uma sugestão..." (shimmer discreto) sob a fala correspondente |
 | primeiro `delta` com conteúdo | `streaming` | o texto chegando, com um cursor pulsante no fim |
 | `completed` (texto não vazio) | `completed_with_text` | o texto final, com ações Copiar/Regenerar/Ocultar |
-| `completed` (texto vazio) | `completed_empty` | "Nenhuma nova sugestão" (discreto, não ocupa o painel inteiro) |
-| `skipped` | `skipped` | "Nenhuma nova sugestão"; mantém a resposta anterior visível, se houver |
-| `cancelled` | `cancelled` | sem mensagem própria — é um estado de transição, a próxima geração já está a caminho |
+| `completed` (texto vazio) | `completed_empty` | "Nenhuma sugestão para esta fala" (discreto) |
+| `skipped` | `skipped` | "Nenhuma sugestão para esta fala" |
+| `cancelled` | `cancelled` | o texto parcial recebido até ali permanece — é um estado de transição, a próxima geração já está a caminho |
 | `error` | `error` | "Não foi possível gerar a sugestão." + [Tentar novamente] |
 
 A UI nunca espera `completed` para começar a renderizar — o streaming aparece assim que
-o primeiro delta com conteúdo chega, e a resposta concluída anterior nunca "pisca" para
-um painel vazio entre uma geração e a próxima. Ver `features/session/SuggestionPanel.tsx`
-e `features/session/responseSuggestionViewModel.ts` (o reducer, movido de
-`src/responseSuggestionViewModel.ts` para dentro de `features/session/` na reformulação
-de UI — mesma lógica, só reorganizada por pasta de domínio).
+o primeiro delta com conteúdo chega. O auto-scroll acompanha o fim do feed só quando o
+usuário já está no fim: se ele rolou para cima para reler uma resposta anterior, uma fala
+nova não arranca a tela dele. Ver `features/session/SuggestionFeed.tsx`,
+`features/session/ExchangeItem.tsx` e `features/session/responseSuggestionViewModel.ts`
+(o reducer, indexado por `utterance_id` — ver `docs/response-suggestion.md` §Frontend
+para por que a chave não pode ser o turno).
 
 "Regenerar" (botão, ou Ctrl/Cmd+Shift+Enter — ver `docs/shortcuts.md`) dispara
 manualmente uma nova geração para o turno elegível mais recente, sem esperar uma nova

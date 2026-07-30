@@ -18,8 +18,9 @@ globalmente mesmo com um campo de texto focado — nenhum deles colide com digit
 normal, ao contrário de uma tecla solta como `Enter` seria.
 
 Exibidos na interface como chips no estilo tecla (`Kbd`), nunca só como texto — por
-exemplo "⌘ D" em `ReadyScreen`, "⌘ ⇧ ⏎" (esmaecido) no rodapé de ações de
-`SuggestionPanel` quando uma sugestão concluída está visível.
+exemplo "⌘ D" em `ReadyScreen`, "⌘ ⇧ ⏎" (esmaecido) nas ações do `ExchangeItem` mais
+recente do feed quando sua sugestão já está concluída — só o mais recente, porque é
+sobre ele que o atalho age (entradas anteriores continuam com o botão "Regenerar").
 
 "Regenerar" (manual) chama `conversation_regenerate_suggestion_command` — ver
 `docs/frontend-architecture.md` §Um comando novo no backend, e por quê — para o único
