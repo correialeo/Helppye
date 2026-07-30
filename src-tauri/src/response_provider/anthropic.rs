@@ -90,6 +90,7 @@ impl ResponseProvider for AnthropicProvider {
         let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": request.max_output_tokens,
+            "temperature": request.temperature,
             "messages": chat_messages,
             "stream": true,
         });

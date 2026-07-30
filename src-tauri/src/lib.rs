@@ -28,9 +28,28 @@ pub fn run() {
         .setup(|app| {
             let provider: Arc<dyn TranscriptionProvider> = Arc::new(WhisperCppProvider::new());
             let timeline = Arc::new(ConversationTimeline::default());
+            timeline.attach();
             let response_engine_state = response_provider::build(app.handle());
             let response_engine = response_engine_state.0.clone();
             let app_handle = app.handle().clone();
+
+            // O timer dedicado da utterance (`ConversationTimeline::reschedule_utterance_timer`)
+            // finaliza uma utterance por silêncio sem que nenhum código externo chame de
+            // volta o timeline — precisa de um jeito de emitir esses eventos por conta
+            // própria. Registra aqui a mesma sequência emit+process usada manualmente logo
+            // abaixo para o caminho síncrono (novo segmento chegando), para que os dois
+            // caminhos cheguem ao frontend e ao `ResponseEngine` de forma idêntica.
+            let app_handle_for_sink = app_handle.clone();
+            let response_engine_for_sink = response_engine.clone();
+            timeline.set_event_sink(Arc::new(move |events| {
+                emit_conversation_events(&app_handle_for_sink, events.clone());
+                process_conversation_events(
+                    &app_handle_for_sink,
+                    response_engine_for_sink.clone(),
+                    &events,
+                );
+            }));
+
             let timeline_for_queue = timeline.clone();
             let response_engine_for_queue = response_engine.clone();
             let queue = Arc::new(TranscriptionQueue::spawn(provider.clone(), move |event| {
@@ -75,6 +94,8 @@ pub fn run() {
             conversation::conversation_flush_turns_command,
             conversation::conversation_end_session_command,
             conversation::conversation_raw_segments_command,
+            conversation::conversation_get_utterance_gap_ms_command,
+            conversation::conversation_set_utterance_gap_ms_command,
             response_provider::response_provider_status_command,
             response_provider::response_set_provider_config_command,
             response_provider::response_set_api_key_command,

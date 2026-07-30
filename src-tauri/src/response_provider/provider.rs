@@ -38,6 +38,9 @@ pub fn to_chat_json(message: &ResponseMessage) -> serde_json::Value {
 pub struct ResponseRequest {
     pub messages: Vec<ResponseMessage>,
     pub max_output_tokens: u32,
+    /// Baixa de propósito (ver `context::TEMPERATURE`) — sugestão de resposta em reunião
+    /// ao vivo se beneficia de previsibilidade, não de criatividade.
+    pub temperature: f32,
 }
 
 #[derive(Debug, Clone)]

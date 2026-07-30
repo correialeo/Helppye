@@ -36,7 +36,8 @@ bytes = "1"
 keyring = "4"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "test-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "test-util", "net"] }
+tauri = { version = "2", features = ["test"] }
 
 [profile.release]
 panic = "abort"

@@ -87,11 +87,13 @@ pub async fn response_set_provider_config_command(
     provider: ResponseProviderKind,
     model: String,
     base_url: Option<String>,
+    ollama_keep_alive: Option<String>,
 ) -> Result<(), String> {
     state.0.update_config(ResponseProviderConfig {
         provider,
         model,
         base_url,
+        ollama_keep_alive,
     })
 }
 

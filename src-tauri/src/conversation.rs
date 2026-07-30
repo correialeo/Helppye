@@ -7,7 +7,8 @@
 //! transcription, summarize, call an LLM, or discard raw segment IDs.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
@@ -63,6 +64,24 @@ impl TurnId {
     }
 }
 
+/// Identifica um processo de app em execução (uma "sessão" de captura). Não persiste
+/// entre execuções — gerado uma vez quando o `ConversationTimeline` é criado, a partir do
+/// relógio de parede, só para dar aos eventos `UtteranceFinalized` uma referência estável
+/// dentro da mesma sessão (ver `docs/response-suggestion.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    pub(crate) fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        SessionId(nanos)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TranscriptSegment {
     pub segment_id: SegmentId,
@@ -107,6 +126,11 @@ pub struct ConversationUtterance {
     pub started_at: AudioTimestamp,
     pub ended_at: AudioTimestamp,
     pub finalized_at: Option<AudioTimestamp>,
+    /// Incrementada a cada segmento anexado. Usada pelo timer dedicado da utterance
+    /// (`ConversationTimeline::reschedule_utterance_timer`) para detectar, ao expirar, se
+    /// a utterance ainda é a mesma que estava aberta quando o timer foi agendado — se a
+    /// revisão mudou (ou a utterance já finalizou por outro caminho), o timer é um no-op.
+    pub revision: u64,
 }
 
 impl ConversationUtterance {
@@ -120,6 +144,7 @@ impl ConversationUtterance {
             started_at: segment.started_at,
             ended_at: segment.ended_at,
             finalized_at: None,
+            revision: 1,
         }
     }
 
@@ -127,6 +152,7 @@ impl ConversationUtterance {
         self.text = join_text(&self.text, &segment.text);
         self.segments.push(segment.segment_id);
         self.ended_at = std::cmp::max(self.ended_at, segment.ended_at);
+        self.revision += 1;
     }
 
     fn duration_ms(&self) -> u64 {
@@ -200,6 +226,62 @@ impl FinalizationReason {
             FinalizationReason::MaximumTurnDuration => "maximum_turn_duration",
         }
     }
+
+    /// Projeta o motivo interno (que também cobre fechamento de turno) no motivo público
+    /// carregado por `ConversationTimelineEvent::UtteranceFinalized`. `UtteranceGapExceeded`
+    /// (timer dedicado ou segmento tardio) e `TurnInactivityTimeout` (o turno acima da
+    /// utterance estourou o timeout enquanto ela ainda estava aberta) colapsam em
+    /// `InactivityTimeout` — do ponto de vista da utterance, ambos são "ninguém falou a
+    /// tempo". O mesmo vale para os dois motivos de duração máxima.
+    fn to_utterance_reason(self) -> UtteranceFinalizationReason {
+        match self {
+            FinalizationReason::SpeakerChanged => UtteranceFinalizationReason::SpeakerChanged,
+            FinalizationReason::SourceChanged => UtteranceFinalizationReason::SourceChanged,
+            FinalizationReason::UtteranceGapExceeded
+            | FinalizationReason::TurnInactivityTimeout => {
+                UtteranceFinalizationReason::InactivityTimeout
+            }
+            FinalizationReason::Paused => UtteranceFinalizationReason::CaptureStopped,
+            FinalizationReason::SessionEnded => UtteranceFinalizationReason::SessionEnded,
+            FinalizationReason::ManualFlush => UtteranceFinalizationReason::ManualFlush,
+            FinalizationReason::MaximumUtteranceDuration
+            | FinalizationReason::MaximumTurnDuration => {
+                UtteranceFinalizationReason::MaximumDuration
+            }
+        }
+    }
+}
+
+/// Motivo de finalização de uma `ConversationUtterance`, carregado no evento
+/// `UtteranceFinalized` para o `ResponseEngine` e para o painel de diagnóstico em modo
+/// dev. `InactivityTimeout` é o caminho esperado para gerar sugestão automaticamente
+/// (silêncio após a fala) — `SpeakerChanged`/`SourceChanged` também disparam geração
+/// (a pessoa terminou de falar porque alguém mais começou), ver
+/// `response_provider::engine::process_conversation_events`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UtteranceFinalizationReason {
+    InactivityTimeout,
+    SpeakerChanged,
+    SourceChanged,
+    CaptureStopped,
+    ManualFlush,
+    SessionEnded,
+    MaximumDuration,
+}
+
+impl UtteranceFinalizationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UtteranceFinalizationReason::InactivityTimeout => "inactivity_timeout",
+            UtteranceFinalizationReason::SpeakerChanged => "speaker_changed",
+            UtteranceFinalizationReason::SourceChanged => "source_changed",
+            UtteranceFinalizationReason::CaptureStopped => "capture_stopped",
+            UtteranceFinalizationReason::ManualFlush => "manual_flush",
+            UtteranceFinalizationReason::SessionEnded => "session_ended",
+            UtteranceFinalizationReason::MaximumDuration => "maximum_duration",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -225,6 +307,18 @@ pub enum ConversationTimelineEvent {
     UtteranceFinalized {
         turn_id: TurnId,
         utterance: ConversationUtterance,
+        finalization_reason: UtteranceFinalizationReason,
+        /// `same_speaker_utterance_gap_ms` vigente no momento da finalização (o valor pode
+        /// mudar em runtime em modo dev, ver `ConversationTimeline::set_utterance_gap_ms`).
+        gap_ms_used: u64,
+        /// Silêncio efetivamente observado antes da finalização, em ms, quando mensurável:
+        /// para o timer dedicado é o próprio `gap_ms_used` (é por definição o que expirou
+        /// sem novo segmento); para o caminho reativo (segmento tardio chegando) é o gap
+        /// real entre o fim da utterance e o início do novo segmento. `None` quando a
+        /// finalização não tem relação com silêncio (flush manual, troca de speaker/fonte,
+        /// captura parada, fim de sessão, duração máxima).
+        silence_detected_ms: Option<u64>,
+        session_id: SessionId,
     },
     TurnStarted {
         turn_id: TurnId,
@@ -271,6 +365,7 @@ struct ConversationAssembler {
     next_utterance_id: u64,
     next_turn_id: u64,
     last_finalized_ended_at: Option<AudioTimestamp>,
+    session_id: SessionId,
 }
 
 impl ConversationAssembler {
@@ -285,6 +380,7 @@ impl ConversationAssembler {
             next_utterance_id: 0,
             next_turn_id: 0,
             last_finalized_ended_at: None,
+            session_id: SessionId::new(),
         }
     }
 
@@ -331,9 +427,10 @@ impl ConversationAssembler {
                 );
 
                 if updated_utterance.duration_ms() >= self.config.maximum_utterance_duration_ms {
-                    events.extend(
-                        self.finalize_open_utterance(FinalizationReason::MaximumUtteranceDuration),
-                    );
+                    events.extend(self.finalize_open_utterance(
+                        FinalizationReason::MaximumUtteranceDuration,
+                        None,
+                    ));
                 }
                 if self
                     .open_turn
@@ -344,11 +441,19 @@ impl ConversationAssembler {
                 }
             }
             SegmentDecision::NewUtteranceSameTurn(reason) => {
-                events.extend(self.finalize_open_utterance(reason));
+                let observed_gap = self
+                    .open_utterance
+                    .as_ref()
+                    .map(|u| segment.started_at.saturating_sub(u.ended_at));
+                events.extend(self.finalize_open_utterance(reason, observed_gap));
                 self.start_utterance_and_maybe_turn(segment, &mut events);
             }
             SegmentDecision::NewTurn(reason) => {
-                events.extend(self.finalize_open_utterance(reason));
+                let observed_gap = self
+                    .open_utterance
+                    .as_ref()
+                    .map(|u| segment.started_at.saturating_sub(u.ended_at));
+                events.extend(self.finalize_open_utterance(reason, observed_gap));
                 events.extend(self.finalize_open_turn(reason));
                 self.start_utterance_and_maybe_turn(segment, &mut events);
             }
@@ -467,8 +572,9 @@ impl ConversationAssembler {
         if segment.ended_at.saturating_sub(segment.started_at)
             >= self.config.maximum_utterance_duration_ms
         {
-            events
-                .extend(self.finalize_open_utterance(FinalizationReason::MaximumUtteranceDuration));
+            events.extend(
+                self.finalize_open_utterance(FinalizationReason::MaximumUtteranceDuration, None),
+            );
         }
     }
 
@@ -485,6 +591,7 @@ impl ConversationAssembler {
     fn finalize_open_utterance(
         &mut self,
         reason: FinalizationReason,
+        observed_gap_ms: Option<u64>,
     ) -> Vec<ConversationTimelineEvent> {
         let Some(mut utterance) = self.open_utterance.take() else {
             return Vec::new();
@@ -504,11 +611,45 @@ impl ConversationAssembler {
             ConversationTimelineEvent::UtteranceFinalized {
                 turn_id: self.open_turn_id(),
                 utterance,
+                finalization_reason: reason.to_utterance_reason(),
+                gap_ms_used: self.config.same_speaker_utterance_gap_ms,
+                silence_detected_ms: observed_gap_ms,
+                session_id: self.session_id,
             },
             ConversationTimelineEvent::TurnUpdated {
                 turn: self.open_turn.clone().expect("open turn exists"),
             },
         ]
+    }
+
+    /// Identidade (id + revisão) da utterance aberta, se houver — usada por
+    /// `ConversationTimeline::reschedule_utterance_timer` para saber o que agendar, e como
+    /// chave de comparação em `finalize_utterance_if_stale` para decidir se o timer que
+    /// expirou ainda corresponde ao estado atual.
+    fn open_utterance_identity(&self) -> Option<(UtteranceId, u64)> {
+        self.open_utterance.as_ref().map(|u| (u.id, u.revision))
+    }
+
+    /// Chamado quando o timer dedicado de uma utterance expira. Só finaliza se a
+    /// utterance aberta ainda for exatamente a mesma (mesmo id e revisão) que estava
+    /// aberta quando o timer foi agendado — qualquer segmento novo (mesmo turno ou não),
+    /// flush, parada de captura ou fim de sessão já terá mudado a revisão ou zerado
+    /// `open_utterance`, tornando este disparo um no-op em vez de uma finalização
+    /// duplicada ou incorreta.
+    fn finalize_utterance_if_stale(
+        &mut self,
+        utterance_id: UtteranceId,
+        revision: u64,
+    ) -> Vec<ConversationTimelineEvent> {
+        let still_current = self
+            .open_utterance
+            .as_ref()
+            .is_some_and(|u| u.id == utterance_id && u.revision == revision);
+        if !still_current {
+            return Vec::new();
+        }
+        let gap_ms = self.config.same_speaker_utterance_gap_ms;
+        self.finalize_open_utterance(FinalizationReason::UtteranceGapExceeded, Some(gap_ms))
     }
 
     fn finalize_open_turn(&mut self, reason: FinalizationReason) -> Vec<ConversationTimelineEvent> {
@@ -538,7 +679,7 @@ impl ConversationAssembler {
             .as_ref()
             .is_some_and(|turn| turn.source == source)
         {
-            let mut events = self.finalize_open_utterance(reason);
+            let mut events = self.finalize_open_utterance(reason, None);
             events.extend(self.finalize_open_turn(reason));
             events
         } else {
@@ -547,13 +688,13 @@ impl ConversationAssembler {
     }
 
     fn flush(&mut self) -> Vec<ConversationTimelineEvent> {
-        let mut events = self.finalize_open_utterance(FinalizationReason::ManualFlush);
+        let mut events = self.finalize_open_utterance(FinalizationReason::ManualFlush, None);
         events.extend(self.finalize_open_turn(FinalizationReason::ManualFlush));
         events
     }
 
     fn end_session(&mut self) -> Vec<ConversationTimelineEvent> {
-        let mut events = self.finalize_open_utterance(FinalizationReason::SessionEnded);
+        let mut events = self.finalize_open_utterance(FinalizationReason::SessionEnded, None);
         events.extend(self.finalize_open_turn(FinalizationReason::SessionEnded));
         events
     }
@@ -624,9 +765,23 @@ pub struct ConversationTimelineSnapshot {
     pub utterances: Vec<ConversationUtterance>,
 }
 
+/// Recebe eventos produzidos fora do fluxo síncrono de `ingest_transcript_event` — hoje,
+/// só o timer dedicado da utterance (ver `reschedule_utterance_timer`). O chamador (
+/// `lib.rs`) registra aqui a mesma sequência `emit_conversation_events` +
+/// `process_conversation_events` que já usa manualmente para eventos síncronos, para que
+/// uma utterance finalizada por silêncio chegue ao frontend e ao `ResponseEngine` do
+/// mesmo jeito que uma finalizada por um novo segmento.
+pub type ConversationEventSink = Arc<dyn Fn(Vec<ConversationTimelineEvent>) + Send + Sync>;
+
 pub struct ConversationTimeline {
     assembler: Mutex<ConversationAssembler>,
     next_sequence: AtomicU64,
+    sink: OnceLock<ConversationEventSink>,
+    /// Referência fraca a si mesmo, usada para o timer dedicado poder chamar de volta em
+    /// `fire_utterance_timeout` depois de `tokio::time::sleep`. Só fica populada depois de
+    /// `attach()`; sem isso (app encerrando, ou testes que não chamam `attach`), o timer
+    /// simplesmente não é agendado — nunca panica.
+    self_weak: OnceLock<Weak<ConversationTimeline>>,
 }
 
 impl Default for ConversationTimeline {
@@ -640,7 +795,38 @@ impl ConversationTimeline {
         ConversationTimeline {
             assembler: Mutex::new(ConversationAssembler::new(config)),
             next_sequence: AtomicU64::new(0),
+            sink: OnceLock::new(),
+            self_weak: OnceLock::new(),
         }
+    }
+
+    /// Precisa ser chamado uma vez, logo após envolver o timeline em `Arc`, para que o
+    /// timer dedicado da utterance consiga se auto-referenciar. Sem isso o timer nunca é
+    /// agendado (finalização volta a depender só de eventos externos).
+    pub fn attach(self: &Arc<Self>) {
+        let _ = self.self_weak.set(Arc::downgrade(self));
+    }
+
+    pub fn set_event_sink(&self, sink: ConversationEventSink) {
+        let _ = self.sink.set(sink);
+    }
+
+    /// `same_speaker_utterance_gap_ms` atualmente em uso — configurável em runtime via
+    /// `set_utterance_gap_ms` (modo dev, sem rebuild).
+    pub fn utterance_gap_ms(&self) -> u64 {
+        self.assembler
+            .lock()
+            .expect("conversation timeline mutex poisoned")
+            .config
+            .same_speaker_utterance_gap_ms
+    }
+
+    pub fn set_utterance_gap_ms(&self, gap_ms: u64) {
+        self.assembler
+            .lock()
+            .expect("conversation timeline mutex poisoned")
+            .config
+            .same_speaker_utterance_gap_ms = gap_ms;
     }
 
     pub fn ingest_transcript_event(
@@ -656,10 +842,62 @@ impl ConversationTimeline {
             return Vec::new();
         };
 
-        self.assembler
+        let events = self
+            .assembler
             .lock()
             .expect("conversation timeline mutex poisoned")
-            .ingest_segment(segment)
+            .ingest_segment(segment);
+        self.reschedule_utterance_timer();
+        events
+    }
+
+    /// (Re)agenda o timer dedicado da utterance aberta, se houver uma. Chamado após todo
+    /// `ingest_transcript_event` — item 4 do plano de correção: cada segmento novo cancela
+    /// implicitamente qualquer timer anterior (via a checagem de revisão em
+    /// `finalize_utterance_if_stale`, não via cancelamento explícito da task) e agenda um
+    /// novo com a revisão atual. Se não houver utterance aberta, ou o timeline ainda não
+    /// tiver sido `attach()`ado, não faz nada.
+    fn reschedule_utterance_timer(&self) {
+        let (identity, gap_ms) = {
+            let assembler = self
+                .assembler
+                .lock()
+                .expect("conversation timeline mutex poisoned");
+            (
+                assembler.open_utterance_identity(),
+                assembler.config.same_speaker_utterance_gap_ms,
+            )
+        };
+        let Some((utterance_id, revision)) = identity else {
+            return;
+        };
+        let Some(timeline) = self.self_weak.get().and_then(Weak::upgrade) else {
+            return;
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+            timeline.fire_utterance_timeout(utterance_id, revision);
+        });
+    }
+
+    /// Executado quando um timer de utterance expira. Só produz efeito se a utterance
+    /// ainda for a mesma (mesmo id + revisão) que estava aberta quando o timer foi
+    /// agendado — ver `ConversationAssembler::finalize_utterance_if_stale`.
+    fn fire_utterance_timeout(&self, utterance_id: UtteranceId, revision: u64) {
+        let events = {
+            let mut assembler = self
+                .assembler
+                .lock()
+                .expect("conversation timeline mutex poisoned");
+            assembler.finalize_utterance_if_stale(utterance_id, revision)
+        };
+        if events.is_empty() {
+            return;
+        }
+        if let Some(sink) = self.sink.get() {
+            sink(events);
+        }
     }
 
     pub fn ingest_capture_event(
@@ -742,6 +980,24 @@ pub async fn conversation_raw_segments_command(
     state: State<'_, ConversationTimelineState>,
 ) -> Result<Vec<TranscriptSegment>, String> {
     Ok(state.0.raw_segments())
+}
+
+/// `same_speaker_utterance_gap_ms` atual. Exposto para o painel de dev (`import.meta.env.DEV`
+/// no frontend) testar valores diferentes sem rebuild — ver `docs/response-suggestion.md`.
+#[tauri::command]
+pub async fn conversation_get_utterance_gap_ms_command(
+    state: State<'_, ConversationTimelineState>,
+) -> Result<u64, String> {
+    Ok(state.0.utterance_gap_ms())
+}
+
+#[tauri::command]
+pub async fn conversation_set_utterance_gap_ms_command(
+    state: State<'_, ConversationTimelineState>,
+    gap_ms: u64,
+) -> Result<(), String> {
+    state.0.set_utterance_gap_ms(gap_ms);
+    Ok(())
 }
 
 pub fn emit_conversation_events(app: &AppHandle, events: Vec<ConversationTimelineEvent>) {
@@ -1191,6 +1447,333 @@ mod tests {
         assert_eq!(
             snapshot.turns[0].utterances,
             vec![snapshot.utterances[0].id]
+        );
+    }
+
+    // --- Timer dedicado da utterance ---------------------------------------------------
+    //
+    // Estes testes exercitam o timer real (`tokio::time::sleep` dentro de
+    // `reschedule_utterance_timer`), mas sem nenhum sleep de parede: `start_paused = true`
+    // congela o relógio do runtime de teste e `tokio::time::advance` avança o tempo
+    // virtual instantaneamente. `yield_now` algumas vezes depois de `advance` dá ao
+    // executor a chance de rodar a task que o `sleep` acordou antes do teste continuar.
+
+    /// Fast-forwards virtual time past `gap_ms` and lets the spawned timer task run.
+    /// `yield_now` first, *before* `advance`, matters: a task spawned just before this
+    /// call hasn't been polled yet, so its `tokio::time::sleep` hasn't registered a
+    /// deadline in the timer wheel — advancing time before that registration happens
+    /// would fast-forward past nothing, and the task would only start sleeping (for the
+    /// full duration, from the new "now") once it's finally polled. Yielding first lets
+    /// it reach that first `.await` and register before we advance the clock.
+    async fn advance_past_gap(gap_ms: u64) {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(gap_ms) + Duration::from_millis(1)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn finalized_utterance_events(
+        events: &[ConversationTimelineEvent],
+    ) -> Vec<&ConversationTimelineEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, ConversationTimelineEvent::UtteranceFinalized { .. }))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_alone_finalizes_utterance_without_a_new_segment() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Em qual situação você usaria microsserviços?",
+            0,
+            1_000,
+        )));
+
+        // Nada mais chega depois disso: sem novo segmento, sem flush, sem stop, sem fala
+        // do usuário. Só o tempo passa.
+        advance_past_gap(ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms)
+            .await;
+
+        let events = sink_events.lock().unwrap();
+        let finalized = finalized_utterance_events(&events);
+        assert_eq!(
+            finalized.len(),
+            1,
+            "the timer alone finalized the utterance"
+        );
+        let ConversationTimelineEvent::UtteranceFinalized {
+            finalization_reason,
+            ..
+        } = finalized[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            *finalization_reason,
+            UtteranceFinalizationReason::InactivityTimeout
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn utterance_timer_finalization_keeps_the_turn_open() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Pergunta.",
+            0,
+            1_000,
+        )));
+        advance_past_gap(ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms)
+            .await;
+
+        let events = sink_events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ConversationTimelineEvent::TurnFinalized { .. })),
+            "only the utterance closes on the timer; the turn stays open for further grouping"
+        );
+
+        let snapshot = timeline.snapshot();
+        assert_eq!(snapshot.turns.len(), 1);
+        assert!(snapshot.turns[0].finalized_at.is_none());
+        assert!(snapshot.utterances[0].finalized_at.is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn continuation_before_the_gap_prevents_early_finalization_and_the_stale_timer_is_a_noop()
+    {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+        let gap_ms = ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms;
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Me conta um caso real",
+            0,
+            1_000,
+        )));
+
+        // Continuação chega bem antes do gap expirar: reagenda o timer (via nova
+        // revisão), então o primeiro timer (agendado no ingest anterior) não deve
+        // finalizar nada quando expirar.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(500)).await;
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "em que você optou por usar monolito.",
+            1_500,
+            2_500,
+        )));
+
+        // Passa o instante em que o timer *original* (agendado em t=0) teria expirado,
+        // mas ainda não o suficiente para o timer *novo* (agendado em t=500ms).
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(gap_ms - 500 + 1)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            finalized_utterance_events(&sink_events.lock().unwrap()).len(),
+            0,
+            "stale timer from before the continuation must not finalize early"
+        );
+
+        // Agora deixa o timer novo (reagendado na continuação) expirar de verdade.
+        advance_past_gap(gap_ms).await;
+        let events = sink_events.lock().unwrap();
+        let finalized = finalized_utterance_events(&events);
+        assert_eq!(
+            finalized.len(),
+            1,
+            "exactly one finalization, from the rescheduled timer"
+        );
+        let ConversationTimelineEvent::UtteranceFinalized { utterance, .. } = finalized[0] else {
+            unreachable!()
+        };
+        assert!(
+            utterance.text.contains("Me conta") && utterance.text.contains("monolito"),
+            "the finalized utterance contains the full, joined speech: {:?}",
+            utterance.text
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn same_utterance_never_finalizes_twice_even_with_multiple_pending_timers() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+
+        // Dois segmentos próximos no tempo agendam dois timers para a mesma utterance
+        // (revisão 1 e revisão 2); só o timer da revisão mais recente deve produzir uma
+        // finalização quando expirar.
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Primeira parte.",
+            0,
+            500,
+        )));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Segunda parte.",
+            600,
+            900,
+        )));
+
+        advance_past_gap(ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms)
+            .await;
+
+        let events = sink_events.lock().unwrap();
+        assert_eq!(
+            finalized_utterance_events(&events).len(),
+            1,
+            "only the timer matching the current revision finalizes; the stale one is a no-op"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn two_consecutive_remote_utterances_each_finalize_independently_via_timer() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+        let gap_ms = ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms;
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Em qual situação você usaria monolitos?",
+            0,
+            1_000,
+        )));
+        advance_past_gap(gap_ms).await;
+        assert_eq!(
+            finalized_utterance_events(&sink_events.lock().unwrap()).len(),
+            1
+        );
+
+        // Sem flush, sem stop — só mais silêncio e uma nova fala no mesmo turno (o gap já
+        // estourou, então isso conta como uma nova utterance dentro do turno ainda aberto).
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Em qual situação você usaria microsserviços?",
+            gap_ms + 3_000,
+            gap_ms + 4_000,
+        )));
+        advance_past_gap(gap_ms).await;
+
+        let events = sink_events.lock().unwrap();
+        assert_eq!(
+            finalized_utterance_events(&events).len(),
+            2,
+            "each finalized utterance produced its own event, independently"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_timer_after_manual_flush_is_a_noop() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Pergunta.",
+            0,
+            1_000,
+        )));
+        // Flush finaliza a utterance (e o turno) por fora do timer.
+        let flush_events = timeline.flush();
+        assert_eq!(finalized_utterance_events(&flush_events).len(), 1);
+
+        // O timer que já estava agendado expira depois — não deve produzir uma segunda
+        // finalização para a mesma utterance.
+        advance_past_gap(ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms)
+            .await;
+        let events = sink_events.lock().unwrap();
+        assert_eq!(
+            finalized_utterance_events(&events).len(),
+            0,
+            "the timer that fires after a manual flush must be a no-op, not a duplicate"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_utterance_gap_ms_changes_how_long_the_timer_waits() {
+        let timeline = Arc::new(ConversationTimeline::default());
+        timeline.attach();
+        let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink_events_cb = sink_events.clone();
+        timeline.set_event_sink(Arc::new(move |events| {
+            sink_events_cb.lock().unwrap().extend(events);
+        }));
+
+        timeline.set_utterance_gap_ms(500);
+        assert_eq!(timeline.utterance_gap_ms(), 500);
+
+        timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
+            AudioSource::SystemOutput,
+            "Pergunta rápida.",
+            0,
+            200,
+        )));
+
+        // Bem menos que o gap padrão de 1800ms, mas mais que o novo gap de 500ms.
+        advance_past_gap(500).await;
+        let events = sink_events.lock().unwrap();
+        assert_eq!(
+            finalized_utterance_events(&events).len(),
+            1,
+            "the shorter, dev-configured gap was honored by the timer"
         );
     }
 }

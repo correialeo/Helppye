@@ -12,12 +12,16 @@ Fundação de áudio e transcrição local implementada. A captura de microfone,
 saída do sistema no Windows via WASAPI Loopback, o pipeline de VAD/segmentação e a
 transcrição local com Whisper Base Multilíngue já existem. A Conversation Timeline
 organiza transcrições em uma linha do tempo única preservando ordem, origem
-(usuário/outra pessoa) e timestamps. A camada atual em construção é a **sugestão de
-resposta em streaming** (`src-tauri/src/response_provider/`): turnos elegíveis da outra
-pessoa disparam geração de uma sugestão de resposta via LLM (Ollama/OpenAI/DeepSeek/
-Anthropic, escolhido pelo usuário), transmitida ao frontend em streaming. Substitui a
-antiga detecção de perguntas por regras, removida. Overlay de resposta dedicado (janela
-flutuante fora da timeline) ainda **não** está implementado.
+(usuário/outra pessoa) e timestamps. Um timer dedicado por utterance
+(`ConversationTimeline::reschedule_utterance_timer`) finaliza uma utterance só por
+silêncio (`same_speaker_utterance_gap_ms`), sem esperar um novo segmento, flush manual,
+parada de captura ou o timeout de inatividade do turno — a camada atual em construção é
+a **sugestão de resposta em streaming** (`src-tauri/src/response_provider/`): turnos
+elegíveis da outra pessoa disparam geração de uma sugestão de resposta via LLM (Ollama/
+OpenAI/DeepSeek/Anthropic, escolhido pelo usuário) automaticamente assim que essa
+utterance finaliza, transmitida ao frontend em streaming. Substitui a antiga detecção de
+perguntas por regras, removida. Overlay de resposta dedicado (janela flutuante fora da
+timeline) ainda **não** está implementado.
 
 ## Stack
 
@@ -130,22 +134,51 @@ de speaker/source, pausa/parada da captura, flush, encerramento de sessão,
 tolerados dentro de `out_of_order_tolerance_ms` (default inicial: 1000 ms), com warning;
 segmentos fora da tolerância não reabrem turnos já finalizados.
 
+**Fechamento de utterance é dirigido por timer, não só por segmento novo.** A avaliação
+de `same_speaker_utterance_gap_ms` descrita acima é reativa (compara o gap só quando um
+segmento novo chega) e sozinha não bastava: se a pessoa parar de falar e mais nada
+acontecer (nenhum segmento novo, sem flush, sem stop, sem fala do usuário), a utterance
+ficava aberta indefinidamente, e com ela a sugestão de resposta nunca disparava. Por
+isso, `ConversationTimeline` também mantém um timer assíncrono dedicado por utterance
+(`reschedule_utterance_timer`/`fire_utterance_timeout`, usando `tokio::time::sleep`):
+toda vez que um segmento novo abre ou estende a utterance aberta, o timer anterior é
+implicitamente descartado (comparação de `ConversationUtterance::revision`, incrementada
+a cada segmento anexado — nenhum `CancellationToken` explícito é necessário, já que o
+`Mutex` do assembler garante que um timer expirado e obsoleto só encontra um estado que
+não bate mais e vira no-op) e um novo timer de `same_speaker_utterance_gap_ms` é
+agendado. Se ele expirar sem que a utterance tenha mudado de revisão, ela finaliza
+sozinha (`UtteranceFinalizationReason::InactivityTimeout`) — **sem fechar o turno**, que
+continua aberto para agrupamento conversacional até seu próprio timeout (ainda avaliado
+só reativamente) ou outro evento de fechamento. `same_speaker_utterance_gap_ms` é
+configurável em runtime via `ConversationTimeline::set_utterance_gap_ms` (comandos
+`conversation_get_utterance_gap_ms_command`/`conversation_set_utterance_gap_ms_command`,
+expostos no frontend só em modo dev) para testar valores diferentes sem rebuild.
+
 Ao unir texto, a camada remove apenas espaços duplicados, adiciona um espaço entre
 trechos e preserva a pontuação produzida pelo transcritor. Não há correção semântica,
 reescrita, LLM, resumo ou troca de modelo nesta camada.
 
 Eventos emitidos via `conversation://timeline-event`:
 `utterance_started`/`utterance_updated`/`utterance_finalized` e
-`turn_started`/`turn_updated`/`turn_finalized`. A Timeline também expõe
-`conversation_timeline_snapshot_command` (snapshot com `turns` e `utterances`),
-`conversation_flush_turns_command`, `conversation_end_session_command` e
-`conversation_raw_segments_command`.
+`turn_started`/`turn_updated`/`turn_finalized`. `utterance_finalized` carrega, além da
+`ConversationUtterance` completa (que agora inclui `revision`): `finalization_reason`
+(`UtteranceFinalizationReason` — `inactivity_timeout`, `speaker_changed`,
+`source_changed`, `capture_stopped`, `manual_flush`, `session_ended`,
+`maximum_duration`), `gap_ms_used`, `silence_detected_ms` (quando mensurável) e
+`session_id`. A Timeline também expõe `conversation_timeline_snapshot_command` (snapshot
+com `turns` e `utterances`), `conversation_flush_turns_command`,
+`conversation_end_session_command` e `conversation_raw_segments_command`.
 
 Os timestamps dos segmentos são convertidos pelo `CaptureEngine` para um relógio
 monotônico comum do processo antes de entrar na fila de transcrição, para que falas de
 microfone e saída do sistema sejam comparáveis na mesma linha do tempo. O
 `ResponseEngine` (`response_provider::engine::process_conversation_events`) consome
-`ConversationTurn`, não `AudioFrame`, `AudioSegment` ou eventos brutos de transcrição.
+`ConversationTurn`, não `AudioFrame`, `AudioSegment` ou eventos brutos de transcrição —
+disparado tanto pela finalização reativa quanto pela finalização via timer, pelo mesmo
+caminho (`emit_conversation_events` + `process_conversation_events`, registrado como
+`ConversationEventSink` em `ConversationTimeline::set_event_sink` para o caso do timer,
+que não tem um chamador síncrono externo para fazer isso manualmente como os comandos
+Tauri fazem).
 
 ## Sugestão de resposta (`src-tauri/src/response_provider/`)
 
@@ -153,9 +186,14 @@ Substitui a antiga detecção local de perguntas por regras (`question_detection
 removida). Em vez de apenas sinalizar que um turno da outra pessoa parece uma pergunta,
 o `ResponseEngine` gera, via LLM e em streaming, uma sugestão real de resposta. Roda
 sobre o mesmo `ConversationTurn` elegível de antes (`speaker = OtherPerson`,
-`source = SystemOutput`), disparando geração em `UtteranceFinalized` (não é preciso
-esperar o turno inteiro terminar). Uma nova utterance no mesmo turno cancela e substitui
-a geração em andamento, para nunca sugerir resposta a uma fala que ainda não terminou.
+`source = SystemOutput`), disparando geração em `UtteranceFinalized` — que agora dispara
+de fato assim que a utterance finaliza por silêncio (via o timer dedicado descrito
+acima), sem depender de flush, stop, fim de turno ou fala do usuário. Uma nova utterance
+no mesmo turno cancela e substitui a geração em andamento, para nunca sugerir resposta a
+uma fala que ainda não terminou; `ResponseEngine::finish_generation` roda em todo caminho
+de saída (completo, skip, erro ou cancelamento) e sempre libera o slot de geração daquele
+turno, para que uma geração seguinte nunca veja um estado "fantasma" de uma anterior já
+encerrada.
 
 O usuário escolhe o provedor de LLM: Ollama local (padrão) ou um provedor de nuvem
 (OpenAI, DeepSeek, Anthropic). A mesma chamada que gera a resposta também decide se deve
@@ -164,8 +202,26 @@ responder, via um marcador `[SKIP]` no início do stream quando a fala não exig
 keychain do SO via crate `keyring`, nunca em texto puro no disco. Eventos emitidos via
 `response://suggestion-event`: `started`, `delta`, `completed`, `skipped`, `cancelled` e
 `error`, todos carregando `turn_id` e `generation_id` para o frontend descartar eventos
-de uma geração já superada. Ver `docs/response-suggestion.md` para a arquitetura
-completa, módulo por módulo.
+de uma geração já superada, além de `diagnostics` (ver abaixo). Ver
+`docs/response-suggestion.md` para a arquitetura completa, módulo por módulo, e
+`docs/session-experience.md` para o comportamento fim a fim durante uma sessão ao vivo.
+
+**Latência.** Contexto deliberadamente pequeno (`response_context_turns` = 4 turnos,
+`maximum_context_characters` = 5000, `maximum_response_tokens` = 160,
+`temperature` = 0.2, ver `context.rs`). O provider Ollama reutiliza uma única instância
+de `reqwest::Client` (reconstruída só quando a configuração muda, nunca por chamada),
+envia `keep_alive` configurável (`ResponseProviderConfig::ollama_keep_alive`, default
+`10m`) para o Ollama não descarregar o modelo entre chamadas, e desliga o modo de
+raciocínio estendido (`"think": false`) para modelos híbridos como o Qwen3, em vez de
+depender de parsing de tags de pensamento. Cada geração emite um evento `diagnostics`
+(`GenerationDiagnostics`) com o contexto do disparo (`finalization_reason`,
+`gap_ms_used`, `silence_detected_ms`) e latências medidas com relógio monotônico
+(`Instant`, não epoch): `utterance_finalized_to_request_started_ms` (meta de engenharia:
+< 100 ms — mede diretamente o atraso de disparo),
+`request_to_first_http_chunk_ms`/`request_to_first_visible_token_ms` (o segundo distingue
+o primeiro chunk HTTP bruto do primeiro texto que o `SkipDetector` de fato libera) e
+`end_of_speech_to_first_visible_token_ms` (métrica principal de UX: silêncio → resposta
+visível).
 
 ## Relação com o Meetily
 

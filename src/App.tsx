@@ -294,7 +294,17 @@ interface ConversationUtterance {
   started_at: number;
   ended_at: number;
   finalized_at: number | null;
+  revision: number;
 }
+
+type UtteranceFinalizationReason =
+  | "inactivity_timeout"
+  | "speaker_changed"
+  | "source_changed"
+  | "capture_stopped"
+  | "manual_flush"
+  | "session_ended"
+  | "maximum_duration";
 
 interface ConversationTimelineSnapshot {
   turns: ConversationTurn[];
@@ -324,7 +334,15 @@ type ConversationTimelineEvent =
       ended_at: number;
       segments: number[];
     }
-  | { type: "utterance_finalized"; turn_id: number; utterance: ConversationUtterance };
+  | {
+      type: "utterance_finalized";
+      turn_id: number;
+      utterance: ConversationUtterance;
+      finalization_reason: UtteranceFinalizationReason;
+      gap_ms_used: number;
+      silence_detected_ms: number | null;
+      session_id: number;
+    };
 
 type ResponseProviderKind = "ollama" | "open_ai" | "deep_seek" | "anthropic";
 
@@ -332,6 +350,7 @@ interface ResponseProviderStatus {
   provider: ResponseProviderKind;
   model: string;
   base_url: string | null;
+  ollama_keep_alive: string | null;
   requires_api_key: boolean;
   has_api_key: boolean;
 }
@@ -645,6 +664,8 @@ function sortUtterances(utterances: ConversationUtterance[]): ConversationUttera
 
 function suggestionStatusLabel(status: SuggestionState["status"]): string {
   switch (status) {
+    case "preparing":
+      return "Analisando fala...";
     case "streaming":
       return "Gerando sugestão de resposta...";
     case "completed_with_text":
@@ -726,6 +747,7 @@ function ConversationTimelineView() {
             started_at: payload.started_at,
             ended_at: payload.started_at,
             finalized_at: null,
+            revision: 1,
           };
           const withoutDuplicate = current.filter((utterance) => utterance.id !== nextUtterance.id);
           return sortUtterances([...withoutDuplicate, nextUtterance]);
@@ -745,6 +767,7 @@ function ConversationTimelineView() {
             started_at: existing?.started_at ?? payload.started_at,
             ended_at: payload.ended_at,
             finalized_at: existing?.finalized_at ?? null,
+            revision: existing?.revision ?? 1,
           };
           const withoutDuplicate = current.filter((utterance) => utterance.id !== nextUtterance.id);
           return sortUtterances([...withoutDuplicate, nextUtterance]);
@@ -812,20 +835,38 @@ function ConversationTimelineView() {
                         <p className="mt-1 font-mono">{utterance.segments.join(", ")}</p>
                       </details>
                     )}
-                    {suggestion && (
-                      <div className="mt-2 rounded border border-indigo-800 bg-indigo-950/25 p-2">
-                        <p className="text-xs font-medium text-indigo-300">
-                          {suggestionStatusLabel(suggestion.status)}
-                        </p>
-                        {(suggestion.status === "streaming" || suggestion.status === "completed_with_text") &&
-                          suggestion.text && (
-                            <p className="mt-1 whitespace-pre-wrap text-sm text-neutral-100">{suggestion.text}</p>
+                    {suggestion && (() => {
+                      // Enquanto a geração atual ainda não tem texto próprio, mostra a
+                      // última sugestão concluída (se houver) em vez de deixar o painel
+                      // vazio — ver `applyResponseSuggestionEvent` em
+                      // `responseSuggestionViewModel.ts`.
+                      const isActive = suggestion.status === "preparing" || suggestion.status === "streaming";
+                      const displayText = suggestion.text || suggestion.previousText;
+                      const label = suggestion.text
+                        ? suggestionStatusLabel(suggestion.status)
+                        : suggestion.previousText
+                          ? isActive
+                            ? "Preparando nova sugestão..."
+                            : `${suggestionStatusLabel(suggestion.status)} (mantendo sugestão anterior)`
+                          : suggestionStatusLabel(suggestion.status);
+                      return (
+                        <div className="mt-2 rounded border border-indigo-800 bg-indigo-950/25 p-2">
+                          <p className="text-xs font-medium text-indigo-300">{label}</p>
+                          {displayText && (
+                            <p
+                              className={`mt-1 whitespace-pre-wrap text-sm ${
+                                suggestion.text ? "text-neutral-100" : "text-neutral-400"
+                              }`}
+                            >
+                              {displayText}
+                            </p>
                           )}
-                        {suggestion.status === "error" && suggestion.errorMessage && (
-                          <p className="mt-1 text-xs text-red-400">{suggestion.errorMessage}</p>
-                        )}
-                      </div>
-                    )}
+                          {suggestion.status === "error" && suggestion.errorMessage && (
+                            <p className="mt-1 text-xs text-red-400">{suggestion.errorMessage}</p>
+                          )}
+                        </div>
+                      );
+                    })()}
                   </div>
                 </li>
               );
@@ -886,6 +927,22 @@ function ConversationTimelineView() {
                 <p>final_text_length: {diagnostics.final_text_length}</p>
                 <p className="font-semibold text-indigo-300">event_emitted: {diagnostics.event_emitted}</p>
                 <p>raw_prefix: {diagnostics.raw_prefix || "—"}</p>
+                <p className="mt-1 border-t border-neutral-800 pt-1 text-neutral-400">
+                  finalization_reason: {diagnostics.finalization_reason || "—"} · gap_ms_used:{" "}
+                  {diagnostics.gap_ms_used} · silence_detected_ms: {diagnostics.silence_detected_ms ?? "—"}
+                </p>
+                <p>
+                  utterance_finalized_to_request_started_ms:{" "}
+                  {diagnostics.utterance_finalized_to_request_started_ms ?? "—"}
+                </p>
+                <p>request_to_first_http_chunk_ms: {diagnostics.request_to_first_http_chunk_ms ?? "—"}</p>
+                <p>
+                  request_to_first_visible_token_ms: {diagnostics.request_to_first_visible_token_ms ?? "—"}
+                </p>
+                <p className="font-semibold text-emerald-400">
+                  end_of_speech_to_first_visible_token_ms:{" "}
+                  {diagnostics.end_of_speech_to_first_visible_token_ms ?? "—"}
+                </p>
               </div>
             ))}
           </div>
@@ -1003,6 +1060,7 @@ function ResponseProviderSettings() {
   const [provider, setProvider] = useState<ResponseProviderKind>("ollama");
   const [model, setModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
+  const [ollamaKeepAlive, setOllamaKeepAlive] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1014,6 +1072,7 @@ function ResponseProviderSettings() {
         setProvider(s.provider);
         setModel(s.model);
         setBaseUrl(s.base_url ?? "");
+        setOllamaKeepAlive(s.ollama_keep_alive ?? "");
         setError(null);
       })
       .catch((e) => setError(String(e)));
@@ -1031,6 +1090,7 @@ function ResponseProviderSettings() {
         provider,
         model,
         baseUrl: baseUrl.trim().length > 0 ? baseUrl.trim() : null,
+        ollamaKeepAlive: ollamaKeepAlive.trim().length > 0 ? ollamaKeepAlive.trim() : null,
       });
       setMessage("Configuração salva.");
       refreshStatus();
@@ -1109,6 +1169,19 @@ function ResponseProviderSettings() {
           />
         </label>
 
+        {provider === "ollama" && (
+          <label className="text-xs text-neutral-400">
+            Ollama keep_alive (opcional)
+            <input
+              type="text"
+              value={ollamaKeepAlive}
+              onChange={(e) => setOllamaKeepAlive(e.target.value)}
+              placeholder="ex.: 10m — mantém o modelo carregado entre chamadas"
+              className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-sm text-neutral-200"
+            />
+          </label>
+        )}
+
         <button
           type="button"
           onClick={saveConfig}
@@ -1159,6 +1232,70 @@ function ResponseProviderSettings() {
   );
 }
 
+/// Painel de dev para testar `same_speaker_utterance_gap_ms` sem rebuild — só renderiza em
+/// `import.meta.env.DEV` (mesmo padrão de `showSegments` em `ConversationTimelineView`).
+/// Ver `docs/response-suggestion.md` para o efeito de cada valor no disparo da geração.
+const UTTERANCE_GAP_PRESETS_MS = [1200, 1500, 1800, 2200];
+
+function UtteranceGapDevControl() {
+  const [gapMs, setGapMs] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    invoke<number>("conversation_get_utterance_gap_ms_command")
+      .then((ms) => {
+        setGapMs(ms);
+        setError(null);
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  const apply = async (ms: number) => {
+    try {
+      await invoke("conversation_set_utterance_gap_ms_command", { gapMs: ms });
+      setGapMs(ms);
+      setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  return (
+    <details className="w-full max-w-md rounded-lg border border-neutral-800 p-4 text-left">
+      <summary className="cursor-pointer text-sm font-medium text-neutral-300">
+        Dev → same_speaker_utterance_gap_ms
+      </summary>
+      <div className="mt-3 flex flex-col gap-2">
+        <p className="text-xs text-neutral-500">
+          Atual: {gapMs === null ? "..." : `${gapMs} ms`}. Valores baixos disparam sugestão mais rápido, mas
+          arriscam responder no meio de uma pergunta ainda incompleta.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          {UTTERANCE_GAP_PRESETS_MS.map((ms) => (
+            <button
+              key={ms}
+              type="button"
+              onClick={() => apply(ms)}
+              className={`rounded border px-3 py-1 text-xs font-medium ${
+                gapMs === ms
+                  ? "border-indigo-500 bg-indigo-950/40 text-indigo-300"
+                  : "border-neutral-700 text-neutral-300 hover:bg-neutral-800"
+              }`}
+            >
+              {ms} ms
+            </button>
+          ))}
+        </div>
+        {error && <p className="text-xs text-red-400">{error}</p>}
+      </div>
+    </details>
+  );
+}
+
 export default function App() {
   return (
     <ModelOnboardingGate>
@@ -1168,6 +1305,7 @@ export default function App() {
 
         <AdvancedTranscriptionSettings />
         <ResponseProviderSettings />
+        {import.meta.env.DEV && <UtteranceGapDevControl />}
 
         <AudioCaptureSection />
         <ConversationTimelineView />

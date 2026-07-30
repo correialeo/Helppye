@@ -14,28 +14,34 @@ Audio capture and local transcription foundations implemented:
 - Local Whisper transcription through `whisper-rs`.
 - Guided download/verification default Whisper Base Multilingual model.
 - Conversation Timeline utterance/turn assembly preserving source, speaker role,
-  timestamps, utterance IDs, segment IDs, and diagnostics.
-- Rule-based local question detection for `OtherPerson` turns from system output,
-  with candidate/updated/confirmed/dismissed frontend events and visual highlight.
+  timestamps, utterance IDs, segment IDs, and diagnostics. A dedicated per-utterance
+  timer finalizes an utterance on silence alone (`same_speaker_utterance_gap_ms`,
+  default 1800ms) — it does not wait for the next segment, a flush, or capture to stop.
+- Streaming response suggestion: an eligible utterance from the other person
+  (`speaker = OtherPerson`, `source = SystemOutput`) automatically triggers an LLM call
+  (Ollama local by default, or a user-chosen cloud provider) that streams a suggested
+  reply — or a `[SKIP]` marker when the speech doesn't need one — back to the frontend.
+  See `docs/response-suggestion.md`.
 
-Answer overlay, Ollama integration, and persistent conversation history are not
-implemented yet.
+Answer overlay (a floating window outside the timeline) and persistent conversation
+history (SQLite) are not implemented yet.
 
 ## Stack
 
 - Tauri 2, stable Rust, Tokio
 - React 18, TypeScript (strict), Vite, Tailwind CSS, Zustand
 - `whisper-rs` / whisper.cpp local speech-to-text
-- Ollama and SQLite planned, not implemented yet
+- Ollama (default) or OpenAI/DeepSeek/Anthropic (opt-in) for response suggestion
+- SQLite planned, not implemented yet
 - `tracing` structured logging
 
 ## Layout
 
 - `src/` — React/TypeScript frontend
 - `src-tauri/` — Rust core (Tauri commands, audio pipeline, transcription,
-  model manager, conversation timeline, question detection)
+  model manager, conversation timeline, response suggestion)
 - `docs/` — architecture audit, design notes, roadmap, including
-  `docs/question-detection.md`
+  `docs/response-suggestion.md` and `docs/session-experience.md`
 - `prompts/` — LLM prompt templates (added in Ollama integration phase)
 - `tests/` — cross-cutting/integration tests; Rust unit tests live alongside
   modules under `src-tauri/src`

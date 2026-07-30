@@ -22,6 +22,10 @@ impl ResponseProviderKind {
     }
 }
 
+fn default_ollama_keep_alive() -> Option<String> {
+    Some(crate::response_provider::ollama::DEFAULT_KEEP_ALIVE.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseProviderConfig {
     pub provider: ResponseProviderKind,
@@ -29,6 +33,13 @@ pub struct ResponseProviderConfig {
     /// Override de endpoint (host do Ollama, proxy compatível com a API da OpenAI, etc.).
     /// `None` usa o padrão de cada provedor.
     pub base_url: Option<String>,
+    /// Só usado pelo provider Ollama (`ResponseProviderKind::Ollama`) — quanto tempo o
+    /// Ollama mantém o modelo carregado depois de uma chamada, para evitar pagar o custo
+    /// de recarregá-lo na chamada seguinte (ver `ollama::DEFAULT_KEEP_ALIVE`). `None`
+    /// deixa a critério do padrão do próprio Ollama. `#[serde(default = ...)]` para que
+    /// arquivos de configuração salvos antes deste campo existir continuem carregando.
+    #[serde(default = "default_ollama_keep_alive")]
+    pub ollama_keep_alive: Option<String>,
 }
 
 impl Default for ResponseProviderConfig {
@@ -37,6 +48,7 @@ impl Default for ResponseProviderConfig {
             provider: ResponseProviderKind::Ollama,
             model: "llama3.1".to_string(),
             base_url: None,
+            ollama_keep_alive: default_ollama_keep_alive(),
         }
     }
 }
@@ -105,10 +117,25 @@ mod tests {
             provider: ResponseProviderKind::Anthropic,
             model: "claude-sonnet".to_string(),
             base_url: Some("https://example.com".to_string()),
+            ollama_keep_alive: Some("5m".to_string()),
         };
 
         save(&path, &config).unwrap();
         assert_eq!(load(&path), config);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn config_missing_keep_alive_field_falls_back_to_default() {
+        let path = temp_config_path("missing-keep-alive-field");
+        std::fs::write(
+            &path,
+            r#"{"provider":"ollama","model":"llama3.1","base_url":null}"#,
+        )
+        .unwrap();
+
+        let config = load(&path);
+        assert_eq!(config.ollama_keep_alive, default_ollama_keep_alive());
         std::fs::remove_file(&path).ok();
     }
 }

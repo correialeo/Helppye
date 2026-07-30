@@ -16,14 +16,58 @@ function run(name: string, fn: () => void): void {
   console.log(`ok: ${name}`);
 }
 
-run("started resets state for the turn", () => {
+run("started resets text but keeps the previous completed answer visible", () => {
   const state = applyResponseSuggestionEvent(
     { 1: { generationId: 3, status: "completed_with_text", text: "old" } },
     { type: "started", turn_id: 1, generation_id: 4 },
   );
   assert(state[1]!.generationId === 4, "generation id updated");
-  assert(state[1]!.status === "streaming", "status is streaming");
-  assert(state[1]!.text === "", "text reset");
+  assert(state[1]!.status === "preparing", "status is preparing, not streaming, before any delta");
+  assert(state[1]!.text === "", "text reset for the new generation");
+  assert(state[1]!.previousText === "old", "previous completed answer kept for display");
+});
+
+run("first delta with content clears previousText and switches to streaming", () => {
+  let state: Record<number, SuggestionState> = {
+    1: { generationId: 3, status: "completed_with_text", text: "old" },
+  };
+  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 4 });
+  assert(state[1]!.previousText === "old", "previousText present while preparing");
+  state = applyResponseSuggestionEvent(state, {
+    type: "delta",
+    turn_id: 1,
+    generation_id: 4,
+    text: "novo",
+  });
+  assert(state[1]!.status === "streaming", "status streaming after first delta");
+  assert(state[1]!.text === "novo", "new text accumulating");
+  assert(state[1]!.previousText === undefined, "previousText cleared once real content arrives");
+});
+
+run("a generation that ends up skipped keeps the previous completed answer visible", () => {
+  let state: Record<number, SuggestionState> = {
+    1: { generationId: 1, status: "completed_with_text", text: "resposta anterior" },
+  };
+  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 2 });
+  state = applyResponseSuggestionEvent(state, { type: "skipped", turn_id: 1, generation_id: 2 });
+  assert(state[1]!.status === "skipped", "status reflects the new generation's outcome");
+  assert(state[1]!.previousText === "resposta anterior", "previous answer still available for the UI to fall back to");
+});
+
+run("a generation that completes with text clears any stale previousText", () => {
+  let state: Record<number, SuggestionState> = {
+    1: { generationId: 1, status: "completed_with_text", text: "resposta antiga" },
+  };
+  state = applyResponseSuggestionEvent(state, { type: "started", turn_id: 1, generation_id: 2 });
+  state = applyResponseSuggestionEvent(state, {
+    type: "completed",
+    turn_id: 1,
+    generation_id: 2,
+    text: "resposta nova",
+  });
+  assert(state[1]!.status === "completed_with_text", "status completed_with_text");
+  assert(state[1]!.text === "resposta nova", "text is the new completed text");
+  assert(state[1]!.previousText === undefined, "no stale previousText once a real completion lands");
 });
 
 run("delta appends text for the current generation", () => {
@@ -133,7 +177,7 @@ run("events for a different turn do not affect other turns", () => {
     generation_id: 1,
   });
   assert(state[1]!.status === "cancelled", "turn 1 cancelled");
-  assert(state[2]!.status === "streaming", "turn 2 unaffected");
+  assert(state[2]!.status === "preparing", "turn 2 unaffected");
 });
 
 run("diagnostics event does not affect visible suggestion state", () => {
@@ -194,4 +238,40 @@ run("applyResponseSuggestionDiagnostics fills missing optional fields with defau
   assert(entry.http_status === null, "missing http_status defaults to null");
   assert(entry.raw_prefix === "", "missing raw_prefix defaults to empty string");
   assert(entry.skip_detected === false, "missing skip_detected defaults to false");
+  assert(entry.finalization_reason === "", "missing finalization_reason defaults to empty string");
+  assert(entry.gap_ms_used === 0, "missing gap_ms_used defaults to 0");
+  assert(entry.silence_detected_ms === null, "missing silence_detected_ms defaults to null");
+  assert(
+    entry.end_of_speech_to_first_visible_token_ms === null,
+    "missing end_of_speech_to_first_visible_token_ms defaults to null",
+  );
+});
+
+run("applyResponseSuggestionDiagnostics records the new latency and trigger fields", () => {
+  let diagnostics: Record<number, ResponseSuggestionDiagnostics> = {};
+  diagnostics = applyResponseSuggestionDiagnostics(diagnostics, {
+    type: "diagnostics",
+    turn_id: 1,
+    generation_id: 1,
+    finalization_reason: "inactivity_timeout",
+    gap_ms_used: 1800,
+    silence_detected_ms: 1800,
+    utterance_finalized_to_request_started_ms: 12,
+    request_to_first_http_chunk_ms: 4200,
+    request_to_first_visible_token_ms: 4210,
+    end_of_speech_to_first_visible_token_ms: 4222,
+  });
+
+  const entry = diagnostics[1]!;
+  assert(entry.finalization_reason === "inactivity_timeout", "finalization_reason recorded");
+  assert(entry.gap_ms_used === 1800, "gap_ms_used recorded");
+  assert(entry.silence_detected_ms === 1800, "silence_detected_ms recorded");
+  assert(
+    entry.utterance_finalized_to_request_started_ms === 12,
+    "utterance_finalized_to_request_started_ms recorded",
+  );
+  assert(
+    entry.end_of_speech_to_first_visible_token_ms === 4222,
+    "end_of_speech_to_first_visible_token_ms recorded",
+  );
 });

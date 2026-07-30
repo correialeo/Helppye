@@ -85,6 +85,7 @@ impl ResponseProvider for OpenAiCompatibleProvider {
             "model": self.model,
             "messages": request.messages.iter().map(to_chat_json).collect::<Vec<_>>(),
             "max_tokens": request.max_output_tokens,
+            "temperature": request.temperature,
             "stream": true,
         });
 

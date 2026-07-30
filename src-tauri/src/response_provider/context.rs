@@ -7,9 +7,16 @@ use crate::conversation::{ConversationSpeaker, ConversationTurn};
 
 use super::provider::{ResponseMessage, ResponseRequest, ResponseRole};
 
-const MAX_HISTORY_TURNS: usize = 6;
-const MAX_HISTORY_CHARS: usize = 6_000;
-const MAX_OUTPUT_TOKENS: u32 = 300;
+// Teto de contexto e de saída deliberadamente pequeno (ver `docs/response-suggestion.md`,
+// seção de latência): menos tokens de entrada e saída significam menos tempo de
+// prefill/decode no provedor, sem depender de nenhuma otimização de infraestrutura.
+const MAX_HISTORY_TURNS: usize = 4;
+const MAX_HISTORY_CHARS: usize = 5_000;
+const MAX_OUTPUT_TOKENS: u32 = 160;
+/// Baixa de propósito: sugestão de resposta em reunião ao vivo quer a resposta mais
+/// provável e direta, não variedade criativa — determinismo também ajuda a manter a
+/// latência estável entre chamadas.
+const TEMPERATURE: f32 = 0.2;
 
 const SYSTEM_PROMPT: &str = "Você é um copiloto que ajuda o usuário durante uma reunião ao vivo. \
 Você recebe o histórico recente da conversa e a fala mais recente da outra pessoa. \
@@ -74,6 +81,7 @@ pub fn build_request(history: &[ConversationTurn], current: &ConversationTurn) -
     ResponseRequest {
         messages,
         max_output_tokens: MAX_OUTPUT_TOKENS,
+        temperature: TEMPERATURE,
     }
 }
 

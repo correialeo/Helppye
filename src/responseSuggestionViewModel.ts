@@ -26,9 +26,17 @@ export interface ResponseSuggestionEventRef {
   latency_ms?: number;
   final_text_length?: number;
   event_emitted?: string;
+  finalization_reason?: string;
+  gap_ms_used?: number;
+  silence_detected_ms?: number | null;
+  utterance_finalized_to_request_started_ms?: number | null;
+  request_to_first_http_chunk_ms?: number | null;
+  request_to_first_visible_token_ms?: number | null;
+  end_of_speech_to_first_visible_token_ms?: number | null;
 }
 
 export type SuggestionStatus =
+  | "preparing"
   | "streaming"
   | "completed_with_text"
   | "completed_empty"
@@ -40,6 +48,15 @@ export interface SuggestionState {
   generationId: number;
   status: SuggestionStatus;
   text: string;
+  /**
+   * Texto da última sugestão com conteúdo (`completed_with_text`) para este turno, mantido
+   * enquanto a geração seguinte ainda não produziu nenhum delta visível. Sem isso, o evento
+   * `started` da nova geração apagaria a sugestão anterior da tela instantaneamente — a
+   * pessoa continuar/mudar de assunto não deveria fazer a resposta útil já mostrada
+   * desaparecer antes que exista algo melhor para colocar no lugar (ver
+   * `docs/response-suggestion.md`, "continuação da fala da outra pessoa").
+   */
+  previousText?: string;
   errorMessage?: string;
 }
 
@@ -51,15 +68,27 @@ export interface SuggestionState {
  * `completed` é dividido em `completed_with_text`/`completed_empty` conforme o texto final:
  * antes disso, uma resposta vazia e um skip pareciam estados diferentes na origem mas nada
  * garantia que a UI os distinguisse — agora ambos carregam um status próprio.
+ *
+ * `started` não apaga o texto de uma geração anterior concluída — ele fica em
+ * `previousText` (status `preparing`) até o primeiro `delta` com conteúdo real da nova
+ * geração chegar, quando finalmente substitui o que estava na tela.
  */
 export function applyResponseSuggestionEvent(
   current: Record<number, SuggestionState>,
   event: ResponseSuggestionEventRef,
 ): Record<number, SuggestionState> {
   if (event.type === "started") {
+    const existing = current[event.turn_id];
+    const previousText =
+      existing?.status === "completed_with_text" ? existing.text : existing?.previousText;
     return {
       ...current,
-      [event.turn_id]: { generationId: event.generation_id, status: "streaming", text: "" },
+      [event.turn_id]: {
+        generationId: event.generation_id,
+        status: "preparing",
+        text: "",
+        previousText,
+      },
     };
   }
 
@@ -69,15 +98,23 @@ export function applyResponseSuggestionEvent(
   }
 
   switch (event.type) {
-    case "delta":
+    case "delta": {
+      const text = existing.text + (event.text ?? "");
+      // Primeiro delta com conteúdo real: a nova geração já tem algo para mostrar, então a
+      // resposta anterior pode finalmente sair de cena.
+      const previousText = text.length > 0 ? undefined : existing.previousText;
       return {
         ...current,
-        [event.turn_id]: { ...existing, text: existing.text + (event.text ?? "") },
+        [event.turn_id]: { ...existing, status: "streaming", text, previousText },
       };
+    }
     case "completed": {
       const text = event.text ?? existing.text;
       const status: SuggestionStatus = text.trim().length > 0 ? "completed_with_text" : "completed_empty";
-      return { ...current, [event.turn_id]: { ...existing, status, text } };
+      // Se esta geração terminou sem conteúdo (skip/vazia/erro/cancelada mais adiante),
+      // `previousText` continua disponível pra UI não regredir para "nenhuma sugestão".
+      const previousText = status === "completed_with_text" ? undefined : existing.previousText;
+      return { ...current, [event.turn_id]: { ...existing, status, text, previousText } };
     }
     case "skipped":
       return { ...current, [event.turn_id]: { ...existing, status: "skipped" } };
@@ -107,6 +144,13 @@ export interface ResponseSuggestionDiagnostics {
   latency_ms: number;
   final_text_length: number;
   event_emitted: string;
+  finalization_reason: string;
+  gap_ms_used: number;
+  silence_detected_ms: number | null;
+  utterance_finalized_to_request_started_ms: number | null;
+  request_to_first_http_chunk_ms: number | null;
+  request_to_first_visible_token_ms: number | null;
+  end_of_speech_to_first_visible_token_ms: number | null;
 }
 
 /**
@@ -137,6 +181,15 @@ export function applyResponseSuggestionDiagnostics(
       latency_ms: event.latency_ms ?? 0,
       final_text_length: event.final_text_length ?? 0,
       event_emitted: event.event_emitted ?? "",
+      finalization_reason: event.finalization_reason ?? "",
+      gap_ms_used: event.gap_ms_used ?? 0,
+      silence_detected_ms: event.silence_detected_ms ?? null,
+      utterance_finalized_to_request_started_ms:
+        event.utterance_finalized_to_request_started_ms ?? null,
+      request_to_first_http_chunk_ms: event.request_to_first_http_chunk_ms ?? null,
+      request_to_first_visible_token_ms: event.request_to_first_visible_token_ms ?? null,
+      end_of_speech_to_first_visible_token_ms:
+        event.end_of_speech_to_first_visible_token_ms ?? null,
     },
   };
 }
