@@ -9,7 +9,7 @@ use serde::Deserialize;
 use super::net::{line_stream, sse_data_payloads};
 use super::provider::{
     ResponseChunk, ResponseMessage, ResponseProvider, ResponseProviderError, ResponseRequest,
-    ResponseRole, ResponseStream,
+    ResponseRole, ResponseStream, ResponseStreamMeta,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -84,7 +84,7 @@ impl ResponseProvider for AnthropicProvider {
     async fn stream_reply(
         &self,
         request: ResponseRequest,
-    ) -> Result<ResponseStream, ResponseProviderError> {
+    ) -> Result<(ResponseStream, ResponseStreamMeta), ResponseProviderError> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let (system, chat_messages) = split_messages(&request.messages);
         let mut body = serde_json::json!({
@@ -113,10 +113,13 @@ impl ResponseProvider for AnthropicProvider {
             return Err(ResponseProviderError::Provider(format!("{status}: {text}")));
         }
 
+        let meta = ResponseStreamMeta {
+            http_status: response.status().as_u16(),
+        };
         let bytes = response.bytes_stream().boxed();
         let payloads = sse_data_payloads(line_stream(bytes));
 
-        Ok(Box::pin(payloads.filter_map(|payload| async move {
+        let stream: ResponseStream = Box::pin(payloads.filter_map(|payload| async move {
             let payload = match payload {
                 Ok(p) => p,
                 Err(e) => return Some(Err(ResponseProviderError::Network(e.to_string()))),
@@ -147,6 +150,8 @@ impl ResponseProvider for AnthropicProvider {
                 }
                 AnthropicEvent::Other => None,
             }
-        })))
+        }));
+
+        Ok((stream, meta))
     }
 }

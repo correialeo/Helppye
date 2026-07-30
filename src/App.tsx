@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  applyResponseSuggestionDiagnostics,
   applyResponseSuggestionEvent,
+  type ResponseSuggestionDiagnostics,
   type ResponseSuggestionEventRef,
   type SuggestionState,
 } from "./responseSuggestionViewModel";
@@ -645,8 +647,10 @@ function suggestionStatusLabel(status: SuggestionState["status"]): string {
   switch (status) {
     case "streaming":
       return "Gerando sugestão de resposta...";
-    case "completed":
+    case "completed_with_text":
       return "Sugestão de resposta";
+    case "completed_empty":
+      return "Resposta gerada veio vazia";
     case "skipped":
       return "Nenhuma resposta sugerida";
     case "cancelled":
@@ -656,10 +660,19 @@ function suggestionStatusLabel(status: SuggestionState["status"]): string {
   }
 }
 
+function sortSuggestionDiagnostics(
+  diagnostics: Record<number, ResponseSuggestionDiagnostics>,
+): ResponseSuggestionDiagnostics[] {
+  return Object.values(diagnostics).sort((a, b) => a.turn_id - b.turn_id);
+}
+
 function ConversationTimelineView() {
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [utterances, setUtterances] = useState<ConversationUtterance[]>([]);
   const [suggestions, setSuggestions] = useState<Record<number, SuggestionState>>({});
+  const [suggestionDiagnostics, setSuggestionDiagnostics] = useState<
+    Record<number, ResponseSuggestionDiagnostics>
+  >({});
   const [error, setError] = useState<string | null>(null);
   const showSegments = import.meta.env.DEV;
 
@@ -752,6 +765,7 @@ function ConversationTimelineView() {
   useEffect(() => {
     const unlisten = listen<ResponseSuggestionEventRef>("response://suggestion-event", (event) => {
       setSuggestions((current) => applyResponseSuggestionEvent(current, event.payload));
+      setSuggestionDiagnostics((current) => applyResponseSuggestionDiagnostics(current, event.payload));
     });
     return () => {
       unlisten.then((fn) => fn());
@@ -803,7 +817,7 @@ function ConversationTimelineView() {
                         <p className="text-xs font-medium text-indigo-300">
                           {suggestionStatusLabel(suggestion.status)}
                         </p>
-                        {(suggestion.status === "streaming" || suggestion.status === "completed") &&
+                        {(suggestion.status === "streaming" || suggestion.status === "completed_with_text") &&
                           suggestion.text && (
                             <p className="mt-1 whitespace-pre-wrap text-sm text-neutral-100">{suggestion.text}</p>
                           )}
@@ -841,6 +855,37 @@ function ConversationTimelineView() {
                     );
                   })}
                 </div>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      {showSegments && Object.keys(suggestionDiagnostics).length > 0 && (
+        <details className="border-t border-neutral-800 pt-3 text-xs text-neutral-500" open>
+          <summary className="cursor-pointer">Diagnóstico de sugestão de resposta</summary>
+          <div className="mt-3 flex flex-col gap-2">
+            {sortSuggestionDiagnostics(suggestionDiagnostics).map((diagnostics) => (
+              <div
+                key={diagnostics.turn_id}
+                className="rounded border border-neutral-800 p-2 font-mono"
+              >
+                <p className="font-medium text-neutral-300">
+                  Turno {diagnostics.turn_id} · geração {diagnostics.generation_id}
+                </p>
+                <p>provider: {diagnostics.provider} · model: {diagnostics.model}</p>
+                <p>
+                  http_status: {diagnostics.http_status ?? "—"} · latency_ms: {diagnostics.latency_ms}
+                </p>
+                <p>
+                  request_started: {diagnostics.request_started} · first_chunk_received:{" "}
+                  {diagnostics.first_chunk_received ?? "—"}
+                </p>
+                <p>skip_detected: {String(diagnostics.skip_detected)}</p>
+                <p>cancel_reason: {diagnostics.cancel_reason ?? "—"}</p>
+                <p>final_text_length: {diagnostics.final_text_length}</p>
+                <p className="font-semibold text-indigo-300">event_emitted: {diagnostics.event_emitted}</p>
+                <p>raw_prefix: {diagnostics.raw_prefix || "—"}</p>
               </div>
             ))}
           </div>

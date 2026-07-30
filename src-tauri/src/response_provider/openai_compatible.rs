@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::net::{line_stream, sse_data_payloads};
 use super::provider::{
     to_chat_json, ResponseChunk, ResponseProvider, ResponseProviderError, ResponseRequest,
-    ResponseStream,
+    ResponseStream, ResponseStreamMeta,
 };
 
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -79,7 +79,7 @@ impl ResponseProvider for OpenAiCompatibleProvider {
     async fn stream_reply(
         &self,
         request: ResponseRequest,
-    ) -> Result<ResponseStream, ResponseProviderError> {
+    ) -> Result<(ResponseStream, ResponseStreamMeta), ResponseProviderError> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
@@ -103,10 +103,13 @@ impl ResponseProvider for OpenAiCompatibleProvider {
             return Err(ResponseProviderError::Provider(format!("{status}: {text}")));
         }
 
+        let meta = ResponseStreamMeta {
+            http_status: response.status().as_u16(),
+        };
         let bytes = response.bytes_stream().boxed();
         let payloads = sse_data_payloads(line_stream(bytes));
 
-        Ok(Box::pin(payloads.filter_map(|payload| async move {
+        let stream: ResponseStream = Box::pin(payloads.filter_map(|payload| async move {
             let payload = match payload {
                 Ok(p) => p,
                 Err(e) => return Some(Err(ResponseProviderError::Network(e.to_string()))),
@@ -132,6 +135,8 @@ impl ResponseProvider for OpenAiCompatibleProvider {
             } else {
                 Some(Ok(ResponseChunk::Delta(content)))
             }
-        })))
+        }));
+
+        Ok((stream, meta))
     }
 }

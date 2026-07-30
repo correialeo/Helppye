@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::net::line_stream;
 use super::provider::{
     to_chat_json, ResponseChunk, ResponseProvider, ResponseProviderError, ResponseRequest,
-    ResponseStream,
+    ResponseStream, ResponseStreamMeta,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -54,7 +54,7 @@ impl ResponseProvider for OllamaProvider {
     async fn stream_reply(
         &self,
         request: ResponseRequest,
-    ) -> Result<ResponseStream, ResponseProviderError> {
+    ) -> Result<(ResponseStream, ResponseStreamMeta), ResponseProviderError> {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({
             "model": self.model,
@@ -78,10 +78,13 @@ impl ResponseProvider for OllamaProvider {
             )));
         }
 
+        let meta = ResponseStreamMeta {
+            http_status: response.status().as_u16(),
+        };
         let bytes = response.bytes_stream().boxed();
         let lines = line_stream(bytes);
 
-        Ok(Box::pin(lines.filter_map(|line| async move {
+        let stream: ResponseStream = Box::pin(lines.filter_map(|line| async move {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => return Some(Err(ResponseProviderError::Network(e.to_string()))),
@@ -105,6 +108,8 @@ impl ResponseProvider for OllamaProvider {
             } else {
                 Some(Ok(ResponseChunk::Delta(content)))
             }
-        })))
+        }));
+
+        Ok((stream, meta))
     }
 }

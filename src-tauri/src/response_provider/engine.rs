@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use tauri::AppHandle;
@@ -21,7 +22,9 @@ use crate::conversation::{
 use super::anthropic::AnthropicProvider;
 use super::config_store::{self, ResponseProviderConfig, ResponseProviderKind};
 use super::context::build_request;
-use super::events::{emit_response_suggestion_event, ResponseSuggestionEvent};
+use super::events::{
+    emit_response_suggestion_event, GenerationDiagnostics, ResponseSuggestionEvent,
+};
 use super::ollama::OllamaProvider;
 use super::openai_compatible::OpenAiCompatibleProvider;
 use super::provider::{ResponseChunk, ResponseProvider, ResponseProviderError, ResponseRequest};
@@ -29,6 +32,21 @@ use super::secrets;
 use super::skip_detector::{SkipDecision, SkipDetector};
 
 const MAX_HISTORY_TURNS: usize = 20;
+
+/// Motivo de cancelamento hoje é sempre este: uma nova utterance no mesmo turno
+/// substituiu a geração em andamento (ver `trigger_generation`).
+const CANCEL_REASON_NEW_UTTERANCE: &str = "new_utterance";
+
+/// Quantos caracteres brutos (antes do `SkipDetector`) manter para diagnóstico. Cobre
+/// folgadamente o marcador `[SKIP]`, sem acumular texto de respostas longas à toa.
+const RAW_PREFIX_CAP_CHARS: usize = 80;
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 struct GenerationHandle {
     generation_id: u64,
@@ -48,7 +66,13 @@ impl ResponseProvider for MisconfiguredProvider {
     async fn stream_reply(
         &self,
         _request: ResponseRequest,
-    ) -> Result<super::provider::ResponseStream, ResponseProviderError> {
+    ) -> Result<
+        (
+            super::provider::ResponseStream,
+            super::provider::ResponseStreamMeta,
+        ),
+        ResponseProviderError,
+    > {
         Err(ResponseProviderError::Credential(self.message.clone()))
     }
 }
@@ -233,6 +257,7 @@ impl ResponseEngine {
             .lock()
             .expect("response engine mutex poisoned")
             .clone();
+        let model = self.current_config().model;
         let history = self.history_snapshot();
         let request = build_request(&history, &turn);
 
@@ -251,17 +276,40 @@ impl ResponseEngine {
             },
         );
 
+        let started_at = Instant::now();
+        let mut diagnostics = GenerationDiagnostics {
+            generation_id,
+            turn_id: turn.id,
+            provider: provider.provider_name().to_string(),
+            model,
+            request_started: epoch_ms(),
+            http_status: None,
+            first_chunk_received: None,
+            raw_prefix: String::new(),
+            skip_detected: false,
+            cancel_reason: None,
+            latency_ms: 0,
+            final_text_length: 0,
+            event_emitted: String::new(),
+        };
+
         let stream_result = tokio::select! {
             _ = cancel_token.cancelled() => {
-                self.clear_if_current(turn.id, generation_id);
+                diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                diagnostics.event_emitted = "cancelled".to_string();
+                self.finish_generation(&app, &turn, generation_id, diagnostics, started_at);
                 return;
             }
             result = provider.stream_reply(request) => result,
         };
 
         let mut stream = match stream_result {
-            Ok(s) => s,
+            Ok((s, meta)) => {
+                diagnostics.http_status = Some(meta.http_status);
+                s
+            }
             Err(e) => {
+                diagnostics.event_emitted = "error".to_string();
                 emit_response_suggestion_event(
                     &app,
                     ResponseSuggestionEvent::Error {
@@ -270,7 +318,7 @@ impl ResponseEngine {
                         message: e.to_string(),
                     },
                 );
-                self.clear_if_current(turn.id, generation_id);
+                self.finish_generation(&app, &turn, generation_id, diagnostics, started_at);
                 return;
             }
         };
@@ -281,11 +329,13 @@ impl ResponseEngine {
         loop {
             let next = tokio::select! {
                 _ = cancel_token.cancelled() => {
+                    diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                    diagnostics.event_emitted = "cancelled".to_string();
                     emit_response_suggestion_event(
                         &app,
                         ResponseSuggestionEvent::Cancelled { turn_id: turn.id, generation_id },
                     );
-                    self.clear_if_current(turn.id, generation_id);
+                    self.finish_generation(&app, &turn, generation_id, diagnostics, started_at);
                     return;
                 }
                 item = stream.next() => item,
@@ -295,36 +345,54 @@ impl ResponseEngine {
                 break;
             };
 
+            if diagnostics.first_chunk_received.is_none() {
+                diagnostics.first_chunk_received = Some(epoch_ms());
+            }
+
             match item {
-                Ok(ResponseChunk::Delta(text)) => match detector.push(&text) {
-                    SkipDecision::Pending => {}
-                    SkipDecision::Skip => {
-                        emit_response_suggestion_event(
-                            &app,
-                            ResponseSuggestionEvent::Skipped {
-                                turn_id: turn.id,
-                                generation_id,
-                            },
-                        );
-                        self.clear_if_current(turn.id, generation_id);
-                        return;
+                Ok(ResponseChunk::Delta(text)) => {
+                    if diagnostics.raw_prefix.chars().count() < RAW_PREFIX_CAP_CHARS {
+                        diagnostics.raw_prefix.push_str(&text);
                     }
-                    SkipDecision::NotSkip { flush } => {
-                        if !flush.is_empty() {
-                            full_text.push_str(&flush);
+                    match detector.push(&text) {
+                        SkipDecision::Pending => {}
+                        SkipDecision::Skip => {
+                            diagnostics.skip_detected = true;
+                            diagnostics.event_emitted = "skipped".to_string();
                             emit_response_suggestion_event(
                                 &app,
-                                ResponseSuggestionEvent::Delta {
+                                ResponseSuggestionEvent::Skipped {
                                     turn_id: turn.id,
                                     generation_id,
-                                    text: flush,
                                 },
                             );
+                            self.finish_generation(
+                                &app,
+                                &turn,
+                                generation_id,
+                                diagnostics,
+                                started_at,
+                            );
+                            return;
+                        }
+                        SkipDecision::NotSkip { flush } => {
+                            if !flush.is_empty() {
+                                full_text.push_str(&flush);
+                                emit_response_suggestion_event(
+                                    &app,
+                                    ResponseSuggestionEvent::Delta {
+                                        turn_id: turn.id,
+                                        generation_id,
+                                        text: flush,
+                                    },
+                                );
+                            }
                         }
                     }
-                },
+                }
                 Ok(ResponseChunk::Done) => break,
                 Err(e) => {
+                    diagnostics.event_emitted = "error".to_string();
                     emit_response_suggestion_event(
                         &app,
                         ResponseSuggestionEvent::Error {
@@ -333,7 +401,7 @@ impl ResponseEngine {
                             message: e.to_string(),
                         },
                     );
-                    self.clear_if_current(turn.id, generation_id);
+                    self.finish_generation(&app, &turn, generation_id, diagnostics, started_at);
                     return;
                 }
             }
@@ -341,6 +409,8 @@ impl ResponseEngine {
 
         match detector.finish() {
             SkipDecision::Skip => {
+                diagnostics.skip_detected = true;
+                diagnostics.event_emitted = "skipped".to_string();
                 emit_response_suggestion_event(
                     &app,
                     ResponseSuggestionEvent::Skipped {
@@ -361,27 +431,54 @@ impl ResponseEngine {
                         },
                     );
                 }
+                diagnostics.event_emitted = if full_text.trim().is_empty() {
+                    "completed_empty".to_string()
+                } else {
+                    "completed_with_text".to_string()
+                };
                 emit_response_suggestion_event(
                     &app,
                     ResponseSuggestionEvent::Completed {
                         turn_id: turn.id,
                         generation_id,
-                        text: full_text,
+                        text: full_text.clone(),
                     },
                 );
             }
             SkipDecision::Pending => {
+                diagnostics.event_emitted = if full_text.trim().is_empty() {
+                    "completed_empty".to_string()
+                } else {
+                    "completed_with_text".to_string()
+                };
                 emit_response_suggestion_event(
                     &app,
                     ResponseSuggestionEvent::Completed {
                         turn_id: turn.id,
                         generation_id,
-                        text: full_text,
+                        text: full_text.clone(),
                     },
                 );
             }
         }
 
+        diagnostics.final_text_length = full_text.chars().count();
+        self.finish_generation(&app, &turn, generation_id, diagnostics, started_at);
+    }
+
+    /// Fecha uma geração: registra `latency_ms`, emite o evento de diagnóstico e libera o
+    /// slot de `generations` se ainda for a geração corrente para o turno.
+    fn finish_generation(
+        &self,
+        app: &AppHandle,
+        turn: &ConversationTurn,
+        generation_id: u64,
+        mut diagnostics: GenerationDiagnostics,
+        started_at: Instant,
+    ) {
+        diagnostics.latency_ms = started_at.elapsed().as_millis() as u64;
+        tracing::debug!(?diagnostics, "response generation diagnostics");
+        emit_response_suggestion_event(app, ResponseSuggestionEvent::Diagnostics(diagnostics));
         self.clear_if_current(turn.id, generation_id);
     }
 }

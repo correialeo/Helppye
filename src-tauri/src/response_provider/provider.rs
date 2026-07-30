@@ -60,6 +60,14 @@ pub enum ResponseProviderError {
 
 pub type ResponseStream = BoxStream<'static, Result<ResponseChunk, ResponseProviderError>>;
 
+/// Metadados da requisição HTTP que produziu o stream, capturados para diagnóstico
+/// (ver `docs/response-suggestion.md`). Providers sem uma chamada HTTP real (ex.:
+/// `MisconfiguredProvider`) nunca chegam a construir isso, já que falham antes.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseStreamMeta {
+    pub http_status: u16,
+}
+
 #[async_trait]
 pub trait ResponseProvider: Send + Sync {
     fn provider_name(&self) -> &'static str;
@@ -67,5 +75,5 @@ pub trait ResponseProvider: Send + Sync {
     async fn stream_reply(
         &self,
         request: ResponseRequest,
-    ) -> Result<ResponseStream, ResponseProviderError>;
+    ) -> Result<(ResponseStream, ResponseStreamMeta), ResponseProviderError>;
 }

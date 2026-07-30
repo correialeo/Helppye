@@ -41,12 +41,56 @@ Igual à extinta detecção de perguntas: só turnos com `speaker = OtherPerson`
 `source = SystemOutput` disparam geração (`engine::is_eligible_turn`). O usuário nunca
 recebe uma "sugestão de resposta" para a própria fala.
 
+## Diagnóstico em modo dev
+
+Sem instrumentação, a UI só distinguia `streaming`/`skipped`/`cancelled`/`error`/
+`completed` — e `completed` com texto vazio (resposta do LLM vazia) e `skipped`
+(marcador `[SKIP]` detectado) apareciam ambos como "Nenhuma resposta sugerida" na tela,
+tornando impossível diferenciar, sem logs, se a requisição não chegou ao provedor, se o
+modelo decidiu `[SKIP]` de propósito, se o parser do stream interpretou mal o início da
+resposta, se uma nova utterance cancelou a geração cedo demais, ou se a resposta veio
+genuinamente vazia.
+
+Para isso, toda geração emite, ao final (`ResponseSuggestionEvent::Diagnostics`), um
+`GenerationDiagnostics` com:
+
+- `generation_id`, `turn_id`, `provider`, `model` — identificação da geração.
+- `request_started` — epoch ms de quando a chamada ao provedor começou.
+- `http_status` — código HTTP da resposta bem-sucedida, `None` se a conexão falhou antes
+  disso (hipótese "a requisição nem chega ao provedor").
+- `first_chunk_received` — epoch ms do primeiro chunk do stream, `None` se nenhum chegou.
+- `raw_prefix` — até ~80 caracteres brutos recebidos do provedor, **antes** de qualquer
+  filtragem do `SkipDetector` — permite confirmar se o modelo de fato respondeu `[SKIP]`
+  literalmente, em vez de supor.
+- `skip_detected` — se o `SkipDetector` decidiu `Skip`.
+- `cancel_reason` — hoje só existe uma causa possível: `"new_utterance"` (uma nova
+  utterance no mesmo turno substituiu esta geração).
+- `latency_ms` — duração total da geração, do início da chamada ao provedor até o
+  evento final.
+- `final_text_length` — tamanho (em caracteres) do texto final acumulado.
+- `event_emitted` — um dos cinco estados finais possíveis, como string:
+  `"skipped"`, `"error"`, `"cancelled"`, `"completed_empty"`, `"completed_with_text"`.
+  `completed_empty` e `completed_with_text` derivam de `Completed` conforme o texto final
+  estar vazio (ou só espaço em branco) ou não — este é justamente o par de estados que
+  antes colapsava, na UI, na mesma mensagem que `skipped`.
+
+`suggestionStatusLabel` (`App.tsx`) agora mostra rótulos distintos para
+`completed_empty` ("Resposta gerada veio vazia") e `skipped` ("Nenhuma resposta
+sugerida"), e um painel `<details>` "Diagnóstico de sugestão de resposta" (gated por
+`showSegments = import.meta.env.DEV`, mesmo padrão usado para as antigas avaliações do
+detector de perguntas) lista os campos acima por turno, para inspeção manual durante o
+desenvolvimento.
+
 ## Módulo por módulo
 
 - **`provider.rs`** — abstração comum (`ResponseProvider`, `ResponseRequest`,
-  `ResponseChunk::{Delta, Done}`, `ResponseProviderError`). Cada provedor devolve um
-  stream de deltas de texto, nunca a resposta inteira de uma vez — é o que permite
-  exibir a sugestão sendo digitada em tempo real em vez de esperar a resposta completa.
+  `ResponseChunk::{Delta, Done}`, `ResponseProviderError`, `ResponseStreamMeta`). Cada
+  provedor devolve um stream de deltas de texto, nunca a resposta inteira de uma vez — é
+  o que permite exibir a sugestão sendo digitada em tempo real em vez de esperar a
+  resposta completa. `stream_reply` devolve `(ResponseStream, ResponseStreamMeta)`: o
+  `http_status` da resposta bem-sucedida vai para `ResponseStreamMeta` porque, sem ele,
+  não havia como o diagnóstico de uma geração confirmar que a requisição de fato chegou
+  ao provedor e obteve `200` antes de o stream começar a produzir chunks.
 - **`context.rs`** — monta o `ResponseRequest` a partir do histórico de turnos e do
   turno atual. Teto de 6 turnos e 6000 caracteres de histórico (`MAX_HISTORY_TURNS`,
   `MAX_HISTORY_CHARS`), 300 tokens de saída (`MAX_OUTPUT_TOKENS`) — contexto limitado de
@@ -68,11 +112,16 @@ recebe uma "sugestão de resposta" para a própria fala.
   cancelada e um evento `Cancelled` é emitido para a geração anterior antes de iniciar a
   nova. `process_conversation_events` é o ponto de entrada chamado a cada lote de eventos
   da timeline: acumula turnos finalizados no histórico e dispara geração em
-  `UtteranceFinalized` de turnos elegíveis.
+  `UtteranceFinalized` de turnos elegíveis. `run_generation` monta um
+  `GenerationDiagnostics` por geração e o fecha em `finish_generation`, chamado em todo
+  caminho de saída (skip, erro, cancelamento ou conclusão) — ver "Diagnóstico em modo dev"
+  abaixo.
 - **`events.rs`** — evento `response://suggestion-event`
-  (`ResponseSuggestionEvent::{Started, Delta, Completed, Skipped, Cancelled, Error}`),
-  cada variante carregando `turn_id` + `generation_id` para o frontend descartar eventos
-  de uma geração já superada.
+  (`ResponseSuggestionEvent::{Started, Delta, Completed, Skipped, Cancelled, Error,
+  Diagnostics}`), cada variante carregando `turn_id` + `generation_id` para o frontend
+  descartar eventos de uma geração já superada. `Diagnostics` carrega um
+  `GenerationDiagnostics` completo (ver abaixo) e é emitido ao final de toda geração,
+  além do evento "de negócio" correspondente (`Skipped`/`Error`/`Cancelled`/`Completed`).
 - **`config_store.rs`** — configuração não-secreta persistida em JSON (mesmo padrão de
   escrita atômica via arquivo temporário + rename de `model_manager::config_store`):
   `ResponseProviderKind` (`ollama`/`open_ai`/`deep_seek`/`anthropic`), `model`, `base_url`
@@ -123,15 +172,21 @@ configuração.
 ## Frontend
 
 `src/responseSuggestionViewModel.ts` reduz os eventos de
-`response://suggestion-event` num `Record<TurnId, SuggestionState>`. Segue a mesma
-semântica de supersessão do backend: eventos que não sejam `started` só são aplicados se
-o `generation_id` do evento ainda casar com o `generationId` armazenado para aquele
-turno — eventos de uma geração já cancelada são descartados silenciosamente. A sugestão é
-renderizada em `App.tsx` (`ConversationTimelineView`) como um painel anexado abaixo da
-última utterance do turno elegível ao qual pertence, não como reescrita/destaque do texto
-transcrito do turno. `ResponseProviderSettings` (também em `App.tsx`) permite escolher
-provedor/modelo/URL base e gerenciar a API key, seguindo o mesmo padrão visual de
-`AdvancedTranscriptionSettings`.
+`response://suggestion-event` num `Record<TurnId, SuggestionState>` via
+`applyResponseSuggestionEvent`. Segue a mesma semântica de supersessão do backend:
+eventos que não sejam `started` só são aplicados se o `generation_id` do evento ainda
+casar com o `generationId` armazenado para aquele turno — eventos de uma geração já
+cancelada são descartados silenciosamente. `SuggestionStatus` tem seis valores:
+`streaming`, `completed_with_text`, `completed_empty`, `skipped`, `cancelled`, `error` —
+o evento `completed` do backend vira `completed_with_text` ou `completed_empty` conforme
+o texto final (`.trim()`) estar vazio ou não. A sugestão é renderizada em `App.tsx`
+(`ConversationTimelineView`) como um painel anexado abaixo da última utterance do turno
+elegível ao qual pertence, não como reescrita/destaque do texto transcrito do turno.
+`applyResponseSuggestionDiagnostics` reduz os eventos `diagnostics` separadamente, num
+`Record<TurnId, ResponseSuggestionDiagnostics>` só usado pelo painel de depuração — não
+afeta `SuggestionState`. `ResponseProviderSettings` (também em `App.tsx`) permite
+escolher provedor/modelo/URL base e gerenciar a API key, seguindo o mesmo padrão visual
+de `AdvancedTranscriptionSettings`.
 
 ## O que foi verificado neste ambiente vs. o que ainda precisa de confirmação manual
 
@@ -148,10 +203,21 @@ sem acesso de rede de teste contra os endpoints reais dos provedores.
   (marcador completo em um chunk, partido entre chunks, divergência no meio do
   marcador, stream vazio), carregamento/salvamento/corrupção de `config_store.rs` e
   mapeamento de erros do `keyring` em `secrets.rs`.
-- `npm run typecheck`, `npm run lint`, `npm run build` — limpos, incluindo o reducer
-  `applyResponseSuggestionEvent` e seus testes manuais (`responseSuggestionViewModel.test.ts`).
+- `npm run typecheck`, `npm run lint`, `npm run build` — limpos, incluindo os reducers
+  `applyResponseSuggestionEvent`/`applyResponseSuggestionDiagnostics` e seus testes
+  manuais (`responseSuggestionViewModel.test.ts`, rodados via `npx tsx`), cobrindo a
+  distinção `completed_with_text`/`completed_empty` e o preenchimento de
+  `ResponseSuggestionDiagnostics` a partir do evento bruto.
 
 **Ainda precisa de confirmação manual (não fabricado aqui):**
+- A causa raiz real do sintoma que motivou o diagnóstico ("Gerando sugestão..." seguido
+  de "Nenhuma resposta sugerida" ao testar contra um Ollama de verdade). A instrumentação
+  acima foi desenhada para tornar essa causa observável (via o painel de diagnóstico em
+  modo dev ou os logs de `tracing::debug!` em `finish_generation`), mas este sandbox não
+  tem um Ollama real para reproduzir o sintoma — falta ao usuário rodar de novo com o
+  painel de diagnóstico aberto e ler o `event_emitted`/`raw_prefix`/`http_status` da
+  geração problemática para confirmar qual das hipóteses (requisição não chega,
+  `[SKIP]` genuíno do modelo, parser, cancelamento prematuro, ou resposta vazia) é a real.
 - Chamadas reais de streaming contra Ollama, OpenAI, DeepSeek e Anthropic — o parsing de
   NDJSON/SSE foi testado com payloads sintéticos, não contra os endpoints reais.
 - Armazenamento/leitura real de API key no keychain do SO (Windows Credential Manager,
