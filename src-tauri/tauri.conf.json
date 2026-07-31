@@ -14,15 +14,15 @@
       {
         "label": "main",
         "title": "Helppye",
-        "width": 306,
+        "width": 326,
         "height": 88,
-        "minWidth": 286,
+        "minWidth": 306,
         "minHeight": 80,
         "resizable": true,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
-        "skipTaskbar": true,
+        "skipTaskbar": false,
         "shadow": false,
         "theme": "Dark"
       }

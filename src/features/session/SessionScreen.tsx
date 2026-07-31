@@ -452,7 +452,13 @@ export function SessionScreen({
   if (mode === "coordinator") {
     return (
       <div className="flex h-full min-h-screen w-full items-center justify-center bg-transparent px-2">
-        <div className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#111113]/94 p-2 shadow-[0_18px_45px_rgba(0,0,0,.46)] backdrop-blur-2xl">
+        <div
+          className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#09090b] p-2 shadow-[0_18px_55px_rgba(0,0,0,.52)]"
+          onPointerDown={(event) => {
+            if ((event.target as HTMLElement).closest("button")) return;
+            startNativeDrag();
+          }}
+        >
           <div className="grid h-10 w-10 place-items-center rounded-full bg-white/[0.06] text-white/36">
             <Grip className="h-4 w-4" />
           </div>
@@ -479,6 +485,14 @@ export function SessionScreen({
           >
             <X className="h-3.5 w-3.5" />
           </button>
+          <button
+            type="button"
+            onClick={minimizeWindow}
+            className="grid h-7 w-7 place-items-center rounded-full text-white/34 transition hover:bg-white/[0.08] hover:text-white/72"
+            aria-label="Minimizar Helppye"
+          >
+            <Minus className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
     );
@@ -486,7 +500,7 @@ export function SessionScreen({
 
   if (mode === "ai") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#111113]/88 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-2xl">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#111113]/94 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-xl">
         <AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} nativeDrag />
       </div>
     );
@@ -533,7 +547,7 @@ export function SessionScreen({
       <DraggablePanel
         position={aiPosition}
         onPositionChange={setAiPosition}
-        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111113]/88 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-2xl"
+        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111113]/94 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-xl"
         handle={<AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} />}
       >
         {null}

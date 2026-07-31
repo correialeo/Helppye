@@ -58,7 +58,7 @@ export async function openSessionWindows(startedAt: number): Promise<boolean> {
     transparent: true,
     alwaysOnTop: true,
     skipTaskbar: true,
-    shadow: true,
+    shadow: false,
     resizable: true,
     theme: "dark",
   });
@@ -76,7 +76,7 @@ export async function openSessionWindows(startedAt: number): Promise<boolean> {
     transparent: true,
     alwaysOnTop: true,
     skipTaskbar: true,
-    shadow: true,
+    shadow: false,
     resizable: true,
     theme: "dark",
   });

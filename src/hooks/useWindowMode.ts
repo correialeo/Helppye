@@ -2,8 +2,8 @@ import { useEffect } from "react";
 import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
 import type { AppScreen } from "../app/appFlow";
 
-const TASKBAR_SIZE = new LogicalSize(306, 88);
-const TASKBAR_MIN_SIZE = new LogicalSize(286, 80);
+const TASKBAR_SIZE = new LogicalSize(326, 88);
+const TASKBAR_MIN_SIZE = new LogicalSize(306, 80);
 const APP_SIZE = new LogicalSize(820, 760);
 const APP_MIN_SIZE = new LogicalSize(520, 560);
 const BOTTOM_MARGIN = 28;
