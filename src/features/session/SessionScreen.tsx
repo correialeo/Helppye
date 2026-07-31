@@ -239,8 +239,8 @@ function TimelineMessage({ utterance }: { utterance: ConversationUtterance }) {
       <div
         className={`max-w-[78%] rounded-[18px] px-4 py-3 ${
           isUser
-            ? "bg-white/[0.08] text-right shadow-[inset_0_0_0_1px_rgba(255,255,255,.04)]"
-            : "bg-white/[0.055] shadow-[inset_0_0_0_1px_rgba(255,255,255,.055)]"
+            ? "bg-[#2b2b2f] text-right"
+            : "bg-[#202124]"
         }`}
       >
         <p className="mb-1.5 text-[10px] font-semibold tracking-wide text-white/32">{label}</p>
@@ -282,7 +282,7 @@ function ChatToolbar({
   );
 
   return (
-    <div className="relative flex h-12 items-center gap-2 border-b border-white/[0.06] bg-white/[0.035] px-3 backdrop-blur-xl">
+    <div className="relative flex h-12 items-center gap-2 border-b border-white/[0.06] bg-[#17181b] px-3">
       <button
         type="button"
         onClick={onOpenTranscript}
@@ -328,7 +328,7 @@ function ChatFooter({
   const elapsed = useElapsed(startedAt);
 
   return (
-    <div className="border-t border-white/[0.06] bg-white/[0.025] px-4 py-3 backdrop-blur-xl">
+    <div className="border-t border-white/[0.06] bg-[#17181b] px-4 py-3">
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           <CaptureDot status={microphoneStatus} label="Mic" />
@@ -386,7 +386,7 @@ function ChatTimelinePanel({
       />
       <ol ref={scrollRef} className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-4">
         {utterances.length === 0 ? (
-          <li className="rounded-[18px] bg-white/[0.055] px-4 py-3 text-sm text-white/42">
+          <li className="rounded-[18px] bg-[#202124] px-4 py-3 text-sm text-white/52">
             Aguardando a conversa...
           </li>
         ) : (
@@ -452,7 +452,7 @@ export function SessionScreen({
   if (mode === "coordinator") {
     return (
       <div className="flex h-full min-h-screen w-full items-center justify-center bg-transparent px-2">
-        <div className="flex h-[58px] w-full items-center gap-2 rounded-[18px] border border-white/10 bg-[#1c1c1e]/86 p-2 shadow-[0_18px_45px_rgba(0,0,0,.38)] backdrop-blur-xl">
+        <div className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#111113]/94 p-2 shadow-[0_18px_45px_rgba(0,0,0,.46)] backdrop-blur-2xl">
           <div className="grid h-10 w-10 place-items-center rounded-full bg-white/[0.06] text-white/36">
             <Grip className="h-4 w-4" />
           </div>
@@ -486,7 +486,7 @@ export function SessionScreen({
 
   if (mode === "ai") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] border border-white/10 bg-[#111113]/62 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-2xl">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#111113]/88 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-2xl">
         <AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} nativeDrag />
       </div>
     );
@@ -494,7 +494,7 @@ export function SessionScreen({
 
   if (mode === "chat") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] border border-white/[0.08] bg-[#101012]/96 shadow-[0_22px_70px_rgba(0,0,0,.45)]">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#111214] shadow-[0_22px_70px_rgba(0,0,0,.45)]">
         <div
           className="flex h-8 items-center justify-between px-4 text-white/36"
           onPointerDown={(event) => {
@@ -533,7 +533,7 @@ export function SessionScreen({
       <DraggablePanel
         position={aiPosition}
         onPositionChange={setAiPosition}
-        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] border border-white/10 bg-[#111113]/72 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-2xl"
+        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111113]/88 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-2xl"
         handle={<AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} />}
       >
         {null}
@@ -541,7 +541,7 @@ export function SessionScreen({
       <DraggablePanel
         position={chatPosition}
         onPositionChange={setChatPosition}
-        className="absolute left-0 top-0 z-10 flex h-[calc(100%-222px)] min-h-[340px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] border border-white/[0.08] bg-[#101012]/96 shadow-[0_22px_70px_rgba(0,0,0,.45)]"
+        className="absolute left-0 top-0 z-10 flex h-[calc(100%-222px)] min-h-[340px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111214] shadow-[0_22px_70px_rgba(0,0,0,.45)]"
         handle={
           <div className="flex h-8 items-center justify-between px-4 text-white/36">
             <div className="flex items-center gap-2">

@@ -15,7 +15,7 @@ function closeWindow() {
 export function WelcomeScreen({ onContinueWithoutLogin, onLogin }: WelcomeScreenProps) {
   return (
     <div className="flex h-full min-h-screen w-full items-center justify-center bg-transparent px-2 py-2">
-      <div className="flex h-[58px] w-full items-center gap-2 rounded-[22px] border border-white/10 bg-[#1c1c1e]/82 p-2 shadow-[0_18px_55px_rgba(0,0,0,.42)] backdrop-blur-2xl">
+      <div className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#111113]/94 p-2 shadow-[0_18px_55px_rgba(0,0,0,.46)] backdrop-blur-2xl">
         <button
           type="button"
           onClick={onLogin}
