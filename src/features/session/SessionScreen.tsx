@@ -9,6 +9,7 @@ import { useAudioCapture } from "../../hooks/useAudioCapture";
 import { useOnboardingStore } from "../../stores/useOnboardingStore";
 import { regenerateSuggestion } from "../../services/conversationService";
 import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
+import { useTransparentWindowBackground } from "../../hooks/useTransparentWindowBackground";
 import { formatDuration } from "../../utils/format";
 import type { CaptureStatus } from "../../stores/useAudioCaptureStore";
 import type { ConversationUtterance } from "../../types/conversation";
@@ -406,6 +407,7 @@ export function SessionScreen({
   onEndSession,
   onRestoreSession,
 }: SessionScreenProps) {
+  useTransparentWindowBackground(mode === "coordinator" || mode === "ai" || mode === "chat");
   const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [aiPosition, setAiPosition] = useState<PanelPosition>({ x: 12, y: 10 });
   const [chatPosition, setChatPosition] = useState<PanelPosition>({ x: 12, y: 210 });
@@ -453,7 +455,7 @@ export function SessionScreen({
     return (
       <div className="flex h-full min-h-screen w-full items-center justify-center bg-transparent px-2">
         <div
-          className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#09090b] p-2 shadow-[0_18px_55px_rgba(0,0,0,.52)]"
+          className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#050506] p-2"
           onPointerDown={(event) => {
             if ((event.target as HTMLElement).closest("button")) return;
             startNativeDrag();
@@ -500,7 +502,7 @@ export function SessionScreen({
 
   if (mode === "ai") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#111113]/94 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-xl">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#16161a]/97 backdrop-blur-sm">
         <AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} nativeDrag />
       </div>
     );
@@ -508,7 +510,7 @@ export function SessionScreen({
 
   if (mode === "chat") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#111214] shadow-[0_22px_70px_rgba(0,0,0,.45)]">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#111214]">
         <div
           className="flex h-8 items-center justify-between px-4 text-white/36"
           onPointerDown={(event) => {
@@ -547,7 +549,7 @@ export function SessionScreen({
       <DraggablePanel
         position={aiPosition}
         onPositionChange={setAiPosition}
-        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111113]/94 shadow-[0_22px_70px_rgba(0,0,0,.45)] backdrop-blur-xl"
+        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#16161a]/97 backdrop-blur-sm"
         handle={<AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} />}
       >
         {null}
@@ -555,7 +557,7 @@ export function SessionScreen({
       <DraggablePanel
         position={chatPosition}
         onPositionChange={setChatPosition}
-        className="absolute left-0 top-0 z-10 flex h-[calc(100%-222px)] min-h-[340px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111214] shadow-[0_22px_70px_rgba(0,0,0,.45)]"
+        className="absolute left-0 top-0 z-10 flex h-[calc(100%-222px)] min-h-[340px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111214]"
         handle={
           <div className="flex h-8 items-center justify-between px-4 text-white/36">
             <div className="flex items-center gap-2">

@@ -2,6 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Grip, Minus, Rocket, Settings, X } from "lucide-react";
 import { Kbd } from "../../components/ui/Kbd";
 import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
+import { useTransparentWindowBackground } from "../../hooks/useTransparentWindowBackground";
 
 interface ReadyScreenProps {
   onStartSession: () => void;
@@ -29,11 +30,12 @@ function startDrag() {
 
 export function ReadyScreen({ onStartSession, onOpenSettings }: ReadyScreenProps) {
   useKeyboardShortcuts({ onToggleSession: onStartSession, onOpenSettings });
+  useTransparentWindowBackground();
 
   return (
     <div className="flex h-full min-h-screen w-full items-center justify-center bg-transparent px-2 py-2">
       <div
-        className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#09090b] p-2 shadow-[0_18px_55px_rgba(0,0,0,.52)]"
+        className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#050506] p-2"
         onPointerDown={(event) => {
           if ((event.target as HTMLElement).closest("button")) return;
           startDrag();

@@ -1,6 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Rocket, X } from "lucide-react";
 import { BrandMark } from "../../components/ui/BrandMark";
+import { useTransparentWindowBackground } from "../../hooks/useTransparentWindowBackground";
 
 interface WelcomeScreenProps {
   onContinueWithoutLogin: () => void;
@@ -27,10 +28,12 @@ function startDrag() {
 }
 
 export function WelcomeScreen({ onContinueWithoutLogin, onLogin }: WelcomeScreenProps) {
+  useTransparentWindowBackground();
+
   return (
     <div className="flex h-full min-h-screen w-full items-center justify-center bg-transparent px-2 py-2">
       <div
-        className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#09090b] p-2 shadow-[0_18px_55px_rgba(0,0,0,.52)]"
+        className="flex h-[58px] w-full items-center gap-2 rounded-[22px] bg-[#050506] p-2"
         onPointerDown={(event) => {
           if ((event.target as HTMLElement).closest("button")) return;
           startDrag();
