@@ -250,12 +250,15 @@ FALA ATUAL DA OUTRA PESSOA:
 Me dá um exemplo disso.
 
 INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do usuário à fala atual, em 2 a
-4 frases. Vá direto ao conteúdo: nada de repetir ou reformular a pergunta, nada de
-comentar se ela exige resposta, nada de preâmbulo. Use o contexto apenas para resolver
-referências, e não invente nome, número, data, empresa ou tecnologia que não esteja nele.
-A pontuação da transcrição não é confiável: um pedido ou pergunta sem "?" continua sendo
-um pedido. Escreva apenas [SKIP] se a fala atual for somente saudação, somente uma
-confirmação isolada, ou um fragmento sem sentido.
+4 frases. Você é o próprio usuário falando na reunião, não um assistente atendendo
+alguém: nunca se ofereça para mostrar, explicar, buscar ou fazer algo, e nunca termine
+perguntando se a pessoa quer mais detalhes. Vá direto ao conteúdo: nada de repetir ou
+reformular a pergunta, nada de comentar se ela exige resposta, nada de preâmbulo. Use o
+contexto apenas para resolver referências, e não invente nome, número, data, empresa ou
+tecnologia que não esteja nele. A pontuação da transcrição não é confiável: um pedido ou
+pergunta sem "?" continua sendo um pedido. Escreva apenas [SKIP] se a fala atual for
+somente saudação, somente uma confirmação isolada, um fragmento sem sentido, ou apenas um
+enunciado que monta contexto sem pedir nada ainda.
 ```
 
 A instrução é a **última coisa que o modelo lê antes de gerar**, e é a que mais pesa na
@@ -279,14 +282,33 @@ O `SYSTEM_PROMPT` declara a política em vez de deixá-la implícita:
 
 - **Responder é o padrão.** `[SKIP]` tem uma **lista fechada** de casos — saudação
   isolada; confirmação/reação isolada sem nada depois; fragmento truncado, ruído ou fala
-  sem sentido; fala que claramente não é dirigida ao usuário — e nenhum outro.
+  sem sentido; enunciado que só monta contexto e ainda não pede nada; fala que claramente
+  não é dirigida ao usuário — e nenhum outro.
+- **De quem é a voz.** O texto gerado vai ser lido em voz alta *pelo usuário*, como fala
+  dele. O prompt diz isso explicitamente e proíbe oferta de serviço ("se quiser, posso te
+  mostrar", "quer que eu explique") e pergunta de fechamento — voz de assistente é
+  inutilizável numa reunião, porque o usuário não tem o que fazer com ela.
 - **A pontuação da transcrição não conta.** O transcritor quase nunca produz "?", então
   decidir por pontuação é decidir por um sinal que não existe: "me conta como foi",
   "explica melhor" e "e como você resolveu isso" são pedidos escritos sem interrogação.
 - Fala que começa com confirmação/saudação mas contém pergunta ou pedido ⇒ responder ao
   pedido (**o caso citado explicitamente**, com exemplo, porque é o que falhava na
   prática: "Perfeito. Me conta um caso real..." voltava como `[SKIP]`).
-- **Em qualquer dúvida, responder curto em vez de `[SKIP]`.**
+- **Em qualquer dúvida, responder curto em vez de `[SKIP]`** — com uma exceção nomeada,
+  abaixo.
+- **Enunciado que ainda não pede nada ⇒ esperar.** Uma pergunta falada costuma chegar
+  partida em duas utterances, porque a pessoa respira no meio dela e o silêncio finaliza
+  a primeira: "Eu tenho uma query que até ontem respondia em menos de um segundo." …
+  "Só que hoje ela demora cinco segundos. O que pode ter acontecido?". A primeira metade é
+  só a premissa — não há pergunta, pedido, imperativo nem convite a falar. Responder a ela
+  produz uma resposta a meia pergunta (e o modelo, forçado a responder, continua a frase
+  da outra pessoa em primeira pessoa, como se fosse o usuário narrando o problema dela).
+  Esse é o **único** caso em que a dúvida se resolve pulando, e o prompt marca a exceção
+  explicitamente para ela não ser anulada pela regra anterior. A premissa não se perde:
+  ela vira `CONTEXTO RECENTE:` da fala seguinte (`preceding_text_in_turn`), que é onde o
+  pedido aparece — então a resposta cobre a pergunta inteira. O raio de ação real do
+  problema também é ajustável em runtime: `same_speaker_utterance_gap_ms` (Configurações →
+  Modo de desenvolvedor) controla quanto silêncio parte uma fala em duas.
 - Exemplos curtos de calibração no fim do prompt de sistema — dois que devem responder
   (um imperativo depois de confirmação, uma pergunta sem "?") e dois que devem pular.
   Modelos locais pequenos seguem exemplo melhor do que seguem política declarada.
@@ -383,6 +405,9 @@ Para isso, toda geração emite, ao final (`ResponseSuggestionEvent::Diagnostics
   filtragem do `SkipDetector` — permite confirmar se o modelo de fato respondeu `[SKIP]`
   literalmente, em vez de supor.
 - `skip_detected` — se o `SkipDetector` decidiu `Skip`.
+- `echo_suppressed_characters` — quantos caracteres o `EchoGuard` descartou por serem
+  repetição da própria fala. Sem esse número, uma resposta que era só eco (portanto
+  integralmente suprimida) chega à UI idêntica a uma resposta vazia do modelo.
 - `cancel_reason` — hoje só existe uma causa possível: `"new_utterance"` (uma nova
   utterance no mesmo turno substituiu esta geração).
 - `latency_ms` — duração total da geração, do início da chamada ao provedor até o
@@ -447,6 +472,25 @@ inspeção manual durante o desenvolvimento.
   marcador. `classify` normaliza espaço em branco à esquerda e caixa, e trata `[SKIP]`
   seguido de qualquer coisa (tipicamente `\n`) como skip — nenhum regex, nenhuma segunda
   chamada ao LLM.
+- **`echo_guard.rs`** — `EchoGuard`, segundo filtro do stream, depois do `SkipDetector` e
+  antes de qualquer `Delta`. Modelos locais menores tratam o prompt como texto a continuar
+  e às vezes começam **repetindo a fala** em vez de respondê-la: numa sessão real a
+  primeira sugestão exibida foi a própria pergunta, palavra por palavra, e em outra a
+  pergunta voltou reformulada ("...usar monolitos?" → "...usar micro-service?") antes da
+  resposta de verdade. O prompt já proíbe isso; o guarda é a rede para quando o modelo
+  desobedece, porque devolver a pergunta é pior que não sugerir nada. Ele compara o texto
+  **gerado** com a fala **conhecida** que originou a geração (normalizando caixa,
+  pontuação e espaçamento) e, se o começo for eco — prefixo em qualquer direção, ou ≥70%
+  de tokens em comum na primeira frase — descarta só esse trecho e deixa passar o que vem
+  depois. **Não é um detector de perguntas:** ele nunca decide se uma fala merece resposta,
+  essa decisão continua sendo do modelo, in-band, via `[SKIP]`. É a mesma natureza de
+  `strip_non_speech_annotations` — higiene de saída sobre uma entrada conhecida.
+  Custo de latência no caso comum: nenhum. Uma resposta que não começa repetindo a pergunta
+  diverge no primeiro caractere e passa direto a partir dali; só um começo que coincide com
+  a fala fica retido, e ainda assim com teto (fim da primeira frase ou 32 caracteres além
+  do tamanho da fala). Falas com menos de 12 caracteres normalizados nunca são guardadas.
+  O quanto foi suprimido aparece em `GenerationDiagnostics::echo_suppressed_characters`,
+  senão um eco integralmente descartado chegaria à UI indistinguível de uma resposta vazia.
 - **`engine.rs`** — `ResponseEngine`: mantém o provedor ativo, a configuração e um único
   `Mutex<SessionState>` com o `session_id` ativo, a flag `ending`, o `CancellationToken`
   raiz, o histórico rolante de até 20 turnos finalizados (`MAX_HISTORY_TURNS`) e o mapa de
@@ -634,6 +678,12 @@ Configurações.
   um chunk, partido entre chunks, divergência no meio, stream vazio), cobre `[SKIP]` com
   `\n` no fim, com espaço em branco à esquerda, em caixa baixa, e espaço em branco isolado
   ainda pendente.
+- **`response_provider/echo_guard.rs`** — eco literal da fala inteira (nada sai), eco
+  reformulado seguido da resposta (só a resposta sai), eco reconhecido atravessando
+  fronteira de chunk, resposta normal liberada já no primeiro chunk (a garantia de que o
+  guarda não custa latência), resposta que reaproveita as palavras iniciais da pergunta mas
+  segue por outro caminho (não é eco), fala curta demais para ser guardada, e texto sem
+  pontuação nenhuma liberado no teto de segurança.
 - **`response_provider/engine.rs`** — `ResponseEngine::for_test` injeta um
   `ResponseProvider` fake (`FakeProvider`) sem tocar o `config_store` real. Ele registra
   **todo** `ResponseRequest` recebido (`prompts()`, `request_count()`), o que permite

@@ -258,10 +258,20 @@ decisão seja sobre a fala atual, não sobre o turno inteiro. O `SYSTEM_PROMPT` 
 política: responder é o padrão, `[SKIP]` tem uma lista fechada de casos, a pontuação da
 transcrição não conta na decisão (o transcritor quase nunca produz "?", então "Me conta um
 caso real..." é um pedido sem interrogação), confirmação seguida de pedido se responde, e
-em qualquer dúvida responde-se curto. Contra alucinação, o mesmo prompt proíbe fabricar
+em qualquer dúvida responde-se curto. Duas regras vieram de uma sessão ao vivo: o prompt
+diz **de quem é a voz** (o texto vai ser lido em voz alta pelo próprio usuário, então nada
+de oferta de serviço tipo "se quiser, posso te mostrar" nem pergunta de fechamento), e
+acrescenta à lista fechada de `[SKIP]` o **enunciado que ainda não pede nada** — uma
+pergunta falada costuma chegar partida em duas utterances, e responder só à premissa
+produz resposta a meia pergunta; a premissa vira contexto da fala seguinte, onde o pedido
+aparece. Contra alucinação, o mesmo prompt proíbe fabricar
 específicos ausentes do contexto (nome, número, data, empresa, tecnologia) e pede resposta
 de 2 a 4 frases — ver `docs/response-suggestion.md`, seção "Estrutura do prompt e política
-de `[SKIP]`". API keys de provedores de nuvem ficam no keychain do SO via crate `keyring`,
+de `[SKIP]`". Depois do `SkipDetector` e antes de qualquer `Delta`, o `EchoGuard`
+(`echo_guard.rs`) descarta o eco da própria fala quando o modelo começa repetindo a
+pergunta em vez de respondê-la — comparação com a fala conhecida que originou a geração,
+não detecção de pergunta; a decisão de responder continua sendo do modelo, via `[SKIP]`.
+API keys de provedores de nuvem ficam no keychain do SO via crate `keyring`,
 nunca em texto puro no disco.
 Eventos emitidos via `response://suggestion-event`: `started`, `delta`, `completed`,
 `skipped`, `cancelled` e `error`, todos carregando `session_id`, `turn_id`,

@@ -139,7 +139,10 @@ export function DeveloperToolsScreen({ onBack }: { onBack: () => void }) {
                   <p className="text-emerald-400">
                     end_of_speech_to_first_visible_token_ms: {d.end_of_speech_to_first_visible_token_ms ?? "—"}
                   </p>
-                  <p>skip_detected: {String(d.skip_detected)} · cancel_reason: {d.cancel_reason ?? "—"}</p>
+                  <p>
+                    skip_detected: {String(d.skip_detected)} · echo_suppressed_characters:{" "}
+                    {d.echo_suppressed_characters} · cancel_reason: {d.cancel_reason ?? "—"}
+                  </p>
                   <p className="break-all">raw_prefix: {d.raw_prefix || "—"}</p>
                   <p>
                     context_turn_count: {d.context_turn_count} · context_character_count:{" "}

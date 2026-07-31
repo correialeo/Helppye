@@ -101,6 +101,7 @@ pub struct GenerationTrigger {
 use super::anthropic::AnthropicProvider;
 use super::config_store::{self, ResponseProviderConfig, ResponseProviderKind};
 use super::context::build_request;
+use super::echo_guard::EchoGuard;
 use super::events::{
     emit_response_suggestion_event, GenerationDiagnostics, ResponseSuggestionEvent,
 };
@@ -662,6 +663,7 @@ impl ResponseEngine {
             first_chunk_received: None,
             raw_prefix: String::new(),
             skip_detected: false,
+            echo_suppressed_characters: 0,
             cancel_reason: None,
             latency_ms: 0,
             final_text_length: 0,
@@ -762,6 +764,14 @@ impl ResponseEngine {
         };
 
         let mut detector = SkipDetector::new();
+        // Segundo filtro, depois do `SkipDetector` e antes de qualquer `Delta`: o modelo às
+        // vezes começa repetindo a fala em vez de respondê-la, e a sugestão saía sendo a
+        // própria pergunta. Ver `echo_guard.rs` — não é detecção de pergunta, é comparação
+        // com a fala conhecida que originou esta geração.
+        let mut echo_guard = EchoGuard::new(&trigger.utterance_text);
+        // Tudo que o `SkipDetector` liberou, tenha o guarda deixado passar ou não — a
+        // diferença para `full_text` no fim é exatamente o que foi suprimido como eco.
+        let mut fed_characters = 0usize;
         let mut full_text = String::new();
 
         loop {
@@ -830,11 +840,13 @@ impl ResponseEngine {
                             return;
                         }
                         SkipDecision::NotSkip { flush } => {
-                            if !flush.is_empty() {
+                            fed_characters += flush.chars().count();
+                            let visible = echo_guard.push(&flush);
+                            if !visible.is_empty() {
                                 if first_visible_text_at.is_none() {
                                     first_visible_text_at = Some(Instant::now());
                                 }
-                                full_text.push_str(&flush);
+                                full_text.push_str(&visible);
                                 if !self.publish_stream_event(
                                     &app,
                                     &ctx,
@@ -843,7 +855,7 @@ impl ResponseEngine {
                                         turn_id: ctx.turn_id,
                                         utterance_id: ctx.utterance_id,
                                         generation_id: ctx.generation_id,
-                                        text: flush,
+                                        text: visible,
                                     },
                                 ) {
                                     // Sessão encerrada ou geração substituída no meio do
@@ -902,11 +914,17 @@ impl ResponseEngine {
                 );
             }
             SkipDecision::NotSkip { flush } => {
-                if !flush.is_empty() {
+                // Fim do stream: o que o guarda ainda estiver segurando precisa sair agora
+                // (ou ser descartado agora), senão uma resposta curta sem pontuação final
+                // nunca chegaria à UI.
+                fed_characters += flush.chars().count();
+                let mut visible = echo_guard.push(&flush);
+                visible.push_str(&echo_guard.finish());
+                if !visible.is_empty() {
                     if first_visible_text_at.is_none() {
                         first_visible_text_at = Some(Instant::now());
                     }
-                    full_text.push_str(&flush);
+                    full_text.push_str(&visible);
                     self.publish_stream_event(
                         &app,
                         &ctx,
@@ -915,7 +933,7 @@ impl ResponseEngine {
                             turn_id: ctx.turn_id,
                             utterance_id: ctx.utterance_id,
                             generation_id: ctx.generation_id,
-                            text: flush,
+                            text: visible,
                         },
                     );
                 }
@@ -961,6 +979,8 @@ impl ResponseEngine {
         }
 
         diagnostics.final_text_length = full_text.chars().count();
+        diagnostics.echo_suppressed_characters =
+            fed_characters.saturating_sub(diagnostics.final_text_length);
         finish!(diagnostics);
     }
 
@@ -1793,6 +1813,97 @@ mod tests {
         let diagnostics = wait_for_event_type(&mut rx, "diagnostics").await;
         assert_eq!(diagnostics["event_emitted"], "completed_with_text");
         assert_eq!(diagnostics["skip_detected"], false);
+    }
+
+    /// O modelo às vezes abre repetindo a pergunta antes de respondê-la. O eco não pode
+    /// chegar à UI — a sugestão exibida tem que ser só a resposta.
+    #[tokio::test]
+    async fn an_echo_of_the_question_is_never_published_as_suggestion() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text(
+            "Em qual situação você escolheria usar micro-service? \
+Acho que depende do tamanho do time.",
+        ));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(
+                &remote_turn(1, "Em qual situação você escolheria usar monolitos?"),
+                session,
+            ),
+        );
+
+        let completed = wait_for_event_type(&mut rx, "completed").await;
+        assert_eq!(
+            completed["text"].as_str().unwrap(),
+            "Acho que depende do tamanho do time."
+        );
+        let diagnostics = wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(diagnostics["event_emitted"], "completed_with_text");
+        assert!(
+            diagnostics["echo_suppressed_characters"].as_u64().unwrap() > 0,
+            "o diagnóstico precisa registrar que houve eco suprimido"
+        );
+    }
+
+    /// Resposta inteiramente ecoada: nada visível, e o estado final é uma conclusão vazia —
+    /// nunca a pergunta de volta.
+    #[tokio::test]
+    async fn a_full_echo_leaves_no_visible_text_at_all() {
+        let question = "Me conta um caso real em que você optou por usar monolito.";
+        let engine = ResponseEngine::for_test(FakeProvider::with_text(question));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, question), session),
+        );
+
+        let completed = wait_for_event_type(&mut rx, "completed").await;
+        assert_eq!(completed["text"].as_str().unwrap(), "");
+        let diagnostics = wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(diagnostics["event_emitted"], "completed_empty");
+    }
+
+    /// O guarda não pode custar latência no caso normal: uma resposta que não começa
+    /// repetindo a pergunta sai no primeiro delta, inteira.
+    #[tokio::test]
+    async fn an_ordinary_answer_is_not_held_back_by_the_echo_guard() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text(
+            "Já usei monolito quando o time era pequeno.",
+        ));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(
+                &remote_turn(
+                    1,
+                    "Me conta um caso real em que você optou por usar monolito.",
+                ),
+                session,
+            ),
+        );
+
+        let delta = wait_for_event_type(&mut rx, "delta").await;
+        assert_eq!(
+            delta["text"].as_str().unwrap(),
+            "Já usei monolito quando o time era pequeno."
+        );
+        let diagnostics = wait_for_event_type(&mut rx, "diagnostics").await;
+        assert_eq!(diagnostics["echo_suppressed_characters"], 0);
     }
 
     #[tokio::test]

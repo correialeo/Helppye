@@ -25,6 +25,7 @@ export interface ResponseSuggestionEventRef {
   first_chunk_received?: number | null;
   raw_prefix?: string;
   skip_detected?: boolean;
+  echo_suppressed_characters?: number;
   cancel_reason?: string | null;
   latency_ms?: number;
   final_text_length?: number;
@@ -150,6 +151,8 @@ export interface ResponseSuggestionDiagnostics {
   first_chunk_received: number | null;
   raw_prefix: string;
   skip_detected: boolean;
+  /** Caracteres descartados pelo EchoGuard por serem repetição da própria fala. */
+  echo_suppressed_characters: number;
   cancel_reason: string | null;
   latency_ms: number;
   final_text_length: number;
@@ -192,6 +195,7 @@ export function applyResponseSuggestionDiagnostics(
       first_chunk_received: event.first_chunk_received ?? null,
       raw_prefix: event.raw_prefix ?? "",
       skip_detected: event.skip_detected ?? false,
+      echo_suppressed_characters: event.echo_suppressed_characters ?? 0,
       cancel_reason: event.cancel_reason ?? null,
       latency_ms: event.latency_ms ?? 0,
       final_text_length: event.final_text_length ?? 0,

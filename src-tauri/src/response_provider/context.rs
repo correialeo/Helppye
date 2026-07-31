@@ -23,6 +23,20 @@
 //! diz explicitamente que a pontuação não é confiável, enumera os únicos casos de skip e
 //! traz exemplos curtos — inclusive o padrão exato que falhava, confirmação seguida de
 //! pedido.
+//!
+//! Duas regras foram acrescentadas depois de uma sessão ao vivo:
+//!
+//! - **Voz.** O texto gerado é lido em voz alta *pelo usuário*, como fala dele. O modelo
+//!   escorregava para a voz de assistente ("Se quiser, posso te mostrar como ela
+//!   funciona"), que é inútil — o usuário não pode ler isso numa entrevista. O prompt agora
+//!   diz de quem é a voz e proíbe explicitamente oferta de serviço e pergunta de
+//!   fechamento.
+//! - **Enunciado que ainda não pede nada.** Uma pergunta falada costuma vir em duas partes
+//!   ("Tenho uma query que respondia em menos de um segundo." … "O que pode ter
+//!   acontecido?"), e o silêncio entre elas finaliza a primeira utterance. Responder à
+//!   premissa produz uma resposta a meia pergunta. Ela entrou na lista fechada de `[SKIP]`
+//!   como o único caso em que a dúvida se resolve pulando em vez de respondendo curto — a
+//!   premissa vira contexto da fala seguinte, que é onde o pedido aparece.
 
 use crate::conversation::{ConversationSpeaker, ConversationTurn};
 
@@ -59,20 +73,27 @@ pub const INSTRUCTION_HEADER: &str = "INSTRUÇÃO:";
 /// específicos) porque um modelo pequeno tende a seguir o que leu por último — não é
 /// redundância acidental.
 const INSTRUCTION: &str = "INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do \
-usuário à fala atual, em 2 a 4 frases. Vá direto ao conteúdo: nada de repetir ou \
+usuário à fala atual, em 2 a 4 frases. Você é o próprio usuário falando na reunião, não um \
+assistente atendendo alguém: nunca se ofereça para mostrar, explicar, buscar ou fazer algo, \
+e nunca termine perguntando se a pessoa quer mais detalhes. \
+Vá direto ao conteúdo: nada de repetir ou \
 reformular a pergunta, nada de comentar se ela exige resposta, nada de preâmbulo. \
 Use o contexto apenas para resolver referências, e não invente nome, número, data, \
 empresa ou tecnologia que não esteja nele. \
 A pontuação da transcrição não é confiável: um pedido ou pergunta sem \"?\" continua \
 sendo um pedido. \
 Escreva apenas [SKIP] se a fala atual for somente saudação, somente uma confirmação \
-isolada, ou um fragmento sem sentido.";
+isolada, um fragmento sem sentido, ou apenas um enunciado que monta contexto sem pedir \
+nada ainda.";
 
 const NO_CONTEXT_PLACEHOLDER: &str = "(nenhum — esta é a primeira fala da sessão)";
 
 const SYSTEM_PROMPT: &str = "Você é um copiloto que ajuda o usuário durante uma reunião ao vivo. \
 Você recebe o contexto recente da conversa e a fala atual da outra pessoa, e escreve a \
 resposta que o usuário daria agora, em primeira pessoa. \
+O texto que você escreve vai ser lido em voz alta pelo próprio usuário, como fala dele: \
+você está escrevendo *como* ele, uma pessoa participando da conversa do próprio \
+conhecimento — nunca como um assistente conversando com ele ou com a outra pessoa. \
 Sua decisão é sempre sobre a fala atual: o contexto serve apenas para entender referências \
 como \"isso\", \"esse problema\" ou \"essa decisão\".\n\
 \n\
@@ -85,14 +106,24 @@ Responder é o padrão. Use [SKIP] apenas nestes casos, e em nenhum outro:\n\
 - saudação isolada;\n\
 - confirmação ou reação isolada, sem nada depois (\"perfeito\", \"entendi\", \"faz sentido\");\n\
 - fragmento truncado, ruído ou fala sem sentido;\n\
+- enunciado que só monta contexto e ainda não pede nada: a pessoa está apresentando um \
+fato, uma premissa ou o começo de um problema, sem nenhuma pergunta, pedido, imperativo \
+ou convite a falar. O pedido costuma vir na fala seguinte; responder agora é responder a \
+meia pergunta;\n\
 - fala que claramente não é dirigida ao usuário.\n\
 Se a fala contiver qualquer pergunta, pedido, imperativo ou convite a falar — inclusive \
 logo depois de uma confirmação, como em \"Perfeito. Me conta como foi\" — responda ao \
-pedido. Em qualquer dúvida, responda curto em vez de usar [SKIP].\n\
+pedido. Em qualquer dúvida entre responder e pular, responda curto — exceto quando a \
+dúvida for exatamente esta: a fala não pede nada e parece ser só o começo do assunto. \
+Aí espere, com [SKIP].\n\
 \n\
 Como responder:\n\
 - primeira pessoa, tom natural de fala, 2 a 4 frases;\n\
 - direto ao conteúdo, sem se apresentar e sem repetir a pergunta antes de responder;\n\
+- nunca ofereça serviço nem ajuda: nada de \"se quiser, posso te mostrar\", \"quer que eu \
+explique\", \"posso te ajudar com isso\". Quem fala é um participante da reunião \
+respondendo, não uma ferramenta se colocando à disposição;\n\
+- nunca termine perguntando se a resposta serviu nem oferecendo continuar;\n\
 - não invente fatos específicos que não estejam no contexto: nomes de empresa, clientes, \
 produtos, datas, números, métricas ou tecnologias;\n\
 - se o pedido exigir um detalhe pessoal que você não tem, responda pelo raciocínio e pela \
@@ -105,6 +136,8 @@ Exemplos, só para calibrar a decisão (não copie este formato na resposta):\n\
 - \"Perfeito. Me conta um caso em que isso deu errado\" → responder (é um pedido, mesmo \
 vindo depois de uma confirmação);\n\
 - \"E quais foram as limitações disso\" → responder (é pergunta, mesmo sem \"?\");\n\
+- \"Tenho um serviço que até ontem respondia rápido.\" → [SKIP] (só monta o cenário, \
+ainda não pede nada — o pedido vem depois);\n\
 - \"Beleza, faz sentido.\" → [SKIP];\n\
 - \"Bom dia, tudo bem?\" → [SKIP].\n\
 \n\
@@ -395,7 +428,7 @@ mod tests {
         let built = build_request(&[], &current, "pode explicar melhor?");
         let system = &built.request.messages[0].content;
         assert!(system.contains("Responder é o padrão"));
-        assert!(system.contains("Em qualquer dúvida, responda curto"));
+        assert!(system.contains("Em qualquer dúvida entre responder e pular, responda curto"));
         assert!(system.contains("[SKIP]"));
     }
 
@@ -447,6 +480,69 @@ mod tests {
         assert!(system.contains("não invente fatos específicos que não estejam no contexto"));
         assert!(system.contains("nunca preencha com detalhe inventado"));
         assert!(user.contains("não invente nome, número, data, empresa ou tecnologia"));
+    }
+
+    /// O texto gerado é lido em voz alta pelo usuário. Voz de assistente ("Se quiser, posso
+    /// te mostrar como ela funciona") é inutilizável numa reunião — a regra tem que estar
+    /// nos dois lugares, porque modelos pequenos seguem melhor o que leram por último.
+    #[test]
+    fn prompt_states_whose_voice_it_is_and_forbids_offering_assistance() {
+        let speech = "Só que de ontem para hoje ela começou a demorar cinco segundos.";
+        let current = turn(1, ConversationSpeaker::OtherPerson, speech);
+        let built = build_request(&[], &current, speech);
+        let system = &built.request.messages[0].content;
+        let user = &built.request.messages.last().unwrap().content;
+
+        assert!(system.contains("lido em voz alta pelo próprio usuário"));
+        assert!(system.contains("nunca ofereça serviço nem ajuda"));
+        assert!(system.contains("se quiser, posso te mostrar"));
+        assert!(system.contains("nunca termine perguntando se a resposta serviu"));
+        assert!(user.contains(
+            "não um \
+assistente atendendo alguém"
+        ));
+        assert!(user.contains("nunca termine perguntando se a pessoa quer mais detalhes"));
+    }
+
+    /// Uma pergunta falada chega partida em duas utterances quando há silêncio no meio. A
+    /// primeira metade é só premissa; responder a ela é responder a meia pergunta.
+    #[test]
+    fn skip_policy_covers_a_statement_that_does_not_ask_for_anything_yet() {
+        let speech = "Eu tenho uma query que até ontem respondia em menos de um segundo.";
+        let current = turn(1, ConversationSpeaker::OtherPerson, speech);
+        let built = build_request(&[], &current, speech);
+        let system = &built.request.messages[0].content;
+        let user = &built.request.messages.last().unwrap().content;
+
+        assert!(system.contains("enunciado que só monta contexto e ainda não pede nada"));
+        assert!(system.contains("responder agora é responder a meia pergunta"));
+        // A exceção precisa ser explícita, senão ela é anulada pela regra anterior
+        // ("em qualquer dúvida, responda curto").
+        assert!(system.contains("Aí espere, com [SKIP]"));
+        assert!(user.contains(
+            "apenas um enunciado que monta contexto sem pedir \
+nada ainda"
+        ));
+    }
+
+    /// A metade que traz o pedido tem que chegar ao modelo com a premissa anterior como
+    /// contexto — é isso que faz a resposta cobrir a pergunta inteira mesmo partida.
+    #[test]
+    fn the_half_that_carries_the_request_sees_the_previous_half_as_context() {
+        let premise = "Eu tenho uma query que até ontem respondia em menos de um segundo.";
+        let request = "Só que hoje ela demora cinco segundos. O que pode ter acontecido?";
+        let current = turn(
+            1,
+            ConversationSpeaker::OtherPerson,
+            &format!("{premise} {request}"),
+        );
+        let built = build_request(&[], &current, request);
+        let user = &built.request.messages.last().unwrap().content;
+
+        let context_block = user.split(CURRENT_SPEECH_HEADER).next().unwrap();
+        assert!(context_block.contains(premise));
+        assert!(!context_block.contains("O que pode ter acontecido?"));
+        assert!(user.contains(&format!("{CURRENT_SPEECH_HEADER}\n{request}")));
     }
 
     /// As falas que o produto **precisa** responder e a que precisa pular, do requisito.

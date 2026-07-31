@@ -96,6 +96,9 @@ pub struct GenerationDiagnostics {
     /// `SkipDetector` — permite ver se o modelo de fato respondeu `[SKIP]`.
     pub raw_prefix: String,
     pub skip_detected: bool,
+    /// Quantos caracteres o `EchoGuard` descartou por serem repetição da própria fala. Sem
+    /// isso, um eco integralmente suprimido chega à UI idêntico a uma resposta vazia.
+    pub echo_suppressed_characters: usize,
     /// Motivo do cancelamento, quando aplicável (hoje só existe uma causa: uma nova
     /// utterance no mesmo turno substituiu esta geração).
     pub cancel_reason: Option<String>,

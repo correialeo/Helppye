@@ -6,6 +6,7 @@
 pub mod anthropic;
 pub mod config_store;
 pub mod context;
+pub mod echo_guard;
 pub mod engine;
 pub mod events;
 pub mod net;
