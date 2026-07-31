@@ -9,8 +9,8 @@ export const GhostButton = forwardRef<HTMLButtonElement, ButtonHTMLAttributes<HT
       ref={ref}
       type="button"
       className={cx(
-        "inline-flex items-center justify-center gap-1.5 rounded-[8px] px-3 py-2 text-sm font-semibold text-neutral-400 transition-colors duration-150",
-        "hover:bg-white/5 hover:text-neutral-200",
+        "inline-flex items-center justify-center gap-1.5 rounded-full px-3 py-2 text-sm font-medium text-neutral-400 transition-colors duration-150",
+        "hover:bg-white/[0.07] hover:text-neutral-100",
         "disabled:cursor-not-allowed disabled:opacity-50",
         className,
       )}

@@ -13,8 +13,8 @@ export const SecondaryButton = forwardRef<HTMLButtonElement, SecondaryButtonProp
       ref={ref}
       type="button"
       className={cx(
-        "inline-flex items-center justify-center gap-2 rounded-[9px] border border-white/12 bg-white/[0.04] px-4 py-2.5 text-sm font-semibold text-neutral-100 transition-colors duration-150",
-        "hover:border-white/25 hover:bg-surface-raised",
+        "inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-white/[0.055] px-4 py-2.5 text-sm font-semibold text-neutral-100 transition-colors duration-150",
+        "hover:border-white/16 hover:bg-white/[0.09]",
         "disabled:cursor-not-allowed disabled:opacity-50",
         fullWidth && "w-full",
         className,

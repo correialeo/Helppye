@@ -3,8 +3,8 @@ import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import type { AppScreen } from "../app/appFlow";
 
 const APP_SIZE = new LogicalSize(420, 760);
-const SESSION_SIZE = new LogicalSize(290, 84);
-const SESSION_MIN_SIZE = new LogicalSize(270, 76);
+const SESSION_SIZE = new LogicalSize(306, 88);
+const SESSION_MIN_SIZE = new LogicalSize(286, 80);
 const APP_MIN_SIZE = new LogicalSize(360, 560);
 
 /**

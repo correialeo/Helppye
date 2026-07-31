@@ -24,8 +24,8 @@ export const TextInput = forwardRef<HTMLInputElement, TextInputProps>(
           ref={ref}
           id={inputId}
           className={cx(
-            "w-full rounded-[4px] border border-white/14 bg-[#171717] px-3 py-2.5 text-sm text-neutral-100 placeholder:text-neutral-500 transition-colors duration-150",
-            "hover:border-white/20 focus:border-brand-400/70",
+            "w-full rounded-[10px] border border-white/10 bg-white/[0.06] px-3 py-2.5 text-sm text-neutral-100 placeholder:text-neutral-500 transition-colors duration-150",
+            "hover:border-white/16 focus:border-white/28",
             "disabled:cursor-not-allowed disabled:opacity-50",
             className,
           )}
