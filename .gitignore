@@ -10,6 +10,11 @@ npm-debug.log*
 /src-tauri/target/
 /src-tauri/gen/
 
+# Benchmark: o manifesto é versionado, o áudio e os relatórios não — os dois são conteúdo
+# de reunião (ver benchmarks/README.md)
+/benchmarks/audio/
+/benchmarks/results/
+
 # Tooling / local state
 .claude/
 .tokensave/
