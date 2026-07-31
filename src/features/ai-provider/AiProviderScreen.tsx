@@ -4,7 +4,7 @@ import { ProviderOption } from "../../components/ui/ProviderOption";
 import { ONBOARDING_STEPS, onboardingStepIndex } from "../../app/appFlow";
 import { useResponseProvider } from "../../hooks/useResponseProvider";
 import { OllamaPanel } from "./OllamaPanel";
-import { CloudProviderPanel } from "./CloudProviderPanel";
+import { CloudProviderPanel, isCloudProvider } from "./CloudProviderPanel";
 import type { ResponseProviderKind } from "../../types/responseProvider";
 
 interface AiProviderScreenProps {
@@ -68,23 +68,24 @@ export function AiProviderScreen({ onBack, onContinue }: AiProviderScreenProps) 
         ))}
       </div>
 
-      {status &&
-        (active === "ollama" ? (
-          <OllamaPanel
-            status={status}
-            onSave={(config) => saveConfig({ provider: "ollama", ...config })}
-          />
-        ) : (
-          <CloudProviderPanel
-            provider={active}
-            status={status}
-            onSaveKey={async (provider, apiKey, model) => {
-              await saveConfig({ provider, model, baseUrl: null, ollamaKeepAlive: null });
-              await saveApiKey(provider, apiKey);
-            }}
-            onRemoveKey={removeApiKey}
-          />
-        ))}
+      {status && active === "ollama" && (
+        <OllamaPanel
+          status={status}
+          onSave={(config) => saveConfig({ provider: "ollama", ...config })}
+        />
+      )}
+
+      {status && isCloudProvider(active) && (
+        <CloudProviderPanel
+          provider={active}
+          status={status}
+          onSaveKey={async (provider, apiKey, model) => {
+            await saveConfig({ provider, model, baseUrl: null, ollamaKeepAlive: null });
+            await saveApiKey(provider, apiKey);
+          }}
+          onRemoveKey={removeApiKey}
+        />
+      )}
     </OnboardingLayout>
   );
 }

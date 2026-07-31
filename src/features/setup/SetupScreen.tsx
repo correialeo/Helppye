@@ -5,7 +5,7 @@ import { PrimaryButton } from "../../components/ui/PrimaryButton";
 import { SecondaryButton } from "../../components/ui/SecondaryButton";
 import { ProviderOption } from "../../components/ui/ProviderOption";
 import { OllamaPanel } from "../ai-provider/OllamaPanel";
-import { CloudProviderPanel } from "../ai-provider/CloudProviderPanel";
+import { CloudProviderPanel, isCloudProvider } from "../ai-provider/CloudProviderPanel";
 import { useAudioCapture } from "../../hooks/useAudioCapture";
 import { useModelStatus } from "../../hooks/useModelStatus";
 import { useResponseProvider } from "../../hooks/useResponseProvider";
@@ -201,20 +201,20 @@ export function SetupScreen({ onBack, onComplete }: SetupScreenProps) {
             open={open === 4}
             onToggle={() => setOpen(open === 4 ? 0 : 4)}
           >
-            {status &&
-              (activeProvider === "ollama" ? (
-                <OllamaPanel status={status} onSave={(config) => saveConfig({ provider: "ollama", ...config })} />
-              ) : (
-                <CloudProviderPanel
-                  provider={activeProvider}
-                  status={status}
-                  onSaveKey={async (provider, apiKey, modelName) => {
-                    await saveConfig({ provider, model: modelName, baseUrl: null, ollamaKeepAlive: null });
-                    await saveApiKey(provider, apiKey);
-                  }}
-                  onRemoveKey={removeApiKey}
-                />
-              ))}
+            {status && activeProvider === "ollama" && (
+              <OllamaPanel status={status} onSave={(config) => saveConfig({ provider: "ollama", ...config })} />
+            )}
+            {status && isCloudProvider(activeProvider) && (
+              <CloudProviderPanel
+                provider={activeProvider}
+                status={status}
+                onSaveKey={async (provider, apiKey, modelName) => {
+                  await saveConfig({ provider, model: modelName, baseUrl: null, ollamaKeepAlive: null });
+                  await saveApiKey(provider, apiKey);
+                }}
+                onRemoveKey={removeApiKey}
+              />
+            )}
           </SetupItem>
 
           <SetupItem

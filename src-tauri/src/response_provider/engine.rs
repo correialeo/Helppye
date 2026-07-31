@@ -100,14 +100,17 @@ pub struct GenerationTrigger {
 
 use super::anthropic::AnthropicProvider;
 use super::config_store::{self, ResponseProviderConfig, ResponseProviderKind};
-use super::context::build_request;
+use super::context::{DefaultResponseContextBuilder, ResponseContextBuilder, ResponseContextInput};
 use super::echo_guard::EchoGuard;
 use super::events::{
     emit_response_suggestion_event, GenerationDiagnostics, ResponseSuggestionEvent,
 };
 use super::ollama::OllamaProvider;
 use super::openai_compatible::OpenAiCompatibleProvider;
-use super::provider::{ResponseChunk, ResponseProvider, ResponseProviderError, ResponseRequest};
+use super::provider::{
+    ResponseChunk, ResponseProvider, ResponseProviderCapabilities, ResponseProviderError,
+    ResponseRequest,
+};
 use super::secrets;
 use super::skip_detector::{SkipDecision, SkipDetector};
 
@@ -174,8 +177,12 @@ struct MisconfiguredProvider {
 
 #[async_trait::async_trait]
 impl ResponseProvider for MisconfiguredProvider {
-    fn provider_name(&self) -> &'static str {
-        "misconfigured"
+    fn id(&self) -> super::provider::ResponseProviderId {
+        super::provider::ResponseProviderId::Misconfigured
+    }
+
+    fn capabilities(&self) -> super::provider::ResponseProviderCapabilities {
+        super::provider::ResponseProviderCapabilities::none()
     }
 
     async fn stream_reply(
@@ -192,42 +199,116 @@ impl ResponseProvider for MisconfiguredProvider {
     }
 }
 
+/// Lê a chave do keychain para um provedor que **exige** credencial. `Ok(None)` e erro de
+/// keychain viram a mesma coisa aqui — uma mensagem — porque o efeito para o usuário é o
+/// mesmo: não há como gerar, e ele precisa saber por quê antes de entrar numa reunião.
+fn required_api_key(kind: ResponseProviderKind) -> Result<String, String> {
+    match secrets::load_api_key(kind) {
+        Ok(Some(key)) => Ok(key),
+        Ok(None) => Err(format!(
+            "nenhuma API key de {} configurada",
+            kind.id().display_name()
+        )),
+        Err(e) => Err(format!(
+            "falha ao ler a API key de {}: {e}",
+            kind.id().display_name()
+        )),
+    }
+}
+
+/// Chave opcional: LM Studio e endpoint personalizado funcionam sem nenhuma. Uma falha de
+/// keychain aqui não é fatal — vira `None` com aviso, e a configuração decide se isso é um
+/// problema (via `CredentialMode`).
+fn optional_api_key(kind: ResponseProviderKind) -> Option<String> {
+    match secrets::load_api_key(kind) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(
+                provider = kind.id().as_str(),
+                %e,
+                "falha ao ler credencial opcional do keychain; seguindo sem credencial"
+            );
+            None
+        }
+    }
+}
+
 fn build_provider(config: &ResponseProviderConfig) -> Arc<dyn ResponseProvider> {
+    // Toda construção compatível com a API da OpenAI pode falhar por endpoint recusado
+    // (esquema inválido, credencial embutida na URL) ou cabeçalho reservado. A falha vira
+    // `MisconfiguredProvider` com a mensagem, nunca um provider silenciosamente quebrado.
+    fn from_openai_compatible(
+        built: Result<OpenAiCompatibleProvider, ResponseProviderError>,
+    ) -> Arc<dyn ResponseProvider> {
+        match built {
+            Ok(provider) => Arc::new(provider),
+            Err(e) => misconfigured(&e.to_string()),
+        }
+    }
+
     match config.provider {
         ResponseProviderKind::Ollama => Arc::new(OllamaProvider::new(
             config.base_url.clone(),
             config.model.clone(),
             config.ollama_keep_alive.clone(),
         )),
-        ResponseProviderKind::OpenAi => match secrets::load_api_key(ResponseProviderKind::OpenAi) {
-            Ok(Some(api_key)) => Arc::new(OpenAiCompatibleProvider::openai(
+        ResponseProviderKind::LmStudio => {
+            from_openai_compatible(OpenAiCompatibleProvider::lm_studio(
+                config.model.clone(),
+                config.base_url.clone(),
+                optional_api_key(ResponseProviderKind::LmStudio),
+            ))
+        }
+        ResponseProviderKind::OpenAi => match required_api_key(ResponseProviderKind::OpenAi) {
+            Ok(api_key) => from_openai_compatible(OpenAiCompatibleProvider::openai(
                 api_key,
                 config.model.clone(),
                 config.base_url.clone(),
             )),
-            Ok(None) => misconfigured("nenhuma API key da OpenAI configurada"),
-            Err(e) => misconfigured(&format!("falha ao ler a API key da OpenAI: {e}")),
+            Err(message) => misconfigured(&message),
         },
-        ResponseProviderKind::DeepSeek => {
-            match secrets::load_api_key(ResponseProviderKind::DeepSeek) {
-                Ok(Some(api_key)) => Arc::new(OpenAiCompatibleProvider::deepseek(
+        ResponseProviderKind::DeepSeek => match required_api_key(ResponseProviderKind::DeepSeek) {
+            Ok(api_key) => from_openai_compatible(OpenAiCompatibleProvider::deepseek(
+                api_key,
+                config.model.clone(),
+                config.base_url.clone(),
+            )),
+            Err(message) => misconfigured(&message),
+        },
+        ResponseProviderKind::OpenRouter => {
+            match required_api_key(ResponseProviderKind::OpenRouter) {
+                Ok(api_key) => from_openai_compatible(OpenAiCompatibleProvider::openrouter(
                     api_key,
                     config.model.clone(),
                     config.base_url.clone(),
                 )),
-                Ok(None) => misconfigured("nenhuma API key da DeepSeek configurada"),
-                Err(e) => misconfigured(&format!("falha ao ler a API key da DeepSeek: {e}")),
+                Err(message) => misconfigured(&message),
             }
         }
+        ResponseProviderKind::CustomOpenAiCompatible => {
+            let Some(base_url) = config.base_url.clone() else {
+                // Sem URL não há para onde cair de volta: adivinhar um endpoint aqui
+                // mandaria a conversa da reunião para um host que o usuário não escolheu.
+                return misconfigured(
+                    "endpoint compatível com a OpenAI exige uma URL base configurada",
+                );
+            };
+            from_openai_compatible(OpenAiCompatibleProvider::custom(
+                base_url,
+                config.model.clone(),
+                optional_api_key(ResponseProviderKind::CustomOpenAiCompatible),
+                config.credential_mode,
+                config.custom_headers.clone(),
+            ))
+        }
         ResponseProviderKind::Anthropic => {
-            match secrets::load_api_key(ResponseProviderKind::Anthropic) {
-                Ok(Some(api_key)) => Arc::new(AnthropicProvider::new(
+            match required_api_key(ResponseProviderKind::Anthropic) {
+                Ok(api_key) => Arc::new(AnthropicProvider::new(
                     api_key,
                     config.model.clone(),
                     config.base_url.clone(),
                 )),
-                Ok(None) => misconfigured("nenhuma API key da Anthropic configurada"),
-                Err(e) => misconfigured(&format!("falha ao ler a API key da Anthropic: {e}")),
+                Err(message) => misconfigured(&message),
             }
         }
     }
@@ -245,6 +326,12 @@ pub fn is_eligible_turn(turn: &ConversationTurn) -> bool {
 
 pub struct ResponseEngine {
     provider: Mutex<Arc<dyn ResponseProvider>>,
+    /// Montagem de prompt como dependência, não como chamada direta a uma função livre.
+    /// Não é `Mutex` porque não há caminho de troca em runtime: o builder é escolhido na
+    /// construção do motor. O ganho é de isolamento — quem monta contexto vê apenas
+    /// `ResponseContextInput` e não tem acesso ao estado de sessão, às gerações ativas ou
+    /// aos diagnósticos.
+    context_builder: Arc<dyn ResponseContextBuilder>,
     config: Mutex<ResponseProviderConfig>,
     config_path: PathBuf,
     session: Mutex<SessionState>,
@@ -261,6 +348,7 @@ impl ResponseEngine {
         let provider = build_provider(&config);
         ResponseEngine {
             provider: Mutex::new(provider),
+            context_builder: Arc::new(DefaultResponseContextBuilder),
             config: Mutex::new(config),
             config_path,
             session: Mutex::new(SessionState::new(SessionId::new())),
@@ -353,6 +441,18 @@ impl ResponseEngine {
             .lock()
             .expect("response engine mutex poisoned")
             .clone()
+    }
+
+    /// Capacidades do provedor **efetivamente construído**, não as do catálogo. A diferença
+    /// importa: `registry::descriptors()` descreve o LM Studio como local porque o padrão
+    /// dele é `localhost`, mas a instância sabe se o `base_url` configurado aponta para
+    /// outra máquina. Um provedor mal configurado responde `none()` e a UI mostra isso em
+    /// vez de prometer streaming que não vai acontecer.
+    pub fn active_capabilities(&self) -> ResponseProviderCapabilities {
+        self.provider
+            .lock()
+            .expect("response engine mutex poisoned")
+            .capabilities()
     }
 
     pub fn update_config(&self, config: ResponseProviderConfig) -> Result<(), String> {
@@ -622,7 +722,12 @@ impl ResponseEngine {
             self.clear_if_current(&ctx);
             return;
         };
-        let built = build_request(&history, &turn, &trigger.utterance_text);
+        let built = self.context_builder.build(ResponseContextInput {
+            session_id: ctx.session_id,
+            history: &history,
+            current_turn: &turn,
+            current_utterance_text: &trigger.utterance_text,
+        });
 
         tracing::info!(
             session_id = ctx.session_id.value(),
@@ -649,6 +754,27 @@ impl ResponseEngine {
             generation_id = ctx.generation_id.value(),
             "starting response generation"
         );
+
+        // O trace desta fala foi aberto no primeiro chunk de áudio e ligado ao
+        // `UtteranceId` quando a timeline finalizou a utterance. Ligá-lo agora à geração é
+        // o último elo: sem ele, "fim da fala → primeiro token visível" não fecharia,
+        // porque o trecho de transcrição e o de geração viveriam em traces distintos.
+        let telemetry = crate::telemetry::recorder();
+        let trace = telemetry.trace_for_utterance(ctx.utterance_id);
+        if let Some(trace) = trace {
+            telemetry.link_generation(trace, ctx.generation_id.value());
+            telemetry.mark(trace, crate::telemetry::Milestone::GenerationStarted);
+            telemetry.record_attributes(
+                trace,
+                crate::telemetry::TraceAttributes {
+                    response_provider: Some(provider.provider_name().to_string()),
+                    response_model: Some(model.clone()),
+                    context_turn_count: Some(built.context_turn_count),
+                    context_character_count: Some(built.context_character_count),
+                    ..Default::default()
+                },
+            );
+        }
 
         let started_at = Instant::now();
         let mut diagnostics = GenerationDiagnostics {
@@ -1016,6 +1142,31 @@ impl ResponseEngine {
             t.saturating_duration_since(utterance_finalized_at)
                 .as_millis() as u64
         });
+        // Marcos gravados com os `Instant` capturados dentro do laço de streaming: pegar o
+        // lock do recorder a cada chunk HTTP seria custo no caminho crítico sem ganho, já
+        // que o valor medido é o mesmo.
+        let telemetry = crate::telemetry::recorder();
+        if let Some(trace) = telemetry.trace_for_generation(ctx.generation_id.value()) {
+            use crate::telemetry::Milestone;
+            if let Some(at) = first_http_chunk_at {
+                telemetry.mark_at(trace, Milestone::FirstHttpChunk, at);
+            }
+            if let Some(at) = first_visible_text_at {
+                telemetry.mark_at(trace, Milestone::FirstVisibleToken, at);
+            }
+            telemetry.mark(trace, Milestone::GenerationCompleted);
+            // Fecha o trace em **todo** caminho de saída, inclusive skip, erro e
+            // cancelamento — `finish_generation` é justamente o ponto por onde todos passam.
+            // Não fechar aqui deixaria um trace vivo por fala descartada até a evicção.
+            if let Some(snapshot) = telemetry.finish(trace) {
+                tracing::debug!(
+                    trace_id = %snapshot.trace_id,
+                    latencies = ?snapshot.latencies,
+                    "pipeline trace"
+                );
+            }
+        }
+
         tracing::debug!(?diagnostics, "response generation diagnostics");
         if self.session_is_active(ctx.session_id) {
             emit_response_suggestion_event(
@@ -1166,6 +1317,7 @@ mod tests {
         fn for_test(provider: Arc<dyn ResponseProvider>) -> Arc<Self> {
             Arc::new(ResponseEngine {
                 provider: Mutex::new(provider),
+                context_builder: Arc::new(super::super::context::DefaultResponseContextBuilder),
                 config: Mutex::new(ResponseProviderConfig::default()),
                 config_path: PathBuf::from("unused-in-tests.json"),
                 session: Mutex::new(SessionState::new(SessionId::new())),
@@ -1274,6 +1426,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResponseProvider for FakeProvider {
+        fn id(&self) -> super::super::provider::ResponseProviderId {
+            super::super::provider::ResponseProviderId::Misconfigured
+        }
+
+        fn capabilities(&self) -> super::super::provider::ResponseProviderCapabilities {
+            super::super::provider::ResponseProviderCapabilities::none()
+        }
+
         fn provider_name(&self) -> &'static str {
             "fake"
         }
@@ -2109,6 +2269,53 @@ Acho que depende do tamanho do time.",
             "depois da fronteira, a geração da sessão A não emite mais nada: {:?}",
             types_of(&events)
         );
+        assert_eq!(engine.active_generation_count(), 0);
+    }
+
+    /// Cancelar não pode significar apenas "parar de publicar". O stream tem que ser
+    /// **largado**: enquanto ele existir, a conexão HTTP com o provedor segue aberta e o
+    /// modelo segue gerando — em provedor de nuvem isso é cota queimada em texto que
+    /// ninguém vai ler, e em Ollama local é a GPU ocupada quando a próxima fala chegar.
+    /// O sinal observável de que o stream foi descartado é o outro lado do canal fechar.
+    #[tokio::test]
+    async fn cancelling_drops_the_provider_stream_instead_of_draining_it() {
+        let (provider, chunks) = FakeProvider::scripted();
+        let engine = ResponseEngine::for_test(provider.clone());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote_turn(1, "pergunta longa"), session),
+        );
+        wait_for_event_type(&mut rx, "started").await;
+        chunks
+            .send(ResponseChunk::Delta("começando".to_string()))
+            .unwrap();
+        wait_for_event_type(&mut rx, "delta").await;
+        assert!(
+            !chunks.is_closed(),
+            "com a geração viva, o stream ainda está sendo lido"
+        );
+
+        // `end_session` cancela e, deliberadamente, não publica evento terminal da sessão
+        // que acabou (ver `is_publishable`) — então o que se observa aqui não é um evento,
+        // é o stream do provedor sendo descartado.
+        engine.end_session(session);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !chunks.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("o stream do provedor precisa ser largado ao cancelar");
+        assert!(chunks
+            .send(ResponseChunk::Delta("ninguém lê".to_string()))
+            .is_err());
         assert_eq!(engine.active_generation_count(), 0);
     }
 

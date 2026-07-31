@@ -6,14 +6,26 @@ import { SecondaryButton } from "../../components/ui/SecondaryButton";
 import { InlineNotice } from "../../components/ui/InlineNotice";
 import type { ResponseProviderKind, ResponseProviderStatus } from "../../types/responseProvider";
 
-const PROVIDER_COPY: Record<Exclude<ResponseProviderKind, "ollama">, { name: string; modelPlaceholder: string }> = {
+/** Provedores de nuvem que esta tela oferece. LM Studio e endpoint personalizado existem
+ * no backend mas não aparecem aqui: os dois são configuração de endpoint, não "conecte sua
+ * conta com uma API key", e o onboarding não é o lugar de pedir uma URL. */
+export type CloudProviderKind = "open_ai" | "anthropic" | "deep_seek" | "open_router";
+
+const PROVIDER_COPY: Record<CloudProviderKind, { name: string; modelPlaceholder: string }> = {
   open_ai: { name: "OpenAI", modelPlaceholder: "gpt-4o-mini" },
   anthropic: { name: "Anthropic", modelPlaceholder: "claude-sonnet-5" },
   deep_seek: { name: "DeepSeek", modelPlaceholder: "deepseek-chat" },
+  open_router: { name: "OpenRouter", modelPlaceholder: "openai/gpt-4o-mini" },
 };
 
+/** Estreita o provedor vindo do backend para os que este painel sabe apresentar. Sem isto
+ * a tela mostraria um campo "sk-..." para LM Studio, que nem sempre pede credencial. */
+export function isCloudProvider(provider: ResponseProviderKind): provider is CloudProviderKind {
+  return provider in PROVIDER_COPY;
+}
+
 interface CloudProviderPanelProps {
-  provider: Exclude<ResponseProviderKind, "ollama">;
+  provider: CloudProviderKind;
   status: ResponseProviderStatus;
   onSaveKey: (provider: ResponseProviderKind, apiKey: string, model: string) => Promise<void>;
   onRemoveKey: (provider: ResponseProviderKind) => Promise<void>;

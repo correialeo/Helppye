@@ -7,7 +7,7 @@ import { ProviderOption } from "../../components/ui/ProviderOption";
 import { SecondaryButton } from "../../components/ui/SecondaryButton";
 import { DeviceTestBlock } from "../audio-setup/DeviceTestBlock";
 import { OllamaPanel } from "../ai-provider/OllamaPanel";
-import { CloudProviderPanel } from "../ai-provider/CloudProviderPanel";
+import { CloudProviderPanel, isCloudProvider } from "../ai-provider/CloudProviderPanel";
 import { useOnboardingStore } from "../../stores/useOnboardingStore";
 import { useResponseProvider } from "../../hooks/useResponseProvider";
 import type { ResponseProviderKind } from "../../types/responseProvider";
@@ -86,20 +86,20 @@ export function SettingsScreen({ onBack, onOpenDeveloperTools }: SettingsScreenP
               />
             ))}
           </div>
-          {status &&
-            (activeProvider === "ollama" ? (
-              <OllamaPanel status={status} onSave={(config) => saveConfig({ provider: "ollama", ...config })} />
-            ) : (
-              <CloudProviderPanel
-                provider={activeProvider}
-                status={status}
-                onSaveKey={async (provider, apiKey, model) => {
-                  await saveConfig({ provider, model, baseUrl: null, ollamaKeepAlive: null });
-                  await saveApiKey(provider, apiKey);
-                }}
-                onRemoveKey={removeApiKey}
-              />
-            ))}
+          {status && activeProvider === "ollama" && (
+            <OllamaPanel status={status} onSave={(config) => saveConfig({ provider: "ollama", ...config })} />
+          )}
+          {status && isCloudProvider(activeProvider) && (
+            <CloudProviderPanel
+              provider={activeProvider}
+              status={status}
+              onSaveKey={async (provider, apiKey, model) => {
+                await saveConfig({ provider, model, baseUrl: null, ollamaKeepAlive: null });
+                await saveApiKey(provider, apiKey);
+              }}
+              onRemoveKey={removeApiKey}
+            />
+          )}
         </Section>
 
         <Section title="Geral">

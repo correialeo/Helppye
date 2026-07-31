@@ -8,8 +8,9 @@ use serde::Deserialize;
 
 use super::net::{line_stream, sse_data_payloads};
 use super::provider::{
-    ResponseChunk, ResponseMessage, ResponseProvider, ResponseProviderError, ResponseRequest,
-    ResponseRole, ResponseStream, ResponseStreamMeta,
+    ResponseChunk, ResponseMessage, ResponseProvider, ResponseProviderCapabilities,
+    ResponseProviderError, ResponseProviderId, ResponseRequest, ResponseRole, ResponseStream,
+    ResponseStreamMeta,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -30,6 +31,15 @@ impl AnthropicProvider {
             api_key,
             model,
         }
+    }
+
+    /// Mesma razão de `OllamaProvider::sanitized_endpoint`: `reqwest::Error` faz `Display`
+    /// da URL completa, e aqui a credencial viaja em cabeçalho justamente para não estar
+    /// na URL — não faz sentido reintroduzi-la no log pela porta dos fundos.
+    fn sanitized_endpoint(&self) -> String {
+        super::endpoint::validate_base_url(&self.base_url)
+            .map(|endpoint| endpoint.sanitized())
+            .unwrap_or_else(|_| self.base_url.clone())
     }
 }
 
@@ -77,8 +87,18 @@ struct AnthropicErrorBody {
 
 #[async_trait]
 impl ResponseProvider for AnthropicProvider {
-    fn provider_name(&self) -> &'static str {
-        "anthropic"
+    fn id(&self) -> ResponseProviderId {
+        ResponseProviderId::Anthropic
+    }
+
+    fn capabilities(&self) -> ResponseProviderCapabilities {
+        ResponseProviderCapabilities {
+            local: false,
+            streaming: true,
+            requires_credentials: true,
+            configurable_base_url: true,
+            custom_headers: false,
+        }
     }
 
     async fn stream_reply(
@@ -106,7 +126,7 @@ impl ResponseProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ResponseProviderError::Network(e.to_string()))?;
+            .map_err(|e| super::endpoint::classify_request_error(&self.sanitized_endpoint(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();

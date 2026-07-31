@@ -5,6 +5,20 @@ import { IconButton } from "../../components/ui/IconButton";
 import { ONBOARDING_STEPS, onboardingStepIndex, type AppScreen } from "../../app/appFlow";
 import { useAudioCaptureStore } from "../../stores/useAudioCaptureStore";
 import { useResponseProvider } from "../../hooks/useResponseProvider";
+import type { ResponseProviderKind } from "../../types/responseProvider";
+
+/** Um nome por provedor conhecido. `Record` completo de propósito: o typecheck passa a
+ * cobrar esta linha quando um provedor novo é adicionado no backend, em vez de deixar o
+ * resumo de onboarding exibir `undefined`. */
+const PROVIDER_NAMES: Record<ResponseProviderKind, string> = {
+  ollama: "Ollama",
+  lm_studio: "LM Studio",
+  open_ai: "OpenAI",
+  anthropic: "Anthropic",
+  deep_seek: "DeepSeek",
+  open_router: "OpenRouter",
+  custom_open_ai_compatible: "Endpoint personalizado",
+};
 
 interface OnboardingReviewScreenProps {
   onBack: () => void;
@@ -43,9 +57,7 @@ export function OnboardingReviewScreen({ onBack, onContinue, onEdit }: Onboardin
 
   const microphoneName = microphone.devices.find((d) => d.id === microphone.selectedId)?.name ?? "Padrão do sistema";
   const outputName = systemOutput.devices.find((d) => d.id === systemOutput.selectedId)?.name ?? "Padrão do sistema";
-  const providerLabel =
-    status &&
-    `${{ ollama: "Ollama", open_ai: "OpenAI", anthropic: "Anthropic", deep_seek: "DeepSeek" }[status.provider]} · ${status.model}`;
+  const providerLabel = status && `${PROVIDER_NAMES[status.provider]} · ${status.model}`;
 
   return (
     <OnboardingLayout

@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use super::net::line_stream;
 use super::provider::{
-    to_chat_json, ResponseChunk, ResponseProvider, ResponseProviderError, ResponseRequest,
-    ResponseStream, ResponseStreamMeta,
+    to_chat_json, ResponseChunk, ResponseProvider, ResponseProviderCapabilities,
+    ResponseProviderError, ResponseProviderId, ResponseRequest, ResponseStream, ResponseStreamMeta,
 };
 
 const DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -38,6 +38,15 @@ impl OllamaProvider {
             keep_alive,
         }
     }
+
+    /// `esquema://host:porta` do endereço configurado — a única forma que pode ir para log
+    /// ou mensagem de erro. Cai para o `base_url` cru só quando ele nem chega a validar,
+    /// caso em que não há caminho nem query para esconder.
+    fn sanitized_endpoint(&self) -> String {
+        super::endpoint::validate_base_url(&self.base_url)
+            .map(|endpoint| endpoint.sanitized())
+            .unwrap_or_else(|_| self.base_url.clone())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,8 +67,23 @@ struct OllamaMessage {
 
 #[async_trait]
 impl ResponseProvider for OllamaProvider {
-    fn provider_name(&self) -> &'static str {
-        "ollama"
+    fn id(&self) -> ResponseProviderId {
+        ResponseProviderId::Ollama
+    }
+
+    fn capabilities(&self) -> ResponseProviderCapabilities {
+        ResponseProviderCapabilities {
+            // O Ollama padrão é `localhost`, mas `base_url` pode apontar para outra
+            // máquina. Classificar o endereço configurado é o que impede a UI de prometer
+            // "não sai da sua máquina" para um host remoto.
+            local: !super::endpoint::validate_base_url(&self.base_url)
+                .map(|e| e.classification().leaves_machine())
+                .unwrap_or(true),
+            streaming: true,
+            requires_credentials: false,
+            configurable_base_url: true,
+            custom_headers: false,
+        }
     }
 
     async fn stream_reply(
@@ -95,7 +119,9 @@ impl ResponseProvider for OllamaProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ResponseProviderError::Network(e.to_string()))?;
+            // Sanitiza antes de sair: `reqwest::Error` imprime a URL inteira, e mesmo num
+            // Ollama local isso enche o log de ruído sem valor de diagnóstico.
+            .map_err(|e| super::endpoint::classify_request_error(&self.sanitized_endpoint(), e))?;
 
         if !response.status().is_success() {
             let status = response.status();

@@ -23,12 +23,20 @@ pub enum SecretError {
     Backend(String),
 }
 
+/// Uma conta de keychain por provedor. Strings literais e não `id().as_str()` de propósito:
+/// este é o nome sob o qual uma chave já foi gravada na máquina do usuário. Derivá-lo de um
+/// identificador que pode ser renomeado faria o app perder silenciosamente a credencial já
+/// salva na primeira vez que alguém encurtasse um nome.
 fn account_for(provider: ResponseProviderKind) -> Option<&'static str> {
     match provider {
+        // Ollama fala com um servidor local sem autenticação; não há segredo a guardar.
         ResponseProviderKind::Ollama => None,
+        ResponseProviderKind::LmStudio => Some("lm-studio-api-key"),
         ResponseProviderKind::OpenAi => Some("openai-api-key"),
         ResponseProviderKind::DeepSeek => Some("deepseek-api-key"),
         ResponseProviderKind::Anthropic => Some("anthropic-api-key"),
+        ResponseProviderKind::OpenRouter => Some("openrouter-api-key"),
+        ResponseProviderKind::CustomOpenAiCompatible => Some("custom-openai-compatible-api-key"),
     }
 }
 
@@ -69,8 +77,8 @@ pub fn delete_api_key(provider: ResponseProviderKind) -> Result<(), SecretError>
 }
 
 pub fn has_api_key(provider: ResponseProviderKind) -> Result<bool, SecretError> {
-    match provider {
-        ResponseProviderKind::Ollama => Ok(false),
-        _ => Ok(load_api_key(provider)?.is_some()),
+    if !provider.accepts_api_key() {
+        return Ok(false);
     }
+    Ok(load_api_key(provider)?.is_some())
 }

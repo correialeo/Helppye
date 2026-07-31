@@ -38,7 +38,7 @@
 //!   como o único caso em que a dúvida se resolve pulando em vez de respondendo curto — a
 //!   premissa vira contexto da fala seguinte, que é onde o pedido aparece.
 
-use crate::conversation::{ConversationSpeaker, ConversationTurn};
+use crate::conversation::{ConversationSpeaker, ConversationTurn, SessionId};
 
 use super::provider::{ResponseMessage, ResponseRequest, ResponseRole};
 
@@ -144,10 +144,30 @@ ainda não pede nada — o pedido vem depois);\n\
 Para pular, responda apenas com o texto exato [SKIP] e nada mais, sem explicações e sem \
 pontuação extra.";
 
-/// Resultado de `build_request`: a requisição em si mais os números que os diagnósticos e
-/// os logs (`context_built`, `context_turn_count`, `context_character_count`) precisam.
+/// Tudo o que a montagem de contexto tem direito de olhar. É deliberadamente um struct
+/// fechado, e não `&ResponseEngine`: o que **não** está aqui é a lista do que não pode
+/// entrar no prompt — diagnósticos, IDs, sugestões anteriores, texto bruto, histórico de
+/// outra sessão. Um builder novo não tem como incluir nada disso por engano, porque não
+/// recebe.
+///
+/// `history` já vem filtrado por sessão pelo chamador
+/// (`ResponseEngine::history_snapshot(session_id)`); `session_id` viaja junto só para
+/// atribuição em log, nunca para o texto do prompt.
+pub struct ResponseContextInput<'a> {
+    pub session_id: SessionId,
+    /// Turnos finalizados anteriores da sessão ativa, do mais antigo para o mais recente.
+    pub history: &'a [ConversationTurn],
+    /// Turno elegível cuja utterance acabou de finalizar.
+    pub current_turn: &'a ConversationTurn,
+    /// Texto exato da utterance atual — a fala que será respondida ou pulada. Já
+    /// normalizado pela camada de normalização; o texto bruto não chega até aqui.
+    pub current_utterance_text: &'a str,
+}
+
+/// Resultado da montagem: a requisição em si mais os números que os diagnósticos e os logs
+/// (`context_built`, `context_turn_count`, `context_character_count`) precisam.
 #[derive(Debug, Clone)]
-pub struct BuiltContext {
+pub struct ResponseContext {
     pub request: ResponseRequest,
     /// Quantas linhas de contexto conversacional entraram no prompt.
     pub context_turn_count: usize,
@@ -155,6 +175,37 @@ pub struct BuiltContext {
     pub context_character_count: usize,
     /// Versão abreviada do prompt para inspeção em modo de desenvolvedor.
     pub sanitized_preview: String,
+}
+
+/// Ponto de extensão da montagem de prompt. Existe separado do `ResponseEngine` porque as
+/// duas coisas mudam por motivos diferentes: o motor cuida de sessão, cancelamento,
+/// streaming e estado terminal — tudo isso é invariante de produto; o prompt é a parte que
+/// se ajusta por experimentação. Trocar um não deve arriscar o outro.
+pub trait ResponseContextBuilder: Send + Sync {
+    fn build(&self, input: ResponseContextInput<'_>) -> ResponseContext;
+}
+
+/// A montagem descrita no cabeçalho deste módulo. Sem estado: os tetos são constantes de
+/// compilação, não configuração de runtime, porque mudá-los muda a latência medida.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DefaultResponseContextBuilder;
+
+impl ResponseContextBuilder for DefaultResponseContextBuilder {
+    fn build(&self, input: ResponseContextInput<'_>) -> ResponseContext {
+        let built = build_request(
+            input.history,
+            input.current_turn,
+            input.current_utterance_text,
+        );
+        tracing::trace!(
+            session_id = input.session_id.value(),
+            history_turns_available = input.history.len(),
+            context_turn_count = built.context_turn_count,
+            context_character_count = built.context_character_count,
+            "contexto montado"
+        );
+        built
+    }
 }
 
 fn speaker_label(speaker: ConversationSpeaker) -> &'static str {
@@ -199,11 +250,11 @@ fn preceding_text_in_turn(turn: &ConversationTurn, current_utterance_text: &str)
 /// para o mais recente; `current` é o turno elegível cuja utterance acabou de finalizar; e
 /// `current_utterance_text` é o texto exato dessa utterance — a fala que será classificada
 /// e respondida.
-pub fn build_request(
+fn build_request(
     history: &[ConversationTurn],
     current: &ConversationTurn,
     current_utterance_text: &str,
-) -> BuiltContext {
+) -> ResponseContext {
     let mut context_lines = Vec::new();
     let mut budget = MAX_HISTORY_CHARS;
 
@@ -274,7 +325,7 @@ pub fn build_request(
         temperature: TEMPERATURE,
     };
 
-    BuiltContext {
+    ResponseContext {
         request,
         context_turn_count: context_lines.len(),
         context_character_count: context_block.chars().count(),
@@ -305,7 +356,7 @@ mod tests {
         }
     }
 
-    fn prompt_text(built: &BuiltContext) -> String {
+    fn prompt_text(built: &ResponseContext) -> String {
         built
             .request
             .messages
@@ -582,6 +633,204 @@ nada ainda"
             assert!(user.contains("Escreva agora, em primeira pessoa, a resposta do usuário"));
             assert!(!user.contains("Decida exclusivamente"));
         }
+    }
+
+    fn build(input: ResponseContextInput<'_>) -> ResponseContext {
+        DefaultResponseContextBuilder.build(input)
+    }
+
+    fn input<'a>(
+        history: &'a [ConversationTurn],
+        current: &'a ConversationTurn,
+        utterance: &'a str,
+    ) -> ResponseContextInput<'a> {
+        ResponseContextInput {
+            session_id: SessionId::new(),
+            history,
+            current_turn: current,
+            current_utterance_text: utterance,
+        }
+    }
+
+    /// O builder padrão é a mesma montagem, só alcançada pelo trait. Se um dia divergirem,
+    /// o motor passaria a mandar um prompt diferente do que os testes acima verificam.
+    #[test]
+    fn trait_builder_matches_the_direct_assembly() {
+        let current = turn(2, ConversationSpeaker::OtherPerson, "e como você resolveu");
+        let history = vec![turn(1, ConversationSpeaker::User, "usei fila")];
+        let direct = build_request(&history, &current, "e como você resolveu");
+        let via_trait = build(input(&history, &current, "e como você resolveu"));
+
+        assert_eq!(direct.request.messages, via_trait.request.messages);
+        assert_eq!(direct.context_turn_count, via_trait.context_turn_count);
+        assert_eq!(
+            direct.context_character_count,
+            via_trait.context_character_count
+        );
+    }
+
+    /// Nenhum identificador interno pode vazar para o prompt. IDs não são conversa: além de
+    /// gastar token, dão ao modelo material para citar ("no turno 7 você disse...").
+    #[test]
+    fn prompt_never_contains_internal_identifiers() {
+        let current = turn(4242, ConversationSpeaker::OtherPerson, "e daí?");
+        let history = vec![turn(777, ConversationSpeaker::User, "estava tudo bem")];
+        let built = build(input(&history, &current, "e daí?"));
+        let prompt = prompt_text(&built);
+
+        for needle in [
+            "4242",
+            "777",
+            "turn_id",
+            "utterance_id",
+            "session_id",
+            "generation_id",
+            "TurnId",
+        ] {
+            assert!(
+                !prompt.contains(needle),
+                "prompt não pode carregar {needle:?}"
+            );
+        }
+    }
+
+    /// Diagnóstico é observabilidade, não contexto. Latência, motivo de finalização e
+    /// contagem de normalizações não entram no prompt em nenhuma circunstância — e o
+    /// `ResponseContextInput` nem tem por onde recebê-los.
+    #[test]
+    fn prompt_never_contains_diagnostics() {
+        let current = turn(1, ConversationSpeaker::OtherPerson, "me explica isso");
+        let built = build(input(&[], &current, "me explica isso"));
+        let prompt = prompt_text(&built);
+
+        for needle in [
+            "inactivity_timeout",
+            "gap_ms",
+            "silence_detected",
+            "latency",
+            "_ms",
+            "finalization_reason",
+            "normalization_changes",
+        ] {
+            assert!(
+                !prompt.contains(needle),
+                "prompt não pode carregar diagnóstico {needle:?}"
+            );
+        }
+    }
+
+    /// O bloco de contexto respeita o teto de caracteres mesmo com histórico enorme. O teto
+    /// é o que mantém o tempo de prefill previsível: sem ele, uma reunião longa faria a
+    /// latência crescer com a duração da conversa.
+    #[test]
+    fn context_block_respects_the_character_cap() {
+        let current = turn(100, ConversationSpeaker::OtherPerson, "e agora");
+        let history: Vec<ConversationTurn> = (0..40)
+            .map(|i| turn(i, ConversationSpeaker::User, &"palavra ".repeat(400)))
+            .collect();
+
+        let built = build(input(&history, &current, "e agora"));
+        assert!(
+            built.context_character_count <= MAX_HISTORY_CHARS,
+            "bloco de contexto com {} caracteres",
+            built.context_character_count
+        );
+        assert!(built.context_turn_count <= MAX_HISTORY_TURNS);
+    }
+
+    /// Exatamente uma fala atual. Utterances anteriores do mesmo turno viram contexto; a
+    /// atual aparece uma única vez, sob o cabeçalho de fala atual.
+    #[test]
+    fn exactly_one_current_utterance_reaches_the_model() {
+        let first = "Eu tenho um serviço que roda em três instâncias.";
+        let second = "O que você faria para diagnosticar";
+        let current = turn(
+            1,
+            ConversationSpeaker::OtherPerson,
+            &format!("{first} {second}"),
+        );
+        let built = build(input(&[], &current, second));
+        let user = built.request.messages.last().unwrap().content.clone();
+
+        let speech = &user[user.find(CURRENT_SPEECH_HEADER).unwrap()..];
+        assert_eq!(speech.matches(second).count(), 1);
+        assert!(!speech.contains(first));
+        assert_eq!(user.matches(CURRENT_SPEECH_HEADER).count(), 1);
+    }
+
+    /// Sugestões anteriores não podem voltar como diálogo. O histórico é de
+    /// `ConversationTurn` — o que o **usuário falou** —, e o `ResponseContextInput` não tem
+    /// campo por onde uma sugestão gerada entraria. Este teste fixa esse contrato: o que
+    /// aparece no contexto é só o que foi dito.
+    #[test]
+    fn previously_generated_suggestions_are_not_replayed_as_dialogue() {
+        let suggestion = "Na prática eu separaria a leitura da escrita e mediria antes.";
+        let current = turn(2, ConversationSpeaker::OtherPerson, "e o que mais");
+        let history = vec![turn(1, ConversationSpeaker::User, "a gente usa Postgres")];
+        let built = build(input(&history, &current, "e o que mais"));
+
+        let prompt = prompt_text(&built);
+        assert!(!prompt.contains(suggestion));
+        assert!(prompt.contains("a gente usa Postgres"));
+    }
+
+    /// Bruto e normalizado nunca convivem no prompt. O que chega aqui já é o texto
+    /// normalizado; o bruto existe só em `TranscriptNormalizationResult`, para diagnóstico.
+    #[test]
+    fn only_normalized_text_reaches_the_prompt() {
+        let raw = "a gente usa micro serviços com rabbit mq";
+        let normalized = "A gente usa microserviços com RabbitMQ";
+        let current = turn(2, ConversationSpeaker::OtherPerson, "e quantos são");
+        let history = vec![turn(1, ConversationSpeaker::User, normalized)];
+        let built = build(input(&history, &current, "e quantos são"));
+
+        let prompt = prompt_text(&built);
+        assert!(prompt.contains(normalized));
+        assert!(!prompt.contains(raw));
+    }
+
+    /// Um mesmo trecho não pode entrar duas vezes: uma como turno do histórico e outra como
+    /// fala precedente do turno atual. Duplicação embaralha a decisão de `[SKIP]` e gasta
+    /// orçamento de contexto com repetição.
+    #[test]
+    fn context_never_duplicates_the_same_speech() {
+        let preceding = "Perfeito.";
+        let speech = "Me conta um caso real";
+        let current = turn(
+            2,
+            ConversationSpeaker::OtherPerson,
+            &format!("{preceding} {speech}"),
+        );
+        // O mesmo turno também presente no histórico — é o que acontece quando o turno já
+        // foi empurrado para o histórico antes da geração disparar.
+        let history = vec![
+            turn(1, ConversationSpeaker::User, "trabalhei com filas"),
+            current.clone(),
+        ];
+        let built = build(input(&history, &current, speech));
+        let user = built.request.messages.last().unwrap().content.clone();
+        let context_block =
+            &user[user.find(CONTEXT_HEADER).unwrap()..user.find(CURRENT_SPEECH_HEADER).unwrap()];
+
+        assert_eq!(context_block.matches(preceding).count(), 1);
+        assert_eq!(context_block.matches(speech).count(), 0);
+    }
+
+    /// Turnos vazios não ocupam linha de contexto. Uma utterance que virou texto vazio
+    /// depois da normalização não pode consumir um dos quatro turnos disponíveis.
+    #[test]
+    fn blank_turns_do_not_consume_context_slots() {
+        let current = turn(10, ConversationSpeaker::OtherPerson, "e então");
+        let history = vec![
+            turn(1, ConversationSpeaker::User, "   "),
+            turn(2, ConversationSpeaker::OtherPerson, ""),
+            turn(3, ConversationSpeaker::User, "isso mesmo"),
+        ];
+        let built = build(input(&history, &current, "e então"));
+
+        assert_eq!(built.context_turn_count, 1);
+        let user = built.request.messages.last().unwrap().content.clone();
+        assert!(user.contains("isso mesmo"));
     }
 
     #[test]

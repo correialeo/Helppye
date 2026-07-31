@@ -7,18 +7,56 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use super::openai_compatible::CredentialMode;
+use super::provider::ResponseProviderId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseProviderKind {
     Ollama,
+    /// Servidor local do LM Studio, dialeto compatível com a API da OpenAI.
+    LmStudio,
     OpenAi,
     DeepSeek,
     Anthropic,
+    OpenRouter,
+    /// Endpoint compatível com a API da OpenAI definido inteiramente pelo usuário.
+    CustomOpenAiCompatible,
 }
 
 impl ResponseProviderKind {
+    /// Se o provedor **não funciona** sem credencial no keychain. LM Studio e endpoint
+    /// personalizado ficam de fora de propósito: os dois aceitam credencial opcional
+    /// (`CredentialMode`), e exigi-la impediria o caso mais comum — um servidor local sem
+    /// autenticação nenhuma.
     pub fn requires_api_key(self) -> bool {
+        matches!(
+            self,
+            ResponseProviderKind::OpenAi
+                | ResponseProviderKind::DeepSeek
+                | ResponseProviderKind::Anthropic
+                | ResponseProviderKind::OpenRouter
+        )
+    }
+
+    /// Se aceita credencial, obrigatória ou não. É o que decide se a UI mostra o campo de
+    /// chave de API.
+    pub fn accepts_api_key(self) -> bool {
         !matches!(self, ResponseProviderKind::Ollama)
+    }
+
+    pub fn id(self) -> ResponseProviderId {
+        match self {
+            ResponseProviderKind::Ollama => ResponseProviderId::Ollama,
+            ResponseProviderKind::LmStudio => ResponseProviderId::LmStudio,
+            ResponseProviderKind::OpenAi => ResponseProviderId::OpenAi,
+            ResponseProviderKind::DeepSeek => ResponseProviderId::DeepSeek,
+            ResponseProviderKind::Anthropic => ResponseProviderId::Anthropic,
+            ResponseProviderKind::OpenRouter => ResponseProviderId::OpenRouter,
+            ResponseProviderKind::CustomOpenAiCompatible => {
+                ResponseProviderId::CustomOpenAiCompatible
+            }
+        }
     }
 }
 
@@ -40,6 +78,17 @@ pub struct ResponseProviderConfig {
     /// arquivos de configuração salvos antes deste campo existir continuem carregando.
     #[serde(default = "default_ollama_keep_alive")]
     pub ollama_keep_alive: Option<String>,
+    /// Como a credencial viaja para provedores compatíveis com a API da OpenAI. Só é
+    /// consultado por eles; Ollama e Anthropic têm forma própria e fixa.
+    #[serde(default)]
+    pub credential_mode: CredentialMode,
+    /// Cabeçalhos extras exigidos por alguns gateways (`X-Title` no OpenRouter, cabeçalho
+    /// de roteamento num proxy corporativo). Pares nome/valor, validados por
+    /// `endpoint::build_custom_headers` — reservados são recusados, e os valores nunca
+    /// entram em log. **Não** são persistidos como local de segredo: uma credencial
+    /// pertence ao keychain, e este campo vai para um JSON em texto puro no disco.
+    #[serde(default)]
+    pub custom_headers: Vec<(String, String)>,
 }
 
 impl Default for ResponseProviderConfig {
@@ -49,6 +98,8 @@ impl Default for ResponseProviderConfig {
             model: "llama3.1".to_string(),
             base_url: None,
             ollama_keep_alive: default_ollama_keep_alive(),
+            credential_mode: CredentialMode::default(),
+            custom_headers: Vec::new(),
         }
     }
 }
@@ -118,6 +169,8 @@ mod tests {
             model: "claude-sonnet".to_string(),
             base_url: Some("https://example.com".to_string()),
             ollama_keep_alive: Some("5m".to_string()),
+            credential_mode: CredentialMode::BearerToken,
+            custom_headers: vec![("x-title".to_string(), "Helppye".to_string())],
         };
 
         save(&path, &config).unwrap();
@@ -137,5 +190,49 @@ mod tests {
         let config = load(&path);
         assert_eq!(config.ollama_keep_alive, default_ollama_keep_alive());
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Os campos de endpoint personalizado nasceram depois; um arquivo salvo antes deles
+    /// tem que continuar carregando com os padrões, e não derrubar o usuário para uma
+    /// configuração inteiramente padrão (o que trocaria o provedor dele por Ollama).
+    #[test]
+    fn config_saved_before_custom_endpoint_fields_still_loads() {
+        let path = temp_config_path("pre-custom-endpoint");
+        std::fs::write(
+            &path,
+            r#"{"provider":"deep_seek","model":"deepseek-chat","base_url":null,"ollama_keep_alive":"10m"}"#,
+        )
+        .unwrap();
+
+        let config = load(&path);
+        assert_eq!(config.provider, ResponseProviderKind::DeepSeek);
+        assert_eq!(config.model, "deepseek-chat");
+        assert_eq!(config.credential_mode, CredentialMode::BearerToken);
+        assert!(config.custom_headers.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// LM Studio e endpoint personalizado aceitam credencial, mas não a exigem: o caso
+    /// normal é um servidor local sem autenticação nenhuma.
+    #[test]
+    fn only_cloud_providers_require_an_api_key() {
+        for kind in [
+            ResponseProviderKind::OpenAi,
+            ResponseProviderKind::DeepSeek,
+            ResponseProviderKind::Anthropic,
+            ResponseProviderKind::OpenRouter,
+        ] {
+            assert!(kind.requires_api_key(), "{kind:?}");
+            assert!(kind.accepts_api_key(), "{kind:?}");
+        }
+        for kind in [
+            ResponseProviderKind::LmStudio,
+            ResponseProviderKind::CustomOpenAiCompatible,
+        ] {
+            assert!(!kind.requires_api_key(), "{kind:?}");
+            assert!(kind.accepts_api_key(), "{kind:?}");
+        }
+        assert!(!ResponseProviderKind::Ollama.requires_api_key());
+        assert!(!ResponseProviderKind::Ollama.accepts_api_key());
     }
 }
