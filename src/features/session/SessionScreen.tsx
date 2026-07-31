@@ -502,7 +502,7 @@ export function SessionScreen({
 
   if (mode === "ai") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#16161a]">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#16161a]/94 backdrop-blur-md">
         <AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} nativeDrag />
       </div>
     );
@@ -549,7 +549,7 @@ export function SessionScreen({
       <DraggablePanel
         position={aiPosition}
         onPositionChange={setAiPosition}
-        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#16161a]"
+        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#16161a]/94 backdrop-blur-md"
         handle={<AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} />}
       >
         {null}
