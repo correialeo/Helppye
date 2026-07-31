@@ -15,39 +15,51 @@ pub const RESPONSE_SUGGESTION_EVENT: &str = "response://suggestion-event";
 /// `session_id + turn_id + generation_id` (ver `docs/response-suggestion.md`). O backend
 /// já descarta eventos de sessões encerradas antes de emitir — o campo existe para o
 /// frontend poder auditar/validar, não como única linha de defesa.
+///
+/// `utterance_id` também é público, e não só um detalhe de diagnóstico: é a **fala que
+/// esta sugestão responde**. Um turno agrupa tudo que a outra pessoa falou enquanto
+/// manteve a palavra e pode conter várias perguntas; sem `utterance_id` o frontend só
+/// conseguia indexar sugestões por turno, e a resposta à segunda pergunta sobrescrevia a
+/// resposta à primeira em vez de aparecer ao lado dela.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseSuggestionEvent {
     Started {
         session_id: SessionId,
         turn_id: TurnId,
+        utterance_id: UtteranceId,
         generation_id: GenerationId,
     },
     Delta {
         session_id: SessionId,
         turn_id: TurnId,
+        utterance_id: UtteranceId,
         generation_id: GenerationId,
         text: String,
     },
     Completed {
         session_id: SessionId,
         turn_id: TurnId,
+        utterance_id: UtteranceId,
         generation_id: GenerationId,
         text: String,
     },
     Skipped {
         session_id: SessionId,
         turn_id: TurnId,
+        utterance_id: UtteranceId,
         generation_id: GenerationId,
     },
     Cancelled {
         session_id: SessionId,
         turn_id: TurnId,
+        utterance_id: UtteranceId,
         generation_id: GenerationId,
     },
     Error {
         session_id: SessionId,
         turn_id: TurnId,
+        utterance_id: UtteranceId,
         generation_id: GenerationId,
         message: String,
     },

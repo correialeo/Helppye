@@ -52,85 +52,81 @@ export type SuggestionStatus =
   | "error";
 
 export interface SuggestionState {
+  /** A fala que esta sugestão responde. É a chave do estado — ver o comentário do reducer. */
+  utteranceId: number;
+  turnId: number;
   generationId: number;
   status: SuggestionStatus;
   text: string;
-  /**
-   * Texto da última sugestão com conteúdo (`completed_with_text`) para este turno, mantido
-   * enquanto a geração seguinte ainda não produziu nenhum delta visível. Sem isso, o evento
-   * `started` da nova geração apagaria a sugestão anterior da tela instantaneamente — a
-   * pessoa continuar/mudar de assunto não deveria fazer a resposta útil já mostrada
-   * desaparecer antes que exista algo melhor para colocar no lugar (ver
-   * `docs/response-suggestion.md`, "continuação da fala da outra pessoa").
-   */
-  previousText?: string;
   errorMessage?: string;
 }
 
 /**
- * Reduz um evento de `response://suggestion-event` sobre o estado de sugestões por turno.
- * Descarta eventos de uma geração já superada (identificada por `generation_id`), já que o
- * backend pode cancelar uma geração em andamento e iniciar outra para o mesmo turno.
+ * Reduz um evento de `response://suggestion-event` sobre o estado de sugestões,
+ * **indexado por `utterance_id`, não por `turn_id`**.
+ *
+ * Um `ConversationTurn` agrupa tudo que a outra pessoa falou enquanto manteve a palavra e
+ * pode conter várias perguntas. Indexando por turno, a resposta à segunda pergunta
+ * sobrescrevia a resposta à primeira: a tela tinha um slot só e o conteúdo era trocado no
+ * lugar. A fala (`utterance`) é a unidade que de fato corresponde a uma sugestão — uma
+ * pergunta, uma resposta — então cada uma tem seu próprio registro e nada é substituído.
+ *
+ * Eventos de uma geração já superada (`generation_id` diferente do registrado) são
+ * descartados: o backend cancela a geração em andamento quando a mesma fala é estendida.
  *
  * `completed` é dividido em `completed_with_text`/`completed_empty` conforme o texto final:
- * antes disso, uma resposta vazia e um skip pareciam estados diferentes na origem mas nada
- * garantia que a UI os distinguisse — agora ambos carregam um status próprio.
- *
- * `started` não apaga o texto de uma geração anterior concluída — ele fica em
- * `previousText` (status `preparing`) até o primeiro `delta` com conteúdo real da nova
- * geração chegar, quando finalmente substitui o que estava na tela.
+ * uma resposta vazia e um skip são estados diferentes na origem e precisam continuar
+ * distinguíveis na UI.
  */
 export function applyResponseSuggestionEvent(
   current: Record<number, SuggestionState>,
   event: ResponseSuggestionEventRef,
 ): Record<number, SuggestionState> {
+  if (event.utterance_id === undefined) {
+    return current;
+  }
+
   if (event.type === "started") {
-    const existing = current[event.turn_id];
-    const previousText =
-      existing?.status === "completed_with_text" ? existing.text : existing?.previousText;
     return {
       ...current,
-      [event.turn_id]: {
+      [event.utterance_id]: {
+        utteranceId: event.utterance_id,
+        turnId: event.turn_id,
         generationId: event.generation_id,
         status: "preparing",
         text: "",
-        previousText,
       },
     };
   }
 
-  const existing = current[event.turn_id];
+  const existing = current[event.utterance_id];
   if (!existing || existing.generationId !== event.generation_id) {
     return current;
   }
 
   switch (event.type) {
-    case "delta": {
-      const text = existing.text + (event.text ?? "");
-      // Primeiro delta com conteúdo real: a nova geração já tem algo para mostrar, então a
-      // resposta anterior pode finalmente sair de cena.
-      const previousText = text.length > 0 ? undefined : existing.previousText;
+    case "delta":
       return {
         ...current,
-        [event.turn_id]: { ...existing, status: "streaming", text, previousText },
+        [event.utterance_id]: {
+          ...existing,
+          status: "streaming",
+          text: existing.text + (event.text ?? ""),
+        },
       };
-    }
     case "completed": {
       const text = event.text ?? existing.text;
       const status: SuggestionStatus = text.trim().length > 0 ? "completed_with_text" : "completed_empty";
-      // Se esta geração terminou sem conteúdo (skip/vazia/erro/cancelada mais adiante),
-      // `previousText` continua disponível pra UI não regredir para "nenhuma sugestão".
-      const previousText = status === "completed_with_text" ? undefined : existing.previousText;
-      return { ...current, [event.turn_id]: { ...existing, status, text, previousText } };
+      return { ...current, [event.utterance_id]: { ...existing, status, text } };
     }
     case "skipped":
-      return { ...current, [event.turn_id]: { ...existing, status: "skipped" } };
+      return { ...current, [event.utterance_id]: { ...existing, status: "skipped" } };
     case "cancelled":
-      return { ...current, [event.turn_id]: { ...existing, status: "cancelled" } };
+      return { ...current, [event.utterance_id]: { ...existing, status: "cancelled" } };
     case "error":
       return {
         ...current,
-        [event.turn_id]: { ...existing, status: "error", errorMessage: event.message },
+        [event.utterance_id]: { ...existing, status: "error", errorMessage: event.message },
       };
     default:
       return current;

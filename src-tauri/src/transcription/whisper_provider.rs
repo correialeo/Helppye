@@ -117,6 +117,44 @@ impl TranscriptionProvider for WhisperCppProvider {
     }
 }
 
+/// O whisper anota trechos *sem fala* — música, silêncio, aplausos, ruído — em vez de
+/// devolver texto vazio: `[Música]`, `[BLANK_AUDIO]`, `[Aplausos]`, `♪`. Isso não é fala e
+/// não pode virar uma utterance. Uma marcação dessas logo depois de uma pergunta real abre
+/// uma utterance nova no mesmo turno, que (a) cancela a geração já em andamento para a
+/// pergunta e (b) é então corretamente classificada como `[SKIP]` — o usuário vê "Nenhuma
+/// sugestão" exatamente na fala que mais precisava de resposta.
+///
+/// Só colchetes e notas musicais são removidos em qualquer posição do texto: o whisper
+/// nunca envolve fala real em colchetes. Parênteses aparecem ocasionalmente em fala
+/// transcrita de verdade, então `(...)` só é descartado quando é o segmento inteiro.
+fn strip_non_speech_annotations(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        if !inner.contains('(') && !inner.contains(')') {
+            return String::new();
+        }
+    }
+
+    let mut out = String::with_capacity(trimmed.len());
+    let mut depth = 0usize;
+    for ch in trimmed.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            '♪' | '♫' => {}
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+
+    // Colapsa o espaço que sobra onde a marcação estava, para não deixar espaços duplos
+    // atravessarem até a junção de texto da timeline.
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Runs on a blocking task: `WhisperState::full` is a synchronous, CPU-bound call and
 /// must never run on the async runtime's worker threads.
 fn transcribe_blocking(
@@ -153,14 +191,14 @@ fn transcribe_blocking(
         let segment_text = segment
             .to_str_lossy()
             .map_err(|e| TranscriptionError::InferenceFailed(e.to_string()))?;
-        let trimmed = segment_text.trim();
-        if trimmed.is_empty() {
+        let cleaned = strip_non_speech_annotations(&segment_text);
+        if cleaned.is_empty() {
             continue;
         }
         if !text.is_empty() {
             text.push(' ');
         }
-        text.push_str(trimmed);
+        text.push_str(&cleaned);
     }
 
     let detected_language = match language {
@@ -187,6 +225,52 @@ mod tests {
             language: TranscriptionLanguage::default(),
             device: InferenceDevice::Cpu,
         }
+    }
+
+    #[test]
+    fn non_speech_annotations_are_dropped_entirely() {
+        for annotation in [
+            "[Música]",
+            "[MÚSICA]",
+            "[BLANK_AUDIO]",
+            "[Aplausos]",
+            "(música de fundo)",
+            "♪",
+            "♪♪♪",
+            "   ",
+        ] {
+            assert_eq!(
+                strip_non_speech_annotations(annotation),
+                "",
+                "{annotation:?} não é fala e não pode virar uma utterance"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_glued_to_real_speech_leaves_the_speech_intact() {
+        // O caso observado: a pergunta e a marcação chegam no mesmo texto. Descartar o
+        // segmento inteiro perderia a pergunta; manter a marcação suja o prompt.
+        assert_eq!(
+            strip_non_speech_annotations(
+                "Me conta um caso real em que você usou monolito. [Música]"
+            ),
+            "Me conta um caso real em que você usou monolito."
+        );
+        assert_eq!(
+            strip_non_speech_annotations("[Música] Então, o que você acha?"),
+            "Então, o que você acha?"
+        );
+    }
+
+    #[test]
+    fn real_speech_with_parentheses_is_preserved() {
+        // Parênteses no meio de fala real são fala; só o segmento inteiro entre parênteses
+        // é anotação.
+        assert_eq!(
+            strip_non_speech_annotations("A latência (p99) subiu muito."),
+            "A latência (p99) subiu muito."
+        );
     }
 
     #[tokio::test]

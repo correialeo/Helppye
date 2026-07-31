@@ -93,11 +93,18 @@ export function useConversationTimeline() {
         return;
       }
 
-      // session_ended / session_started: a sessão anterior deixou de existir no backend
-      // (turnos, utterances e contexto apagados). A tela acompanha em vez de continuar
-      // mostrando uma conversa que já não é mais consultável.
-      setTurns([]);
-      setUtterances([]);
+      // A sessão anterior deixou de existir no backend (turnos, utterances e contexto
+      // apagados). A tela acompanha em vez de continuar mostrando uma conversa que já não
+      // é mais consultável.
+      //
+      // Explícito de propósito, e não um `else` que pega tudo que não casou acima: como
+      // catch-all, qualquer evento novo ou desconhecido no canal apagaria a timeline
+      // inteira da tela — a janela de sessão ficaria presa em "Ouvindo a conversa...", que
+      // é exatamente o estado exibido quando não existe turno elegível.
+      if (event.type === "session_ended" || event.type === "session_started") {
+        setTurns([]);
+        setUtterances([]);
+      }
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());

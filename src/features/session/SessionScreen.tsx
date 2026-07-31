@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { SessionHeader } from "./SessionHeader";
-import { TranscriptPeek } from "./TranscriptPeek";
-import { SuggestionPanel } from "./SuggestionPanel";
+import { SuggestionFeed } from "./SuggestionFeed";
+import type { Exchange } from "./ExchangeItem";
 import { SessionFooter } from "./SessionFooter";
 import { TranscriptDrawer } from "./TranscriptDrawer";
 import { useConversationTimeline } from "../../hooks/useConversationTimeline";
@@ -18,16 +18,22 @@ interface SessionScreenProps {
   onEndSession: () => void;
 }
 
-function isEligible(turn: { speaker: string; source: string }): boolean {
-  return turn.speaker === "other_person" && turn.source === "system_output";
+/** Mesma regra de elegibilidade do backend (`response_provider::engine::is_eligible_turn`):
+ * só a fala da outra pessoa, vinda da saída do sistema, pede uma sugestão. */
+function isEligible(item: { speaker: string; source: string }): boolean {
+  return item.speaker === "other_person" && item.source === "system_output";
 }
 
 /**
- * The compact window the whole spec revolves around. Structure mirrors
- * docs/design-system.md's mockup exactly: header (mark + status + menu), the other
- * person's last line (secondary), the suggestion (primary, fills the remaining space),
- * footer (mic/system dots + timer). Nothing here is a dashboard — there's exactly one
- * thing to look at.
+ * The compact window the whole spec revolves around: header (mark + status + menu), the
+ * conversation feed (primary, fills the remaining space), footer (mic/system dots +
+ * timer). Nothing here is a dashboard — there's exactly one thing to look at.
+ *
+ * O feed é indexado por **utterance**, não por turno. Um `ConversationTurn` agrupa tudo
+ * que a outra pessoa falou enquanto manteve a palavra e pode conter várias perguntas;
+ * mostrando só o último turno elegível, a resposta à segunda pergunta substituía a
+ * resposta à primeira no lugar. Cada fala vira uma entrada própria, e o que é novo entra
+ * abaixo — nada é sobrescrito.
  */
 export function SessionScreen({ startedAt, onOpenSettings, onOpenDeveloperTools, onEndSession }: SessionScreenProps) {
   const { turns, utterances } = useConversationTimeline();
@@ -37,23 +43,36 @@ export function SessionScreen({ startedAt, onOpenSettings, onOpenDeveloperTools,
   const devMode = useOnboardingStore((s) => s.devMode);
   const [transcriptOpen, setTranscriptOpen] = useState(false);
 
-  const lastEligibleTurn = useMemo(() => {
-    const eligible = turns.filter(isEligible);
-    return eligible[eligible.length - 1] ?? null;
-  }, [turns]);
+  const exchanges = useMemo<Exchange[]>(() => {
+    const turnOf = new Map<number, number>();
+    for (const turn of turns) {
+      for (const utteranceId of turn.utterances) {
+        turnOf.set(utteranceId, turn.id);
+      }
+    }
+    return utterances
+      .filter((u) => isEligible(u) && u.text.trim().length > 0)
+      .map((u) => ({
+        utteranceId: u.id,
+        // O turno vem da timeline; enquanto ele ainda não listou esta fala, a própria
+        // sugestão já carrega o turno de origem (o backend emite os dois juntos).
+        turnId: turnOf.get(u.id) ?? suggestions[u.id]?.turnId ?? -1,
+        question: u.text,
+        suggestion: suggestions[u.id],
+      }));
+  }, [turns, utterances, suggestions]);
 
-  const lastRemoteUtteranceText = useMemo(() => {
-    const remote = utterances.filter((u) => u.speaker === "other_person");
-    return remote[remote.length - 1]?.text ?? null;
-  }, [utterances]);
-
-  const suggestion = lastEligibleTurn ? suggestions[lastEligibleTurn.id] : undefined;
-
-  const handleRegenerate = () => {
-    if (lastEligibleTurn) void regenerateSuggestion(lastEligibleTurn.id);
+  const handleRegenerate = (turnId: number) => {
+    if (turnId >= 0) void regenerateSuggestion(turnId);
   };
 
-  useKeyboardShortcuts({ onToggleSession: onEndSession, onOpenSettings, onRegenerate: handleRegenerate });
+  const latestTurnId = exchanges[exchanges.length - 1]?.turnId ?? -1;
+
+  useKeyboardShortcuts({
+    onToggleSession: onEndSession,
+    onOpenSettings,
+    onRegenerate: () => handleRegenerate(latestTurnId),
+  });
 
   return (
     <div className="flex h-full min-h-screen w-full flex-col bg-app">
@@ -66,10 +85,8 @@ export function SessionScreen({ startedAt, onOpenSettings, onOpenDeveloperTools,
         onEndSession={onEndSession}
       />
 
-      <div className="flex flex-1 flex-col gap-4 overflow-hidden px-4 py-4">
-        <TranscriptPeek text={lastRemoteUtteranceText} />
-        <div className="h-px bg-white/8" />
-        <SuggestionPanel suggestion={suggestion} hasEligibleTurn={lastEligibleTurn !== null} onRegenerate={handleRegenerate} />
+      <div className="flex flex-1 flex-col overflow-hidden px-4 py-4">
+        <SuggestionFeed exchanges={exchanges} onRegenerate={handleRegenerate} />
       </div>
 
       <SessionFooter microphoneStatus={microphone.status} systemStatus={systemOutput.status} startedAt={startedAt} />

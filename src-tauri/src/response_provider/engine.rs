@@ -578,6 +578,7 @@ impl ResponseEngine {
                 Some(ResponseSuggestionEvent::Cancelled {
                     session_id: previous_ctx.session_id,
                     turn_id: previous_ctx.turn_id,
+                    utterance_id: previous_ctx.utterance_id,
                     generation_id: previous.generation_id,
                 }),
             );
@@ -704,6 +705,7 @@ impl ResponseEngine {
             ResponseSuggestionEvent::Started {
                 session_id: ctx.session_id,
                 turn_id: ctx.turn_id,
+                utterance_id: ctx.utterance_id,
                 generation_id: ctx.generation_id,
             },
         ) {
@@ -713,25 +715,26 @@ impl ResponseEngine {
         }
 
         let stream_result = tokio::select! {
-            _ = cancel_token.cancelled() => {
-                diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                diagnostics.event_emitted = "cancelled".to_string();
-                self.publish_terminal_event(
-                    &app,
-                    &ctx,
-                    &terminal_emitted,
-                    TerminalState::Cancelled,
-                    Some(ResponseSuggestionEvent::Cancelled {
-                        session_id: ctx.session_id,
-                        turn_id: ctx.turn_id,
-                        generation_id: ctx.generation_id,
-                    }),
-                );
-                finish!(diagnostics);
-                return;
-            }
-            result = provider.stream_reply(built.request) => result,
-        };
+                    _ = cancel_token.cancelled() => {
+                        diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                        diagnostics.event_emitted = "cancelled".to_string();
+                        self.publish_terminal_event(
+                            &app,
+                            &ctx,
+                            &terminal_emitted,
+                            TerminalState::Cancelled,
+                            Some(ResponseSuggestionEvent::Cancelled {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+        utterance_id: ctx.utterance_id,
+                                generation_id: ctx.generation_id,
+                            }),
+                        );
+                        finish!(diagnostics);
+                        return;
+                    }
+                    result = provider.stream_reply(built.request) => result,
+                };
 
         let mut stream = match stream_result {
             Ok((s, meta)) => {
@@ -748,6 +751,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Error {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                         message: e.to_string(),
                     }),
@@ -762,25 +766,26 @@ impl ResponseEngine {
 
         loop {
             let next = tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                    diagnostics.event_emitted = "cancelled".to_string();
-                    self.publish_terminal_event(
-                        &app,
-                        &ctx,
-                        &terminal_emitted,
-                        TerminalState::Cancelled,
-                        Some(ResponseSuggestionEvent::Cancelled {
-                            session_id: ctx.session_id,
-                            turn_id: ctx.turn_id,
-                            generation_id: ctx.generation_id,
-                        }),
-                    );
-                    finish!(diagnostics);
-                    return;
-                }
-                item = stream.next() => item,
-            };
+                            _ = cancel_token.cancelled() => {
+                                diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                                diagnostics.event_emitted = "cancelled".to_string();
+                                self.publish_terminal_event(
+                                    &app,
+                                    &ctx,
+                                    &terminal_emitted,
+                                    TerminalState::Cancelled,
+                                    Some(ResponseSuggestionEvent::Cancelled {
+                                        session_id: ctx.session_id,
+                                        turn_id: ctx.turn_id,
+            utterance_id: ctx.utterance_id,
+                                        generation_id: ctx.generation_id,
+                                    }),
+                                );
+                                finish!(diagnostics);
+                                return;
+                            }
+                            item = stream.next() => item,
+                        };
 
             let Some(item) = next else {
                 break;
@@ -817,6 +822,7 @@ impl ResponseEngine {
                                 Some(ResponseSuggestionEvent::Skipped {
                                     session_id: ctx.session_id,
                                     turn_id: ctx.turn_id,
+                                    utterance_id: ctx.utterance_id,
                                     generation_id: ctx.generation_id,
                                 }),
                             );
@@ -835,6 +841,7 @@ impl ResponseEngine {
                                     ResponseSuggestionEvent::Delta {
                                         session_id: ctx.session_id,
                                         turn_id: ctx.turn_id,
+                                        utterance_id: ctx.utterance_id,
                                         generation_id: ctx.generation_id,
                                         text: flush,
                                     },
@@ -860,6 +867,7 @@ impl ResponseEngine {
                         Some(ResponseSuggestionEvent::Error {
                             session_id: ctx.session_id,
                             turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
                             generation_id: ctx.generation_id,
                             message: e.to_string(),
                         }),
@@ -888,6 +896,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Skipped {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                     }),
                 );
@@ -904,6 +913,7 @@ impl ResponseEngine {
                         ResponseSuggestionEvent::Delta {
                             session_id: ctx.session_id,
                             turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
                             generation_id: ctx.generation_id,
                             text: flush,
                         },
@@ -922,6 +932,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Completed {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                         text: full_text.clone(),
                     }),
@@ -941,6 +952,7 @@ impl ResponseEngine {
                     Some(ResponseSuggestionEvent::Completed {
                         session_id: ctx.session_id,
                         turn_id: ctx.turn_id,
+                        utterance_id: ctx.utterance_id,
                         generation_id: ctx.generation_id,
                         text: full_text.clone(),
                     }),
@@ -1001,21 +1013,31 @@ impl ResponseEngine {
     }
 }
 
-/// Motivos de finalização que **nunca** disparam geração: são consequência de a sessão ou
-/// a captura estar terminando, não de a outra pessoa ter parado de falar esperando uma
-/// resposta. Gerar aqui era uma das rotas pelas quais a última pergunta de uma sessão
-/// aparecia respondida já dentro da sessão seguinte (o frontend para a captura antes de
-/// encerrar a sessão, então `CaptureStopped` chegava primeiro).
+/// Motivos de finalização que **nunca** disparam geração. Dois grupos, por razões
+/// diferentes:
+///
+/// - `CaptureStopped`/`SessionEnded` são consequência de a sessão ou a captura estar
+///   terminando, não de a outra pessoa ter parado de falar esperando uma resposta. Gerar
+///   aqui era uma das rotas pelas quais a última pergunta de uma sessão aparecia
+///   respondida já dentro da sessão seguinte (o frontend para a captura antes de encerrar
+///   a sessão, então `CaptureStopped` chegava primeiro).
+/// - `SpeakerChanged`/`SourceChanged`, numa utterance da outra pessoa, só podem significar
+///   uma coisa: o microfone começou a produzir fala, ou seja, **o usuário tomou a palavra**.
+///   Ele já está respondendo — uma sugestão agora chega tarde por definição. E o efeito era
+///   ativamente destrutivo: a geração nova substituía, token a token, a sugestão que o
+///   usuário estava lendo em voz alta naquele exato instante e, como a fala dele acabara de
+///   entrar no contexto como `Você: ...`, o modelo com frequência devolvia a própria fala
+///   dele de volta. O disparo legítimo é o silêncio (`InactivityTimeout`), já coberto pelo
+///   timer dedicado da utterance.
 fn triggers_generation(reason: UtteranceFinalizationReason) -> bool {
     match reason {
         UtteranceFinalizationReason::InactivityTimeout
-        | UtteranceFinalizationReason::SpeakerChanged
-        | UtteranceFinalizationReason::SourceChanged
         | UtteranceFinalizationReason::ManualFlush
         | UtteranceFinalizationReason::MaximumDuration => true,
-        UtteranceFinalizationReason::CaptureStopped | UtteranceFinalizationReason::SessionEnded => {
-            false
-        }
+        UtteranceFinalizationReason::SpeakerChanged
+        | UtteranceFinalizationReason::SourceChanged
+        | UtteranceFinalizationReason::CaptureStopped
+        | UtteranceFinalizationReason::SessionEnded => false,
     }
 }
 
@@ -1441,15 +1463,9 @@ mod tests {
     }
 
     #[test]
-    fn session_and_capture_teardown_finalizations_never_trigger_generation() {
+    fn only_silence_flush_and_maximum_duration_trigger_generation() {
         assert!(triggers_generation(
             UtteranceFinalizationReason::InactivityTimeout
-        ));
-        assert!(triggers_generation(
-            UtteranceFinalizationReason::SpeakerChanged
-        ));
-        assert!(triggers_generation(
-            UtteranceFinalizationReason::SourceChanged
         ));
         assert!(triggers_generation(
             UtteranceFinalizationReason::ManualFlush
@@ -1462,6 +1478,19 @@ mod tests {
         ));
         assert!(!triggers_generation(
             UtteranceFinalizationReason::CaptureStopped
+        ));
+    }
+
+    /// Numa utterance da outra pessoa, esses dois motivos significam que o microfone
+    /// começou a falar: o usuário tomou a palavra. Gerar aí substituía a sugestão que ele
+    /// estava lendo em voz alta naquele momento.
+    #[test]
+    fn the_user_taking_the_floor_never_triggers_generation() {
+        assert!(!triggers_generation(
+            UtteranceFinalizationReason::SpeakerChanged
+        ));
+        assert!(!triggers_generation(
+            UtteranceFinalizationReason::SourceChanged
         ));
     }
 
@@ -1497,6 +1526,52 @@ mod tests {
         );
         assert_eq!(started["session_id"], session.value());
         wait_for_event_type(&mut rx, "completed").await;
+    }
+
+    /// O bug: o usuário lê a sugestão em voz alta, o microfone capta, a utterance aberta
+    /// da outra pessoa finaliza por `SpeakerChanged` e isso disparava uma geração nova —
+    /// que ia substituindo, token a token, exatamente a resposta que ele estava lendo.
+    #[tokio::test]
+    async fn the_user_starting_to_speak_does_not_replace_the_suggestion_being_read() {
+        let engine = ResponseEngine::for_test(FakeProvider::with_text("resposta sugerida"));
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        let remote = remote_turn(1, "e como você faria isso?");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote, session),
+        );
+        let first = wait_for_event_type(&mut rx, "started").await;
+        let first_generation_id = first["generation_id"].clone();
+        wait_for_event_type(&mut rx, "completed").await;
+
+        // O usuário toma a palavra: a utterance aberta da outra pessoa finaliza por troca
+        // de speaker, não por silêncio.
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_full(
+                &remote,
+                session,
+                "e como você faria isso?",
+                UtteranceFinalizationReason::SpeakerChanged,
+            ),
+        );
+
+        let events = drain_for(&mut rx, QUIET_WINDOW).await;
+        let new_generations: Vec<_> = events
+            .iter()
+            .filter(|e| e["type"] == "started" && e["generation_id"] != first_generation_id)
+            .collect();
+        assert!(
+            new_generations.is_empty(),
+            "o usuário falando não pode iniciar uma geração nova sobre a sugestão que ele \
+             está lendo, mas iniciou: {new_generations:?}"
+        );
     }
 
     #[tokio::test]
@@ -2185,8 +2260,11 @@ mod tests {
         wait_for_event_type(&mut rx, "completed").await;
         let prompt_b = answering_b.prompts().pop().expect("prompt da sessão B");
         assert!(prompt_b.contains("problema de escalabilidade"));
+        // Sentinelas de conteúdo *da sessão A* — "Perfeito." não serve mais como sentinela
+        // porque aparece literalmente no `SYSTEM_PROMPT` fixo, como exemplo de calibração
+        // da política de `[SKIP]` (ver `context.rs`); casaria sem nenhum vazamento real.
         assert!(
-            !prompt_b.contains("monolito") && !prompt_b.contains("Perfeito."),
+            !prompt_b.contains("monolito") && !prompt_b.contains("Em qual situação"),
             "o prompt da sessão B não pode conter nada da sessão A:\n{prompt_b}"
         );
 

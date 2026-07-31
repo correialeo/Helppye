@@ -81,10 +81,10 @@ utterance mais recente termina.
 (`conversation::UtteranceFinalizationReason`: `inactivity_timeout`, `speaker_changed`,
 `source_changed`, `capture_stopped`, `manual_flush`, `session_ended`,
 `maximum_duration`), `gap_ms_used` (`same_speaker_utterance_gap_ms` vigente no momento),
-`silence_detected_ms` (quando mensurável) e `session_id`. A geração automática do
-`ResponseEngine` funciona para qualquer motivo, mas os três esperados no dia a dia são
-`inactivity_timeout` (o caso comum: silêncio após a fala), `speaker_changed` e
-`source_changed` (a pessoa terminou de falar porque alguém mais começou).
+`silence_detected_ms` (quando mensurável) e `session_id`. O motivo esperado no dia a dia
+é `inactivity_timeout` — silêncio após a fala, detectado pelo timer dedicado da utterance.
+`speaker_changed`/`source_changed` também finalizam a utterance, mas deliberadamente
+**não** disparam geração (ver "Elegibilidade" abaixo).
 
 `same_speaker_utterance_gap_ms` (default 1800ms) é configurável em runtime, sem rebuild,
 via `conversation_get_utterance_gap_ms_command`/`conversation_set_utterance_gap_ms_command`
@@ -101,10 +101,21 @@ recebe uma "sugestão de resposta" para a própria fala.
 Além do turno ser elegível, o **motivo de finalização** da utterance precisa representar
 fim de fala, não desmontagem de estado (`engine::triggers_generation`):
 
-| `UtteranceFinalizationReason`                                                  | Dispara geração? |
-| ------------------------------------------------------------------------------ | ---------------- |
-| `inactivity_timeout`, `speaker_changed`, `source_changed`, `manual_flush`, `maximum_duration` | sim              |
-| `capture_stopped`, `session_ended`                                             | **não**          |
+| `UtteranceFinalizationReason`                              | Dispara geração? |
+| ---------------------------------------------------------- | ---------------- |
+| `inactivity_timeout`, `manual_flush`, `maximum_duration`   | sim              |
+| `speaker_changed`, `source_changed`                        | **não**          |
+| `capture_stopped`, `session_ended`                         | **não**          |
+
+**`speaker_changed`/`source_changed` — o usuário tomou a palavra.** Numa utterance da
+outra pessoa, esses dois motivos só podem significar que o microfone começou a produzir
+fala. O usuário já está respondendo; uma sugestão nesse instante chega tarde por
+definição. Pior, o efeito era ativamente destrutivo: enquanto ele lia a sugestão em voz
+alta, a própria leitura entrava pelo microfone, finalizava a utterance da outra pessoa por
+troca de speaker e disparava uma geração nova — que ia substituindo, token a token,
+exatamente a resposta que estava sendo lida. E como a fala dele acabara de entrar no
+contexto como `Você: ...`, o modelo com frequência devolvia a fala dele de volta. O
+disparo legítimo é o silêncio, que o timer dedicado da utterance já cobre.
 
 Parar a captura e encerrar a sessão finalizam a utterance aberta — é correto que
 finalizem, mas essas finalizações são consequência do teardown, não de alguém ter
@@ -238,9 +249,21 @@ Você: ...
 FALA ATUAL DA OUTRA PESSOA:
 Me dá um exemplo disso.
 
-INSTRUÇÃO: Decida exclusivamente se a fala atual exige resposta. Use o contexto apenas
-para compreender referências.
+INSTRUÇÃO: Escreva agora, em primeira pessoa, a resposta do usuário à fala atual, em 2 a
+4 frases. Vá direto ao conteúdo: nada de repetir ou reformular a pergunta, nada de
+comentar se ela exige resposta, nada de preâmbulo. Use o contexto apenas para resolver
+referências, e não invente nome, número, data, empresa ou tecnologia que não esteja nele.
+A pontuação da transcrição não é confiável: um pedido ou pergunta sem "?" continua sendo
+um pedido. Escreva apenas [SKIP] se a fala atual for somente saudação, somente uma
+confirmação isolada, ou um fragmento sem sentido.
 ```
+
+A instrução é a **última coisa que o modelo lê antes de gerar**, e é a que mais pesa na
+saída. A versão anterior pedia só uma decisão ("Decida exclusivamente se a fala atual
+exige resposta"), o que contradizia o `SYSTEM_PROMPT` — que já mandava responder — e
+fazia modelos locais menores devolverem a análise da fala, ou a própria pergunta
+reformulada, em vez de uma resposta. A tarefa pedida é escrever a resposta; `[SKIP]` é a
+exceção, não o objetivo.
 
 Sem contexto (primeira fala da sessão), o bloco recebe
 `(nenhum — esta é a primeira fala da sessão)` em vez de sumir — a estrutura do prompt é
@@ -254,13 +277,35 @@ atual dentro do contexto embaralharia justamente a decisão de `[SKIP]`.
 
 O `SYSTEM_PROMPT` declara a política em vez de deixá-la implícita:
 
-- Exigem resposta: perguntas, pedidos de explicação, pedidos de exemplo, desafios de
-  entrevista, solicitações implícitas e frases no imperativo.
-- `[SKIP]` só quando claramente nenhuma resposta é necessária: saudação isolada,
-  confirmação breve, comentário sem pedido, ruído evidente, fragmento sem sentido.
-- **Em caso de dúvida razoável, gerar uma resposta curta em vez de `[SKIP]`.**
+- **Responder é o padrão.** `[SKIP]` tem uma **lista fechada** de casos — saudação
+  isolada; confirmação/reação isolada sem nada depois; fragmento truncado, ruído ou fala
+  sem sentido; fala que claramente não é dirigida ao usuário — e nenhum outro.
+- **A pontuação da transcrição não conta.** O transcritor quase nunca produz "?", então
+  decidir por pontuação é decidir por um sinal que não existe: "me conta como foi",
+  "explica melhor" e "e como você resolveu isso" são pedidos escritos sem interrogação.
 - Fala que começa com confirmação/saudação mas contém pergunta ou pedido ⇒ responder ao
-  pedido.
+  pedido (**o caso citado explicitamente**, com exemplo, porque é o que falhava na
+  prática: "Perfeito. Me conta um caso real..." voltava como `[SKIP]`).
+- **Em qualquer dúvida, responder curto em vez de `[SKIP]`.**
+- Exemplos curtos de calibração no fim do prompt de sistema — dois que devem responder
+  (um imperativo depois de confirmação, uma pergunta sem "?") e dois que devem pular.
+  Modelos locais pequenos seguem exemplo melhor do que seguem política declarada.
+
+Contra alucinação, o mesmo prompt separa **responder** de **inventar**: a resposta
+continua obrigatória, mas não pode fabricar o específico que o modelo não tem como saber
+— nomes de empresa, clientes, produtos, datas, números, métricas ou tecnologias que não
+apareceram no contexto. Quando o pedido exige um detalhe pessoal ausente ("me conta um
+caso real em que você..."), a política é responder pelo raciocínio e pela estrutura da
+experiência, deixando o específico em aberto para o usuário completar em voz alta, em vez
+de fabricar um caso — e, sem base nenhuma, dar a resposta mais curta e honesta possível.
+O teto de saída (`MAX_OUTPUT_TOKENS` = 160) e a instrução de 2 a 4 frases também são
+anti-alucinação, não só latência: resposta longa é onde o detalhe inventado aparece.
+
+Nada disso é verificável por teste automatizado além da estrutura: os testes de
+`context.rs` provam que cada fala chega isolada sob `FALA ATUAL DA OUTRA PESSOA:` e que a
+política, os exemplos e as regras anti-invenção estão no prompt — **não** que um modelo
+específico decida certo. Isso só se observa rodando um provedor real (ver a seção de
+validação no fim deste documento).
 
 Continua valendo a restrição de arquitetura: **nenhum detector por regex e nenhuma segunda
 chamada de classificação**. A mesma chamada que gera a resposta decide, in-band, via o
@@ -268,6 +313,24 @@ marcador `[SKIP]` no início do stream. O `SkipDetector` ganhou apenas robustez 
 parsing (`classify`): tolera espaço em branco à esquerda, marcador em caixa baixa e
 `[SKIP]` seguido de `\n` — antes, um `"[SKIP]\n"` num único chunk não era reconhecido
 como skip e vazava o marcador literal para a tela.
+
+### Ruído do transcritor não pode virar fala
+
+O whisper não devolve texto vazio para trechos sem fala: ele **anota** o trecho —
+`[Música]`, `[BLANK_AUDIO]`, `[Aplausos]`, `♪`. Como qualquer outro texto, essas marcações
+viravam segmento, e um segmento abre utterance. O efeito na sugestão era duplo e
+silencioso: a marcação que chega logo depois de uma pergunta real (a) abre uma utterance
+nova no mesmo turno, o que **cancela a geração já em andamento** para a pergunta, e (b) é
+então corretamente classificada como `[SKIP]` — o usuário via "Nenhuma sugestão"
+exatamente na fala que mais precisava de resposta.
+
+A filtragem mora em `transcription::whisper_provider::strip_non_speech_annotations`, que é
+onde o vocabulário de anotação é conhecido — não na timeline, que não deve saber quais
+marcações um transcritor específico inventa. Regra conservadora: colchetes e notas musicais
+são removidos em qualquer posição do texto (o whisper nunca envolve fala real em
+colchetes); `(...)` só é descartado quando é o segmento inteiro, porque parênteses
+aparecem em fala transcrita de verdade. Se o que sobra é vazio, `TranscriptSegment::
+from_transcript` já devolve `None` e nada entra na timeline.
 
 ## Logs estruturados
 
@@ -482,29 +545,35 @@ configuração.
 `features/session/responseSuggestionViewModel.ts` (movido de `src/` para dentro de
 `features/session/` na reformulação de UI documentada em `docs/frontend-architecture.md`
 — mesma lógica, só reorganizada por domínio) reduz os eventos de
-`response://suggestion-event` num `Record<TurnId, SuggestionState>` via
+`response://suggestion-event` num `Record<UtteranceId, SuggestionState>` via
 `applyResponseSuggestionEvent`. Segue a mesma semântica de supersessão do backend:
 eventos que não sejam `started` só são aplicados se o `generation_id` do evento ainda
-casar com o `generationId` armazenado para aquele turno — eventos de uma geração já
+casar com o `generationId` armazenado para aquela fala — eventos de uma geração já
 cancelada são descartados silenciosamente. `SuggestionStatus` tem sete valores:
 `preparing`, `streaming`, `completed_with_text`, `completed_empty`, `skipped`,
 `cancelled`, `error` — o evento `completed` do backend vira `completed_with_text` ou
-`completed_empty` conforme o texto final (`.trim()`) estar vazio ou não. A sugestão é
-renderizada em `features/session/SuggestionPanel.tsx`, o elemento com maior destaque
-tipográfico da janela de sessão (ver `docs/design-system.md` §Janela de sessão) — texto
-editorial correndo, não um balão de chat, não uma reescrita do texto transcrito do
-turno.
+`completed_empty` conforme o texto final (`.trim()`) estar vazio ou não.
 
-**A resposta anterior não desaparece assim que uma nova geração começa.** `started` não
-zera mais o texto visível: se havia uma sugestão `completed_with_text` para o turno, ela
-migra para `previousText` e o status vira `preparing` ("Analisando fala..." na UI). O
-primeiro `delta` com conteúdo real limpa `previousText` e substitui o que está na tela;
-se a nova geração terminar sem conteúdo (skip, vazia, erro, cancelada), `previousText`
-continua disponível para a UI não regredir para "nenhuma sugestão" quando havia uma boa
-resposta momentos atrás. Isso cobre o caso de continuação de fala descrito acima: a
-resposta à primeira pergunta ("Em qual situação você usaria monolitos?") permanece
-visível enquanto a segunda ("Em qual situação você usaria microsserviços?") ainda está
-sendo preparada, em vez de piscar para um painel vazio entre as duas.
+**A chave é a utterance, não o turno — e é por isso que todo evento público carrega
+`utterance_id`.** Um `ConversationTurn` agrupa tudo que a outra pessoa falou enquanto
+manteve a palavra (até `turn_inactivity_timeout_ms`, 20s por padrão) e pode conter
+várias perguntas seguidas. Indexando por turno, a resposta à segunda pergunta
+sobrescrevia, no mesmo lugar, a resposta à primeira — que o usuário podia ainda estar
+lendo. A utterance é a unidade que de fato corresponde a uma sugestão (uma pergunta, uma
+resposta), então cada uma tem seu próprio registro e nada é substituído. O `turn_id`
+continua no estado, mas só como o argumento de `regenerate_suggestion_command`, que é
+por turno.
+
+A tela é um **feed cronológico**, não um slot único: `features/session/SuggestionFeed.tsx`
+empilha um `features/session/ExchangeItem.tsx` por fala elegível da outra pessoa (a fala,
+secundária, e logo abaixo a sua sugestão — o elemento com maior destaque tipográfico da
+janela, ver `docs/design-system.md` §Janela de sessão). O que é novo entra **embaixo**;
+nada acima é apagado ou trocado. O auto-scroll só acompanha o fim quando o usuário já
+está no fim — se ele rolou para cima para reler uma resposta anterior, uma fala nova não
+arranca a tela dele. Isso substitui o antigo `SuggestionPanel`/`TranscriptPeek` (painel
+único + última fala) e, com ele, o mecanismo de `previousText`, que existia só para
+disfarçar a sobrescrita: com uma entrada por fala, a resposta anterior continua
+literalmente na tela, não numa cópia de fallback.
 
 **Fronteira de sessão no frontend (fiação mínima, sem redesign).** Iniciar uma sessão em
 `app/router.tsx` agora chama `startConversationSession()`
@@ -602,9 +671,11 @@ Configurações.
   confirmar que `keep_alive`, `options.num_predict`, `options.temperature` e
   `think: false` realmente vão no JSON enviado ao Ollama — e que `keep_alive` fica
   totalmente ausente (não `null`) quando não configurado.
-- **`src/responseSuggestionViewModel.test.ts`** — cobre a transição `started` →
-  `preparing` com `previousText`, a limpeza de `previousText` no primeiro delta com
-  conteúdo, e a permanência de `previousText` quando a nova geração termina sem conteúdo.
+- **`src/features/session/responseSuggestionViewModel.test.ts`** — cobre o chaveamento
+  por `utterance_id` (inclusive o caso central: duas perguntas no **mesmo turno**
+  produzem duas entradas coexistentes, nenhuma sobrescrita), o descarte de eventos sem
+  `utterance_id`, a supersessão por `generation_id` e a distinção
+  `completed_with_text`/`completed_empty`.
 
 ## O que foi verificado neste ambiente vs. o que ainda precisa de confirmação manual
 
@@ -643,9 +714,9 @@ sem acesso de rede de teste contra os endpoints reais dos provedores.
 - `npm run typecheck`, `npm run lint`, `npm run build` — limpos, incluindo os reducers
   `applyResponseSuggestionEvent`/`applyResponseSuggestionDiagnostics` e seus testes
   manuais (`responseSuggestionViewModel.test.ts`, rodados via `npx tsx`), cobrindo a
-  distinção `completed_with_text`/`completed_empty`, a transição `preparing`/
-  `previousText` e o preenchimento de `ResponseSuggestionDiagnostics` a partir do
-  evento bruto.
+  distinção `completed_with_text`/`completed_empty`, o chaveamento por `utterance_id`
+  (duas perguntas no mesmo turno coexistindo) e o preenchimento de
+  `ResponseSuggestionDiagnostics` a partir do evento bruto.
 
 **Ainda precisa de confirmação manual (não fabricado aqui):**
 - A causa raiz real do sintoma que motivou o diagnóstico original ("Gerando

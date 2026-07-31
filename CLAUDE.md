@@ -120,11 +120,24 @@ com inferência CPU-only. `TranscriptionQueue` recebe `AudioSegment`s do pipelin
 em uma fila limitada e não bloqueante; se a transcrição ficar atrasada, segmentos novos
 são descartados e contabilizados, sem aplicar backpressure à captura.
 
+O whisper anota trechos **sem fala** em vez de devolver texto vazio (`[Música]`,
+`[BLANK_AUDIO]`, `[Aplausos]`, `♪`). `strip_non_speech_annotations` remove essas marcações
+ainda no provider — é lá que o vocabulário de anotação de um transcritor específico é
+conhecido, não na timeline. Sem isso a marcação vira segmento, abre uma utterance nova no
+mesmo turno, cancela a geração de resposta em andamento da pergunta anterior e é então
+classificada como `[SKIP]`: o usuário via "Nenhuma sugestão" justamente na fala que pedia
+resposta. Ver `docs/response-suggestion.md`, seção "Ruído do transcritor não pode virar
+fala".
+
 `model_manager` implementa o fluxo guiado de primeiro uso: status do modelo, download
 explícito, progresso, cancelamento, verificação de SHA-256, instalação atômica,
 persistência da seleção e carregamento real no provider. O modelo padrão é o Whisper Base
 Multilíngue; modelos personalizados podem ser selecionados por caminho local e são
-validados antes de persistir.
+validados antes de persistir. **O carregamento do modelo no provider acontece uma vez no
+boot** (`lib.rs`, `.setup()`), não como efeito colateral de uma tela: o arquivo sobrevive
+ao restart, o estado em memória do provider não, e amarrar essa restauração ao
+`AudioSetupScreen` fazia toda transcrição falhar em silêncio a partir da segunda execução
+do app.
 
 ## Conversation Timeline (`src-tauri/src/conversation.rs`)
 
@@ -215,8 +228,13 @@ no mesmo turno cancela e substitui a geração em andamento, para nunca sugerir 
 uma fala que ainda não terminou; `ResponseEngine::finish_generation` roda em todo caminho
 de saída (completo, skip, erro ou cancelamento) e sempre libera o slot de geração daquele
 turno, para que uma geração seguinte nunca veja um estado "fantasma" de uma anterior já
-encerrada. Finalizações que são consequência de teardown (`capture_stopped`,
-`session_ended`) nunca disparam geração (`engine::triggers_generation`).
+encerrada. Só `inactivity_timeout`, `manual_flush` e `maximum_duration` disparam geração
+(`engine::triggers_generation`): teardown (`capture_stopped`, `session_ended`) nunca
+dispara, e `speaker_changed`/`source_changed` também não — numa utterance da outra pessoa
+esses dois motivos significam que o microfone começou a falar, ou seja, **o usuário tomou
+a palavra**. Ele já está respondendo, e gerar aí substituía token a token a sugestão que
+ele estava lendo em voz alta (com a fala dele recém-entrada no contexto como `Você: ...`,
+o modelo costumava devolvê-la de volta).
 
 **Isolamento por sessão.** A unidade de isolamento é a sessão (`conversation::SessionId`,
 monotônico, de propriedade da `ConversationTimeline`; o `ResponseEngine` espelha o valor).
@@ -236,13 +254,23 @@ O usuário escolhe o provedor de LLM: Ollama local (padrão) ou um provedor de n
 responder, via um marcador `[SKIP]` no início do stream quando a fala não exige resposta
 — sem uma segunda chamada de classificação e sem detector por regex. O prompt separa
 fisicamente `CONTEXTO RECENTE:` / `FALA ATUAL DA OUTRA PESSOA:` / `INSTRUÇÃO:` para que a
-decisão seja sobre a fala atual, não sobre o turno inteiro, e o `SYSTEM_PROMPT` declara a
-política (em dúvida razoável, responder curto em vez de `[SKIP]`). API keys de provedores
-de nuvem ficam no keychain do SO via crate `keyring`, nunca em texto puro no disco.
+decisão seja sobre a fala atual, não sobre o turno inteiro. O `SYSTEM_PROMPT` declara a
+política: responder é o padrão, `[SKIP]` tem uma lista fechada de casos, a pontuação da
+transcrição não conta na decisão (o transcritor quase nunca produz "?", então "Me conta um
+caso real..." é um pedido sem interrogação), confirmação seguida de pedido se responde, e
+em qualquer dúvida responde-se curto. Contra alucinação, o mesmo prompt proíbe fabricar
+específicos ausentes do contexto (nome, número, data, empresa, tecnologia) e pede resposta
+de 2 a 4 frases — ver `docs/response-suggestion.md`, seção "Estrutura do prompt e política
+de `[SKIP]`". API keys de provedores de nuvem ficam no keychain do SO via crate `keyring`,
+nunca em texto puro no disco.
 Eventos emitidos via `response://suggestion-event`: `started`, `delta`, `completed`,
-`skipped`, `cancelled` e `error`, todos carregando `session_id`, `turn_id` e
-`generation_id` para o frontend descartar eventos de uma geração já superada, além de
-`diagnostics` (ver abaixo). Ver
+`skipped`, `cancelled` e `error`, todos carregando `session_id`, `turn_id`,
+`utterance_id` e `generation_id` — o `generation_id` para o frontend descartar eventos de
+uma geração já superada, o `utterance_id` porque a sugestão pertence a uma **fala**, não
+ao turno: um turno pode conter várias perguntas, e indexando por turno a resposta à
+segunda sobrescrevia a resposta à primeira. A janela de sessão é um feed cronológico com
+uma entrada por fala elegível (`features/session/SuggestionFeed.tsx`), crescendo para
+baixo; nada já exibido é substituído no lugar. Há também `diagnostics` (ver abaixo). Ver
 `docs/response-suggestion.md` para a arquitetura completa, módulo por módulo, e
 `docs/session-experience.md` para o comportamento fim a fim durante uma sessão ao vivo.
 
