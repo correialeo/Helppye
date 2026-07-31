@@ -157,12 +157,12 @@ function AiResponsePanel({
     window.setTimeout(() => setCopied(false), 1400);
   };
 
-  let body: ReactNode = <p className="text-[15px] leading-relaxed text-white/50">Aguardando uma fala de OTHERS...</p>;
+  let body: ReactNode = <p className="text-[15px] leading-relaxed text-white/66">Aguardando uma fala de OTHERS...</p>;
 
   if (suggestion?.status === "preparing") {
     body = (
-      <div className="flex items-center gap-2 text-[15px] font-medium text-white/62">
-        <Loader2 className="h-4 w-4 animate-spin text-white/50" />
+      <div className="flex items-center gap-2 text-[15px] font-medium text-white/74">
+        <Loader2 className="h-4 w-4 animate-spin text-white/62" />
         Preparando resposta
       </div>
     );
@@ -186,13 +186,13 @@ function AiResponsePanel({
     );
   } else if (suggestion?.text) {
     body = (
-      <p className="whitespace-pre-wrap text-[18px] font-medium leading-[1.42] tracking-normal text-white/84">
+      <p className="whitespace-pre-wrap text-[18px] font-medium leading-[1.42] tracking-normal text-white/92">
         {suggestion.text}
         {active && <span className="ml-1 inline-block h-4 w-1 translate-y-0.5 animate-pulse-soft rounded-full bg-white/55" />}
       </p>
     );
   } else if (suggestion?.status === "completed_empty" || suggestion?.status === "skipped") {
-    body = <p className="text-[15px] leading-relaxed text-white/42">Sem sugestao para esta fala.</p>;
+    body = <p className="text-[15px] leading-relaxed text-white/58">Sem sugestao para esta fala.</p>;
   }
 
   return (
@@ -204,7 +204,7 @@ function AiResponsePanel({
           startNativeDrag();
         }}
       >
-        <div className="flex items-center gap-2 text-white/38">
+        <div className="flex items-center gap-2 text-white/54">
           <Grip className="h-3.5 w-3.5" />
           <span className="text-[11px] font-medium">Helppye</span>
         </div>
@@ -223,7 +223,7 @@ function AiResponsePanel({
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-4 pt-1">{body}</div>
-      <div className="flex h-8 items-center justify-between px-4 text-[11px] text-white/34">
+      <div className="flex h-8 items-center justify-between px-4 text-[11px] text-white/48">
         <span>{exchange ? "1 / 1" : "0 / 0"}</span>
         <span>{copied ? "copiado" : active ? "gerando" : "resposta"}</span>
       </div>
@@ -502,7 +502,7 @@ export function SessionScreen({
 
   if (mode === "ai") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#16161a]/97 backdrop-blur-sm">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#16161a]">
         <AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} nativeDrag />
       </div>
     );
@@ -549,7 +549,7 @@ export function SessionScreen({
       <DraggablePanel
         position={aiPosition}
         onPositionChange={setAiPosition}
-        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#16161a]/97 backdrop-blur-sm"
+        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#16161a]"
         handle={<AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} />}
       >
         {null}
