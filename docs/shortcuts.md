@@ -1,27 +1,15 @@
-# Atalhos de teclado
+# Atalhos
 
-Implementados em `hooks/useKeyboardShortcuts.ts`, chamado a partir de cada tela que
-precisa deles — não um listener global único em `App.tsx` — porque o significado de
-"Ctrl/Cmd+D" muda com o contexto (começar vs. encerrar sessão) e "Regenerar" precisa do
-turno atual, que só a tela de sessão conhece. Ver `docs/frontend-architecture.md`.
+| Atalho | Acao | Onde esta ativo |
+| --- | --- | --- |
+| `Ctrl + D` (Windows/Linux) / `Cmd + D` (macOS) | Comecar sessao se nao houver sessao ativa; encerrar sessao se houver | Global, mesmo com Helppye sem foco ou minimizado |
+| `Ctrl/Cmd + Enter` | Abrir configuracoes | `ReadyScreen`, `SessionScreen` com foco |
+| `Ctrl/Cmd + Shift + Enter` | Gerar sugestao manualmente ("Regenerar") | `SessionScreen` com foco |
 
-| Atalho | Ação | Onde está ativo |
-|---|---|---|
-| `Ctrl/Cmd + D` | Começar sessão | `ReadyScreen` |
-| `Ctrl/Cmd + D` | Encerrar sessão | `SessionScreen` |
-| `Ctrl/Cmd + Enter` | Abrir configurações | `ReadyScreen`, `SessionScreen` |
-| `Ctrl/Cmd + Shift + Enter` | Gerar sugestão manualmente ("Regenerar") | `SessionScreen` |
+## Limitacoes
 
-Todos os três são combinações com `mod` (Ctrl no Windows/Linux, ⌘ no macOS via
-`components/ui/Kbd.tsx` `modKeyLabel()`), o que é também por que são tratados
-globalmente mesmo com um campo de texto focado — nenhum deles colide com digitação
-normal, ao contrário de uma tecla solta como `Enter` seria.
-
-Exibidos na interface como chips no estilo tecla (`Kbd`), nunca só como texto — por
-exemplo "⌘ D" em `ReadyScreen`, "⌘ ⇧ ⏎" (esmaecido) nas ações do `ExchangeItem` mais
-recente do feed quando sua sugestão já está concluída — só o mais recente, porque é
-sobre ele que o atalho age (entradas anteriores continuam com o botão "Regenerar").
-
-"Regenerar" (manual) chama `conversation_regenerate_suggestion_command` — ver
-`docs/frontend-architecture.md` §Um comando novo no backend, e por quê — para o único
-comando novo que esta reformulação adicionou ao lado Rust.
+O atalho global usa o mecanismo nativo exposto por `tauri-plugin-global-shortcut`.
+Se o sistema operacional, gerenciador de janelas, politica corporativa ou outro
+aplicativo ja tiver reservado a combinacao, o registro pode falhar. Nesse caso o
+Helppye registra o erro em log e os atalhos locais continuam funcionando quando a
+janela do Helppye estiver com foco.

@@ -11,9 +11,10 @@ import { regenerateSuggestion } from "../../services/conversationService";
 import { useKeyboardShortcuts } from "../../hooks/useKeyboardShortcuts";
 import { useTransparentWindowBackground } from "../../hooks/useTransparentWindowBackground";
 import { formatDuration } from "../../utils/format";
+import { endSessionLabel } from "./sessionLabels";
+import { buildSessionExchanges, type SessionExchange } from "./sessionTimelineViewModel";
 import type { CaptureStatus } from "../../stores/useAudioCaptureStore";
 import type { ConversationUtterance } from "../../types/conversation";
-import type { SuggestionState } from "./responseSuggestionViewModel";
 
 type SessionMode = "combined" | "coordinator" | "ai" | "chat";
 
@@ -32,20 +33,11 @@ interface SessionScreenProps {
   onRestoreSession?: () => void;
 }
 
-interface Exchange {
-  utteranceId: number;
-  turnId: number;
-  question: string;
-  suggestion: SuggestionState | undefined;
-}
+type Exchange = SessionExchange;
 
 interface PanelPosition {
   x: number;
   y: number;
-}
-
-function isEligible(item: { speaker: string; source: string }): boolean {
-  return item.speaker === "other_person" && item.source === "system_output";
 }
 
 function isTauriRuntime(): boolean {
@@ -262,6 +254,7 @@ function TimelineMessage({ utterance }: { utterance: ConversationUtterance }) {
 function ChatToolbar({
   listening,
   devMode,
+  elapsed,
   onOpenSettings,
   onOpenTranscript,
   onOpenDeveloperTools,
@@ -269,6 +262,7 @@ function ChatToolbar({
 }: {
   listening: boolean;
   devMode: boolean;
+  elapsed: string;
   onOpenSettings: () => void;
   onOpenTranscript: () => void;
   onOpenDeveloperTools: () => void;
@@ -318,7 +312,7 @@ function ChatToolbar({
           {devMode && menuItem(<Terminal className="h-3.5 w-3.5" />, "Diagnostico", onOpenDeveloperTools)}
           {menuItem(<Minus className="h-3.5 w-3.5" />, "Minimizar", minimizeWindow)}
           <div className="my-1 border-t border-white/8" />
-          {menuItem(<X className="h-3.5 w-3.5 text-red-300" />, "Encerrar sessao", onEndSession)}
+          {menuItem(<X className="h-3.5 w-3.5 text-red-300" />, endSessionLabel(elapsed), onEndSession)}
         </div>
       )}
     </div>
@@ -328,14 +322,10 @@ function ChatToolbar({
 function ChatFooter({
   microphoneStatus,
   systemStatus,
-  startedAt,
 }: {
   microphoneStatus: CaptureStatus;
   systemStatus: CaptureStatus;
-  startedAt: number;
 }) {
-  const elapsed = useElapsed(startedAt);
-
   return (
     <div className="border-t border-white/[0.06] bg-[#17181b] px-4 py-3">
       <div className="flex items-center justify-between gap-3">
@@ -343,10 +333,9 @@ function ChatFooter({
           <CaptureDot status={microphoneStatus} label="Mic" />
           <CaptureDot status={systemStatus} label="Sistema" />
         </div>
-        <div className="flex items-center gap-2 text-[11px] font-medium text-white/42">
-          <span>Portugues</span>
-          <span className="font-mono text-white/32">{elapsed}</span>
-        </div>
+      <div className="flex items-center gap-2 text-[11px] font-medium text-white/42">
+        <span>Portugues</span>
+      </div>
       </div>
     </div>
   );
@@ -375,6 +364,7 @@ function ChatTimelinePanel({
   onOpenDeveloperTools: () => void;
   onEndSession: () => void;
 }) {
+  const elapsed = useElapsed(startedAt);
   const scrollRef = useRef<HTMLOListElement>(null);
   const lastKey = utterances.map((u) => `${u.id}:${u.text.length}`).join("|");
 
@@ -388,6 +378,7 @@ function ChatTimelinePanel({
       <ChatToolbar
         listening={listening}
         devMode={devMode}
+        elapsed={elapsed}
         onOpenSettings={onOpenSettings}
         onOpenTranscript={onOpenTranscript}
         onOpenDeveloperTools={onOpenDeveloperTools}
@@ -402,7 +393,7 @@ function ChatTimelinePanel({
           utterances.map((utterance) => <TimelineMessage key={utterance.id} utterance={utterance} />)
         )}
       </ol>
-      <ChatFooter microphoneStatus={microphoneStatus} systemStatus={systemStatus} startedAt={startedAt} />
+      <ChatFooter microphoneStatus={microphoneStatus} systemStatus={systemStatus} />
     </>
   );
 }
@@ -424,22 +415,12 @@ export function SessionScreen({
   const microphone = useAudioCapture("microphone");
   const systemOutput = useAudioCapture("system_output");
   const devMode = useOnboardingStore((s) => s.devMode);
+  const elapsed = useElapsed(startedAt);
 
-  const exchanges = useMemo<Exchange[]>(() => {
-    const turnOf = new Map<number, number>();
-    for (const turn of turns) {
-      for (const utteranceId of turn.utterances) turnOf.set(utteranceId, turn.id);
-    }
-
-    return utterances
-      .filter((utterance) => isEligible(utterance) && utterance.text.trim().length > 0)
-      .map((utterance) => ({
-        utteranceId: utterance.id,
-        turnId: turnOf.get(utterance.id) ?? suggestions[utterance.id]?.turnId ?? -1,
-        question: utterance.text,
-        suggestion: suggestions[utterance.id],
-      }));
-  }, [turns, utterances, suggestions]);
+  const exchanges = useMemo<Exchange[]>(
+    () => buildSessionExchanges(turns, utterances, suggestions),
+    [turns, utterances, suggestions],
+  );
 
   const activeExchange =
     [...exchanges].reverse().find((exchange) => exchange.suggestion?.status === "streaming" || exchange.suggestion?.status === "preparing") ??
@@ -487,14 +468,15 @@ export function SessionScreen({
           >
             Mostrar sessao
           </button>
-          <button
-            type="button"
-            onClick={onEndSession}
-            className="grid h-7 w-7 place-items-center rounded-full text-white/34 transition hover:bg-white/[0.08] hover:text-white/72"
-            aria-label="Encerrar sessao"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
+        <button
+          type="button"
+          onClick={onEndSession}
+          className="inline-flex h-10 items-center gap-2 rounded-full bg-red-500/92 px-3 text-[11px] font-semibold text-white transition hover:bg-red-500"
+          aria-label={`Encerrar sessao ${elapsed}`}
+        >
+          <X className="h-3.5 w-3.5" />
+          <span className="whitespace-nowrap">{endSessionLabel(elapsed)}</span>
+        </button>
           <button
             type="button"
             onClick={minimizeWindow}

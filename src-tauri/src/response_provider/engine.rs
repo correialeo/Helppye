@@ -123,6 +123,55 @@ const CANCEL_REASON_NEW_UTTERANCE: &str = "new_utterance";
 /// Quantos caracteres brutos (antes do `SkipDetector`) manter para diagnóstico. Cobre
 /// folgadamente o marcador `[SKIP]`, sem acumular texto de respostas longas à toa.
 const RAW_PREFIX_CAP_CHARS: usize = 80;
+const MIN_USEFUL_RESPONSE_CHARS: usize = 12;
+
+fn normalize_generated_response_for_quality(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch.to_lowercase().collect::<String>()
+            } else {
+                " ".to_string()
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_invalid_generated_response(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_whitespace() || ch.is_ascii_punctuation())
+    {
+        return true;
+    }
+
+    let normalized = normalize_generated_response_for_quality(trimmed);
+    if normalized.is_empty() {
+        return true;
+    }
+
+    let useful_len = normalized.chars().filter(|ch| ch.is_alphanumeric()).count();
+    let low_value = [
+        "sim",
+        "não",
+        "nao",
+        "tchau",
+        "até logo",
+        "ate logo",
+        "obrigado",
+        "valeu",
+    ];
+    low_value.contains(&normalized.as_str())
+        || (useful_len < MIN_USEFUL_RESPONSE_CHARS && normalized.starts_with("tchau"))
+}
 
 fn epoch_ms() -> u64 {
     SystemTime::now()
@@ -842,159 +891,36 @@ impl ResponseEngine {
             return;
         }
 
-        let stream_result = tokio::select! {
-                    _ = cancel_token.cancelled() => {
-                        diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                        diagnostics.event_emitted = "cancelled".to_string();
-                        self.publish_terminal_event(
-                            &app,
-                            &ctx,
-                            &terminal_emitted,
-                            TerminalState::Cancelled,
-                            Some(ResponseSuggestionEvent::Cancelled {
-                                session_id: ctx.session_id,
-                                turn_id: ctx.turn_id,
-        utterance_id: ctx.utterance_id,
-                                generation_id: ctx.generation_id,
-                            }),
-                        );
-                        finish!(diagnostics);
-                        return;
-                    }
-                    result = provider.stream_reply(built.request) => result,
-                };
+        let mut invalid_retry_available = true;
 
-        let mut stream = match stream_result {
-            Ok((s, meta)) => {
-                diagnostics.http_status = Some(meta.http_status);
-                s
-            }
-            Err(e) => {
-                diagnostics.event_emitted = "error".to_string();
-                self.publish_terminal_event(
-                    &app,
-                    &ctx,
-                    &terminal_emitted,
-                    TerminalState::Error,
-                    Some(ResponseSuggestionEvent::Error {
-                        session_id: ctx.session_id,
-                        turn_id: ctx.turn_id,
-                        utterance_id: ctx.utterance_id,
-                        generation_id: ctx.generation_id,
-                        message: e.to_string(),
-                    }),
-                );
-                finish!(diagnostics);
-                return;
-            }
-        };
-
-        let mut detector = SkipDetector::new();
-        // Segundo filtro, depois do `SkipDetector` e antes de qualquer `Delta`: o modelo às
-        // vezes começa repetindo a fala em vez de respondê-la, e a sugestão saía sendo a
-        // própria pergunta. Ver `echo_guard.rs` — não é detecção de pergunta, é comparação
-        // com a fala conhecida que originou esta geração.
-        let mut echo_guard = EchoGuard::new(&trigger.utterance_text);
-        // Tudo que o `SkipDetector` liberou, tenha o guarda deixado passar ou não — a
-        // diferença para `full_text` no fim é exatamente o que foi suprimido como eco.
-        let mut fed_characters = 0usize;
-        let mut full_text = String::new();
-
-        loop {
-            let next = tokio::select! {
-                            _ = cancel_token.cancelled() => {
-                                diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                                diagnostics.event_emitted = "cancelled".to_string();
-                                self.publish_terminal_event(
-                                    &app,
-                                    &ctx,
-                                    &terminal_emitted,
-                                    TerminalState::Cancelled,
-                                    Some(ResponseSuggestionEvent::Cancelled {
-                                        session_id: ctx.session_id,
-                                        turn_id: ctx.turn_id,
-            utterance_id: ctx.utterance_id,
-                                        generation_id: ctx.generation_id,
-                                    }),
-                                );
-                                finish!(diagnostics);
-                                return;
-                            }
-                            item = stream.next() => item,
-                        };
-
-            let Some(item) = next else {
-                break;
-            };
-
-            if diagnostics.first_chunk_received.is_none() {
-                diagnostics.first_chunk_received = Some(epoch_ms());
-            }
-            if first_http_chunk_at.is_none() {
-                first_http_chunk_at = Some(Instant::now());
-            }
-
-            match item {
-                Ok(ResponseChunk::Delta(text)) => {
-                    if diagnostics.raw_prefix.chars().count() < RAW_PREFIX_CAP_CHARS {
-                        diagnostics.raw_prefix.push_str(&text);
-                    }
-                    match detector.push(&text) {
-                        SkipDecision::Pending => {}
-                        SkipDecision::Skip => {
-                            diagnostics.skip_detected = true;
-                            diagnostics.event_emitted = "skipped".to_string();
-                            tracing::info!(
-                                session_id = ctx.session_id.value(),
-                                turn_id = ctx.turn_id.value(),
-                                generation_id = ctx.generation_id.value(),
-                                "skip_detected"
-                            );
+        'generation_attempt: loop {
+            let stream_result = tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                            diagnostics.event_emitted = "cancelled".to_string();
                             self.publish_terminal_event(
                                 &app,
                                 &ctx,
                                 &terminal_emitted,
-                                TerminalState::Skipped,
-                                Some(ResponseSuggestionEvent::Skipped {
+                                TerminalState::Cancelled,
+                                Some(ResponseSuggestionEvent::Cancelled {
                                     session_id: ctx.session_id,
                                     turn_id: ctx.turn_id,
-                                    utterance_id: ctx.utterance_id,
+            utterance_id: ctx.utterance_id,
                                     generation_id: ctx.generation_id,
                                 }),
                             );
                             finish!(diagnostics);
                             return;
                         }
-                        SkipDecision::NotSkip { flush } => {
-                            fed_characters += flush.chars().count();
-                            let visible = echo_guard.push(&flush);
-                            if !visible.is_empty() {
-                                if first_visible_text_at.is_none() {
-                                    first_visible_text_at = Some(Instant::now());
-                                }
-                                full_text.push_str(&visible);
-                                if !self.publish_stream_event(
-                                    &app,
-                                    &ctx,
-                                    ResponseSuggestionEvent::Delta {
-                                        session_id: ctx.session_id,
-                                        turn_id: ctx.turn_id,
-                                        utterance_id: ctx.utterance_id,
-                                        generation_id: ctx.generation_id,
-                                        text: visible,
-                                    },
-                                ) {
-                                    // Sessão encerrada ou geração substituída no meio do
-                                    // stream: para de consumir e não publica mais nada.
-                                    diagnostics.event_emitted = "discarded_stale".to_string();
-                                    finish!(diagnostics);
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                result = provider.stream_reply(built.request.clone()) => result,
+            };
+
+            let mut stream = match stream_result {
+                Ok((s, meta)) => {
+                    diagnostics.http_status = Some(meta.http_status);
+                    s
                 }
-                Ok(ResponseChunk::Done) => break,
                 Err(e) => {
                     diagnostics.event_emitted = "error".to_string();
                     self.publish_terminal_event(
@@ -1013,101 +939,265 @@ impl ResponseEngine {
                     finish!(diagnostics);
                     return;
                 }
-            }
-        }
+            };
 
-        match detector.finish() {
-            SkipDecision::Skip => {
-                diagnostics.skip_detected = true;
-                diagnostics.event_emitted = "skipped".to_string();
-                tracing::info!(
-                    session_id = ctx.session_id.value(),
-                    turn_id = ctx.turn_id.value(),
-                    generation_id = ctx.generation_id.value(),
-                    "skip_detected"
-                );
-                self.publish_terminal_event(
-                    &app,
-                    &ctx,
-                    &terminal_emitted,
-                    TerminalState::Skipped,
-                    Some(ResponseSuggestionEvent::Skipped {
-                        session_id: ctx.session_id,
-                        turn_id: ctx.turn_id,
-                        utterance_id: ctx.utterance_id,
-                        generation_id: ctx.generation_id,
-                    }),
-                );
-            }
-            SkipDecision::NotSkip { flush } => {
-                // Fim do stream: o que o guarda ainda estiver segurando precisa sair agora
-                // (ou ser descartado agora), senão uma resposta curta sem pontuação final
-                // nunca chegaria à UI.
-                fed_characters += flush.chars().count();
-                let mut visible = echo_guard.push(&flush);
-                visible.push_str(&echo_guard.finish());
-                if !visible.is_empty() {
-                    if first_visible_text_at.is_none() {
-                        first_visible_text_at = Some(Instant::now());
+            let mut detector = SkipDetector::new();
+            // Segundo filtro, depois do `SkipDetector` e antes de qualquer `Delta`: o modelo às
+            // vezes começa repetindo a fala em vez de respondê-la, e a sugestão saía sendo a
+            // própria pergunta. Ver `echo_guard.rs` — não é detecção de pergunta, é comparação
+            // com a fala conhecida que originou esta geração.
+            let mut echo_guard = EchoGuard::new(&trigger.utterance_text);
+            // Tudo que o `SkipDetector` liberou, tenha o guarda deixado passar ou não — a
+            // diferença para `full_text` no fim é exatamente o que foi suprimido como eco.
+            let mut fed_characters = 0usize;
+            let mut full_text = String::new();
+
+            loop {
+                let next = tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                                    diagnostics.event_emitted = "cancelled".to_string();
+                                    self.publish_terminal_event(
+                                        &app,
+                                        &ctx,
+                                        &terminal_emitted,
+                                        TerminalState::Cancelled,
+                                        Some(ResponseSuggestionEvent::Cancelled {
+                                            session_id: ctx.session_id,
+                                            turn_id: ctx.turn_id,
+                utterance_id: ctx.utterance_id,
+                                            generation_id: ctx.generation_id,
+                                        }),
+                                    );
+                                    finish!(diagnostics);
+                                    return;
+                                }
+                                item = stream.next() => item,
+                            };
+
+                let Some(item) = next else {
+                    break;
+                };
+
+                if diagnostics.first_chunk_received.is_none() {
+                    diagnostics.first_chunk_received = Some(epoch_ms());
+                }
+                if first_http_chunk_at.is_none() {
+                    first_http_chunk_at = Some(Instant::now());
+                }
+
+                match item {
+                    Ok(ResponseChunk::Delta(text)) => {
+                        if diagnostics.raw_prefix.chars().count() < RAW_PREFIX_CAP_CHARS {
+                            diagnostics.raw_prefix.push_str(&text);
+                        }
+                        match detector.push(&text) {
+                            SkipDecision::Pending => {}
+                            SkipDecision::Skip => {
+                                diagnostics.skip_detected = true;
+                                diagnostics.event_emitted = "skipped".to_string();
+                                tracing::info!(
+                                    session_id = ctx.session_id.value(),
+                                    turn_id = ctx.turn_id.value(),
+                                    generation_id = ctx.generation_id.value(),
+                                    "skip_detected"
+                                );
+                                self.publish_terminal_event(
+                                    &app,
+                                    &ctx,
+                                    &terminal_emitted,
+                                    TerminalState::Skipped,
+                                    Some(ResponseSuggestionEvent::Skipped {
+                                        session_id: ctx.session_id,
+                                        turn_id: ctx.turn_id,
+                                        utterance_id: ctx.utterance_id,
+                                        generation_id: ctx.generation_id,
+                                    }),
+                                );
+                                finish!(diagnostics);
+                                return;
+                            }
+                            SkipDecision::NotSkip { flush } => {
+                                fed_characters += flush.chars().count();
+                                let visible = echo_guard.push(&flush);
+                                if !visible.is_empty() {
+                                    if first_visible_text_at.is_none() {
+                                        first_visible_text_at = Some(Instant::now());
+                                    }
+                                    full_text.push_str(&visible);
+                                    if !self.publish_stream_event(
+                                        &app,
+                                        &ctx,
+                                        ResponseSuggestionEvent::Delta {
+                                            session_id: ctx.session_id,
+                                            turn_id: ctx.turn_id,
+                                            utterance_id: ctx.utterance_id,
+                                            generation_id: ctx.generation_id,
+                                            text: visible,
+                                        },
+                                    ) {
+                                        // Sessão encerrada ou geração substituída no meio do
+                                        // stream: para de consumir e não publica mais nada.
+                                        diagnostics.event_emitted = "discarded_stale".to_string();
+                                        finish!(diagnostics);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    full_text.push_str(&visible);
-                    self.publish_stream_event(
+                    Ok(ResponseChunk::Done) => break,
+                    Err(e) => {
+                        diagnostics.event_emitted = "error".to_string();
+                        self.publish_terminal_event(
+                            &app,
+                            &ctx,
+                            &terminal_emitted,
+                            TerminalState::Error,
+                            Some(ResponseSuggestionEvent::Error {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+                                utterance_id: ctx.utterance_id,
+                                generation_id: ctx.generation_id,
+                                message: e.to_string(),
+                            }),
+                        );
+                        finish!(diagnostics);
+                        return;
+                    }
+                }
+            }
+
+            match detector.finish() {
+                SkipDecision::Skip => {
+                    diagnostics.skip_detected = true;
+                    diagnostics.event_emitted = "skipped".to_string();
+                    tracing::info!(
+                        session_id = ctx.session_id.value(),
+                        turn_id = ctx.turn_id.value(),
+                        generation_id = ctx.generation_id.value(),
+                        "skip_detected"
+                    );
+                    self.publish_terminal_event(
                         &app,
                         &ctx,
-                        ResponseSuggestionEvent::Delta {
+                        &terminal_emitted,
+                        TerminalState::Skipped,
+                        Some(ResponseSuggestionEvent::Skipped {
                             session_id: ctx.session_id,
                             turn_id: ctx.turn_id,
                             utterance_id: ctx.utterance_id,
                             generation_id: ctx.generation_id,
-                            text: visible,
-                        },
+                        }),
                     );
                 }
-                diagnostics.event_emitted = if full_text.trim().is_empty() {
-                    "completed_empty".to_string()
-                } else {
-                    "completed_with_text".to_string()
-                };
-                self.publish_terminal_event(
-                    &app,
-                    &ctx,
-                    &terminal_emitted,
-                    TerminalState::Completed,
-                    Some(ResponseSuggestionEvent::Completed {
-                        session_id: ctx.session_id,
-                        turn_id: ctx.turn_id,
-                        utterance_id: ctx.utterance_id,
-                        generation_id: ctx.generation_id,
-                        text: full_text.clone(),
-                    }),
-                );
-            }
-            SkipDecision::Pending => {
-                diagnostics.event_emitted = if full_text.trim().is_empty() {
-                    "completed_empty".to_string()
-                } else {
-                    "completed_with_text".to_string()
-                };
-                self.publish_terminal_event(
-                    &app,
-                    &ctx,
-                    &terminal_emitted,
-                    TerminalState::Completed,
-                    Some(ResponseSuggestionEvent::Completed {
-                        session_id: ctx.session_id,
-                        turn_id: ctx.turn_id,
-                        utterance_id: ctx.utterance_id,
-                        generation_id: ctx.generation_id,
-                        text: full_text.clone(),
-                    }),
-                );
-            }
-        }
+                SkipDecision::NotSkip { flush } => {
+                    // Fim do stream: o que o guarda ainda estiver segurando precisa sair agora
+                    // (ou ser descartado agora), senão uma resposta curta sem pontuação final
+                    // nunca chegaria à UI.
+                    fed_characters += flush.chars().count();
+                    let mut visible = echo_guard.push(&flush);
+                    visible.push_str(&echo_guard.finish());
+                    if !visible.is_empty() {
+                        if first_visible_text_at.is_none() {
+                            first_visible_text_at = Some(Instant::now());
+                        }
+                        full_text.push_str(&visible);
+                        self.publish_stream_event(
+                            &app,
+                            &ctx,
+                            ResponseSuggestionEvent::Delta {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+                                utterance_id: ctx.utterance_id,
+                                generation_id: ctx.generation_id,
+                                text: visible,
+                            },
+                        );
+                    }
+                    if is_invalid_generated_response(&full_text) && invalid_retry_available {
+                        invalid_retry_available = false;
+                        diagnostics.raw_prefix.clear();
+                        diagnostics.first_chunk_received = None;
+                        diagnostics.event_emitted = "retry_invalid_generation".to_string();
+                        let _ = self.publish_stream_event(
+                            &app,
+                            &ctx,
+                            ResponseSuggestionEvent::Started {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+                                utterance_id: ctx.utterance_id,
+                                generation_id: ctx.generation_id,
+                            },
+                        );
+                        continue 'generation_attempt;
+                    }
 
-        diagnostics.final_text_length = full_text.chars().count();
-        diagnostics.echo_suppressed_characters =
-            fed_characters.saturating_sub(diagnostics.final_text_length);
-        finish!(diagnostics);
+                    diagnostics.event_emitted = if full_text.trim().is_empty() {
+                        "completed_empty".to_string()
+                    } else {
+                        "completed_with_text".to_string()
+                    };
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Completed,
+                        Some(ResponseSuggestionEvent::Completed {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            generation_id: ctx.generation_id,
+                            text: full_text.clone(),
+                        }),
+                    );
+                }
+                SkipDecision::Pending => {
+                    if is_invalid_generated_response(&full_text) && invalid_retry_available {
+                        invalid_retry_available = false;
+                        diagnostics.raw_prefix.clear();
+                        diagnostics.first_chunk_received = None;
+                        diagnostics.event_emitted = "retry_invalid_generation".to_string();
+                        let _ = self.publish_stream_event(
+                            &app,
+                            &ctx,
+                            ResponseSuggestionEvent::Started {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+                                utterance_id: ctx.utterance_id,
+                                generation_id: ctx.generation_id,
+                            },
+                        );
+                        continue 'generation_attempt;
+                    }
+
+                    diagnostics.event_emitted = if full_text.trim().is_empty() {
+                        "completed_empty".to_string()
+                    } else {
+                        "completed_with_text".to_string()
+                    };
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Completed,
+                        Some(ResponseSuggestionEvent::Completed {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            generation_id: ctx.generation_id,
+                            text: full_text.clone(),
+                        }),
+                    );
+                }
+            }
+
+            diagnostics.final_text_length = full_text.chars().count();
+            diagnostics.echo_suppressed_characters =
+                fed_characters.saturating_sub(diagnostics.final_text_length);
+            finish!(diagnostics);
+            break;
+        }
     }
 
     /// Fecha uma geração: registra `latency_ms`, computa as métricas de latência de ponta
@@ -1305,9 +1395,30 @@ mod tests {
     };
     use crate::response_provider::provider::{ResponseStream, ResponseStreamMeta};
     use futures_util::stream;
+    use std::collections::VecDeque;
     use std::time::Duration;
     use tauri::Listener;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn punctuation_only_generation_is_invalid() {
+        assert!(is_invalid_generated_response("?"));
+        assert!(is_invalid_generated_response("."));
+    }
+
+    #[test]
+    fn farewell_only_generation_is_invalid() {
+        assert!(is_invalid_generated_response("Tchau!"));
+        assert!(is_invalid_generated_response("tchau"));
+    }
+
+    #[test]
+    fn empty_generation_is_invalid_but_technical_answer_is_valid() {
+        assert!(is_invalid_generated_response(" \n"));
+        assert!(!is_invalid_generated_response(
+            "Eu separaria o domínio da persistência e mapearia EF só na infraestrutura."
+        ));
+    }
 
     // `ResponseEngine::from_config_path` reads/derives config from disk and picks a real
     // provider by kind — not useful for testing the orchestration logic in this file.
@@ -1358,6 +1469,7 @@ mod tests {
     // response provider configuration changes, not once per generation.
     enum FakeBehavior {
         RepliesWith(String),
+        RepliesInOrder(Mutex<VecDeque<String>>),
         /// Never yields anything and never ends — stays "in flight" until the caller
         /// cancels it (via a new trigger for the same turn) or the test drops it. Used to
         /// test cancellation/replacement of an active generation.
@@ -1389,6 +1501,12 @@ mod tests {
 
         fn with_text(text: &str) -> Arc<Self> {
             FakeProvider::new(FakeBehavior::RepliesWith(text.to_string()))
+        }
+
+        fn with_texts(texts: &[&str]) -> Arc<Self> {
+            FakeProvider::new(FakeBehavior::RepliesInOrder(Mutex::new(
+                texts.iter().map(|text| (*text).to_string()).collect(),
+            )))
         }
 
         fn hanging() -> Arc<Self> {
@@ -1446,6 +1564,14 @@ mod tests {
             let stream: ResponseStream = match &self.behavior {
                 FakeBehavior::RepliesWith(text) => {
                     Box::pin(stream::iter(vec![Ok(ResponseChunk::Delta(text.clone()))]))
+                }
+                FakeBehavior::RepliesInOrder(texts) => {
+                    let text = texts
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("fake provider sequence exhausted");
+                    Box::pin(stream::iter(vec![Ok(ResponseChunk::Delta(text))]))
                 }
                 FakeBehavior::Hangs => Box::pin(stream::pending()),
                 FakeBehavior::FailsRequest => {
@@ -1706,6 +1832,50 @@ mod tests {
         );
         assert_eq!(started["session_id"], session.value());
         wait_for_event_type(&mut rx, "completed").await;
+    }
+
+    async fn assert_invalid_first_generation_is_retried_once(invalid: &str) {
+        let provider = FakeProvider::with_texts(&[
+            invalid,
+            "Eu separaria o domínio da persistência e deixaria o Entity Framework na infraestrutura.",
+        ]);
+        let engine = ResponseEngine::for_test(provider.clone());
+        let session = engine.active_session_id();
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut rx = capture_events(&handle);
+
+        let remote = remote_turn(1, "Como você aplicaria DDD com Entity Framework?");
+        process_conversation_events(
+            &handle,
+            engine.clone(),
+            &utterance_finalized_batch_in(&remote, session),
+        );
+
+        wait_for_event_type(&mut rx, "started").await;
+        wait_for_event_type(&mut rx, "started").await;
+        let completed = wait_for_event_type(&mut rx, "completed").await;
+
+        assert_eq!(provider.request_count(), 2);
+        assert_eq!(
+            completed["text"],
+            "Eu separaria o domínio da persistência e deixaria o Entity Framework na infraestrutura."
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_generation_retries_once_with_same_context() {
+        assert_invalid_first_generation_is_retried_once("").await;
+    }
+
+    #[tokio::test]
+    async fn question_mark_only_generation_retries_once_with_same_context() {
+        assert_invalid_first_generation_is_retried_once("?").await;
+    }
+
+    #[tokio::test]
+    async fn farewell_only_generation_retries_once_with_same_context() {
+        assert_invalid_first_generation_is_retried_once("Tchau!").await;
     }
 
     /// O bug: o usuário lê a sugestão em voz alta, o microfone capta, a utterance aberta

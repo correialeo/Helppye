@@ -17,6 +17,7 @@ pub mod transcription;
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tracing_subscriber::EnvFilter;
 
 use audio::segment::SegmentId;
@@ -36,6 +37,18 @@ use transcription::whisper_local::WhisperLocalTranscriptionProvider;
 use transcription::whisper_provider::WhisperCppProvider;
 use transcription::{TranscriptionState, TRANSCRIPTION_EVENT};
 
+const GLOBAL_SESSION_TOGGLE_EVENT: &str = "helppye://global-session-toggle";
+
+fn session_toggle_shortcut() -> Shortcut {
+    #[cfg(target_os = "macos")]
+    let modifiers = Modifiers::SUPER;
+
+    #[cfg(not(target_os = "macos"))]
+    let modifiers = Modifiers::CONTROL;
+
+    Shortcut::new(Some(modifiers), Code::KeyD)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -45,7 +58,25 @@ pub fn run() {
         .init();
 
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() == ShortcutState::Pressed && *shortcut == session_toggle_shortcut() {
+                        if let Err(e) = app.emit(GLOBAL_SESSION_TOGGLE_EVENT, ()) {
+                            tracing::warn!(%e, "failed emit global session shortcut event frontend");
+                        }
+                    }
+                })
+                .build(),
+        )
         .setup(|app| {
+            if let Err(e) = app.global_shortcut().register(session_toggle_shortcut()) {
+                tracing::warn!(
+                    %e,
+                    "failed register global session shortcut; Ctrl+D/Cmd+D may only work while Helppye is focused"
+                );
+            }
+
             let transcriber: Arc<dyn SegmentTranscriber> = Arc::new(WhisperCppProvider::new());
             let timeline = Arc::new(ConversationTimeline::default());
             timeline.attach();

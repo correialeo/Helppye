@@ -16,7 +16,7 @@
         "title": "Helppye",
         "width": 326,
         "height": 88,
-        "minWidth": 306,
+      "minWidth": 360,
         "minHeight": 80,
         "resizable": true,
         "decorations": false,

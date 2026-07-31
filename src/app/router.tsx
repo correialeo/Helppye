@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { nextOnboardingScreen, type AppScreen } from "./appFlow";
+import { createSessionToggleController } from "./sessionToggleController";
 import { useOnboardingStore } from "../stores/useOnboardingStore";
 import { startCapture, stopCapture } from "../services/audioService";
 import { endConversationSession, startConversationSession } from "../services/conversationService";
 import { closeSessionWindows, openSessionWindows, openSettingsWindow, restoreSessionWindows } from "../services/sessionWindowService";
+import { onGlobalSessionToggle } from "../services/globalShortcutService";
 import { WelcomeScreen } from "../features/welcome/WelcomeScreen";
 import { CloudLoginScreen } from "../features/welcome/CloudLoginScreen";
 import { ReadyScreen } from "../features/ready/ReadyScreen";
@@ -24,6 +26,7 @@ export function AppRouter() {
   const [sessionDetached, setSessionDetached] = useState(false);
   const [settingsReturnTo, setSettingsReturnTo] = useState<AppScreen>("ready");
   const [developerToolsOpen, setDeveloperToolsOpen] = useState(false);
+  const globalToggleController = useRef<(() => Promise<void>) | null>(null);
 
   const goNext = () => setScreen(nextOnboardingScreen(screen));
 
@@ -55,6 +58,24 @@ export function AppRouter() {
     await endConversationSession().catch(() => {});
     setScreen("ready");
   };
+
+  if (!globalToggleController.current) {
+    globalToggleController.current = createSessionToggleController({
+      getScreen: () => useOnboardingStore.getState().screen,
+      startSession,
+      endSession,
+    });
+  }
+
+  useEffect(() => {
+    const unlistenPromise = onGlobalSessionToggle(() => {
+      void globalToggleController.current?.();
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   const finishOnboarding = async () => {
     await stopAllCapture();
