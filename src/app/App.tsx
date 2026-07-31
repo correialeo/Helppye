@@ -6,7 +6,8 @@ import { AudioCaptureProvider } from "../hooks/useAudioCapture";
 import { useWindowMode } from "../hooks/useWindowMode";
 import { useOnboardingStore } from "../stores/useOnboardingStore";
 import { SessionScreen } from "../features/session/SessionScreen";
-import { getSessionWindowRole, getWindowStartedAt } from "../services/sessionWindowService";
+import { SettingsScreen } from "../features/settings/SettingsScreen";
+import { getSessionWindowRole, getWindowStartedAt, openSettingsWindow } from "../services/sessionWindowService";
 
 export default function App() {
   const screen = useOnboardingStore((s) => s.screen);
@@ -25,13 +26,22 @@ export default function App() {
   useWindowMode(screen, windowRole === "main");
 
   if (windowRole !== "main") {
+    if (windowRole === "settings") {
+      return (
+        <ErrorBoundary>
+          <AudioCaptureProvider />
+          <SettingsScreen onBack={() => window.close()} onOpenDeveloperTools={() => {}} />
+        </ErrorBoundary>
+      );
+    }
+
     return (
       <ErrorBoundary>
         <AudioCaptureProvider />
         <SessionScreen
           mode={windowRole}
           startedAt={getWindowStartedAt()}
-          onOpenSettings={() => {}}
+          onOpenSettings={() => void openSettingsWindow()}
           onOpenDeveloperTools={() => {}}
           onEndSession={() => window.close()}
         />

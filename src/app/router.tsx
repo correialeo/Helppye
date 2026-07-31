@@ -3,7 +3,7 @@ import { nextOnboardingScreen, type AppScreen } from "./appFlow";
 import { useOnboardingStore } from "../stores/useOnboardingStore";
 import { startCapture, stopCapture } from "../services/audioService";
 import { endConversationSession, startConversationSession } from "../services/conversationService";
-import { closeSessionWindows, openSessionWindows } from "../services/sessionWindowService";
+import { closeSessionWindows, openSessionWindows, openSettingsWindow, restoreSessionWindows } from "../services/sessionWindowService";
 import { WelcomeScreen } from "../features/welcome/WelcomeScreen";
 import { CloudLoginScreen } from "../features/welcome/CloudLoginScreen";
 import { ReadyScreen } from "../features/ready/ReadyScreen";
@@ -29,7 +29,9 @@ export function AppRouter() {
 
   const openSettings = () => {
     setSettingsReturnTo(screen === "session" ? "session" : "ready");
-    setScreen("settings");
+    openSettingsWindow().then((opened) => {
+      if (!opened) setScreen("settings");
+    });
   };
 
   const openDeveloperTools = () => setDeveloperToolsOpen(true);
@@ -95,6 +97,7 @@ export function AppRouter() {
           onOpenSettings={openSettings}
           onOpenDeveloperTools={openDeveloperTools}
           onEndSession={endSession}
+          onRestoreSession={restoreSessionWindows}
         />
       );
     case "settings":

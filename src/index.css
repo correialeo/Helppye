@@ -20,7 +20,7 @@ body,
 }
 
 body {
-  @apply bg-app text-neutral-100 antialiased;
+  @apply bg-transparent text-neutral-100 antialiased;
   font-feature-settings: "cv11", "ss01";
 }
 
