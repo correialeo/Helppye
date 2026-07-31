@@ -19,6 +19,7 @@ export interface ConversationUtterance {
   speaker: ConversationSpeaker;
   text: string;
   segments: number[];
+  received_sequence: number;
   started_at: number;
   ended_at: number;
   finalized_at: number | null;
@@ -42,29 +43,31 @@ export interface ConversationTimelineSnapshot {
 export type ConversationTimelineEvent =
   | {
       type: "turn_started";
-      turn_id: number;
-      speaker: ConversationSpeaker;
-      source: AudioSourceKind;
-      started_at: number;
+  turn_id: number;
+  speaker: ConversationSpeaker;
+  source: AudioSourceKind;
+  started_at: number;
     }
   | { type: "turn_updated"; turn: ConversationTurn }
   | { type: "turn_finalized"; turn: ConversationTurn; session_id: number }
   | {
       type: "utterance_started";
       utterance_id: number;
-      turn_id: number;
-      speaker: ConversationSpeaker;
-      source: AudioSourceKind;
-      started_at: number;
+  turn_id: number;
+  speaker: ConversationSpeaker;
+  source: AudioSourceKind;
+  received_sequence: number;
+  started_at: number;
     }
   | {
       type: "utterance_updated";
       utterance_id: number;
-      turn_id: number;
-      speaker: ConversationSpeaker;
-      source: AudioSourceKind;
-      started_at: number;
-      text: string;
+  turn_id: number;
+  speaker: ConversationSpeaker;
+  source: AudioSourceKind;
+  received_sequence: number;
+  started_at: number;
+  text: string;
       ended_at: number;
       segments: number[];
     }

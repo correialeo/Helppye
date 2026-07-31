@@ -157,11 +157,11 @@ function AiResponsePanel({
     window.setTimeout(() => setCopied(false), 1400);
   };
 
-  let body: ReactNode = <p className="text-[15px] leading-relaxed text-white/66">Aguardando uma fala de OTHERS...</p>;
+  let body: ReactNode = <p className="text-[14px] leading-relaxed text-white/66">Aguardando uma fala de OTHERS...</p>;
 
   if (suggestion?.status === "preparing") {
     body = (
-      <div className="flex items-center gap-2 text-[15px] font-medium text-white/74">
+      <div className="flex items-center gap-2 text-[14px] font-medium text-white/74">
         <Loader2 className="h-4 w-4 animate-spin text-white/62" />
         Preparando resposta
       </div>
@@ -169,7 +169,7 @@ function AiResponsePanel({
   } else if (suggestion?.status === "error") {
     body = (
       <div className="flex flex-col gap-3">
-        <p className="text-[15px] leading-relaxed text-red-200/90">
+        <p className="text-[14px] leading-relaxed text-red-200/90">
           {suggestion.errorMessage || "Nao foi possivel gerar a resposta."}
         </p>
         {regenerateTurnId !== null && (
@@ -186,7 +186,7 @@ function AiResponsePanel({
     );
   } else if (suggestion?.text) {
     body = (
-      <p className="whitespace-pre-wrap text-[18px] font-medium leading-[1.42] tracking-normal text-white/92">
+      <p className="whitespace-pre-wrap text-[16px] font-medium leading-[1.42] tracking-normal text-white/92">
         {suggestion.text}
         {active && <span className="ml-1 inline-block h-4 w-1 translate-y-0.5 animate-pulse-soft rounded-full bg-white/55" />}
       </p>
@@ -471,7 +471,7 @@ export function SessionScreen({
         <button
           type="button"
           onClick={onEndSession}
-          className="inline-flex h-10 items-center gap-2 rounded-full bg-red-500/92 px-3 text-[11px] font-semibold text-white transition hover:bg-red-500"
+          className="inline-flex h-10 items-center gap-2 rounded-full border border-red-400/45 bg-[#1b090b] px-3 text-[11px] font-semibold text-red-100 transition hover:border-red-300/70 hover:bg-[#260b0f]"
           aria-label={`Encerrar sessao ${elapsed}`}
         >
           <X className="h-3.5 w-3.5" />
@@ -539,7 +539,7 @@ export function SessionScreen({
       <DraggablePanel
         position={aiPosition}
         onPositionChange={setAiPosition}
-        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px]"
+        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[400px] flex-col overflow-hidden rounded-[22px]"
         style={AI_GLASS_STYLE}
         handle={<AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} />}
       >
@@ -548,7 +548,7 @@ export function SessionScreen({
       <DraggablePanel
         position={chatPosition}
         onPositionChange={setChatPosition}
-        className="absolute left-0 top-0 z-10 flex h-[calc(100%-222px)] min-h-[340px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#111214]"
+        className="absolute left-0 top-0 z-10 flex h-[calc(100%-222px)] min-h-[340px] w-[calc(100%-24px)] min-w-[400px] flex-col overflow-hidden rounded-[22px] bg-[#111214]"
         handle={
           <div className="flex h-8 items-center justify-between px-4 text-white/36">
             <div className="flex items-center gap-2">

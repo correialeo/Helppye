@@ -192,6 +192,7 @@ pub struct ConversationUtterance {
     pub source: AudioSource,
     pub text: String,
     pub segments: Vec<SegmentId>,
+    pub received_sequence: u64,
     pub started_at: AudioTimestamp,
     pub ended_at: AudioTimestamp,
     pub finalized_at: Option<AudioTimestamp>,
@@ -210,6 +211,7 @@ impl ConversationUtterance {
             source: segment.source,
             text: segment.text.clone(),
             segments: vec![segment.segment_id],
+            received_sequence: segment.received_sequence,
             started_at: segment.started_at,
             ended_at: segment.ended_at,
             finalized_at: None,
@@ -361,6 +363,7 @@ pub enum ConversationTimelineEvent {
         turn_id: TurnId,
         speaker: ConversationSpeaker,
         source: AudioSource,
+        received_sequence: u64,
         started_at: AudioTimestamp,
     },
     UtteranceUpdated {
@@ -368,6 +371,7 @@ pub enum ConversationTimelineEvent {
         turn_id: TurnId,
         speaker: ConversationSpeaker,
         source: AudioSource,
+        received_sequence: u64,
         started_at: AudioTimestamp,
         text: String,
         ended_at: AudioTimestamp,
@@ -493,6 +497,7 @@ impl ConversationAssembler {
                     turn_id: self.open_turn_id(),
                     speaker: updated_utterance.speaker,
                     source: updated_utterance.source,
+                    received_sequence: updated_utterance.received_sequence,
                     started_at: updated_utterance.started_at,
                     text: updated_utterance.text.clone(),
                     ended_at: updated_utterance.ended_at,
@@ -634,6 +639,7 @@ impl ConversationAssembler {
             turn_id,
             speaker: utterance.speaker,
             source: utterance.source,
+            received_sequence: utterance.received_sequence,
             started_at: utterance.started_at,
         });
         events.push(ConversationTimelineEvent::UtteranceUpdated {
@@ -641,6 +647,7 @@ impl ConversationAssembler {
             turn_id,
             speaker: utterance.speaker,
             source: utterance.source,
+            received_sequence: utterance.received_sequence,
             started_at: utterance.started_at,
             text: utterance.text.clone(),
             ended_at: utterance.ended_at,
@@ -825,8 +832,14 @@ impl ConversationAssembler {
         if let Some(open) = self.open_utterance.clone() {
             utterances.push(open);
         }
-        utterances
-            .sort_by_key(|utterance| (utterance.started_at, utterance.ended_at, utterance.id));
+        utterances.sort_by_key(|utterance| {
+            (
+                utterance.received_sequence,
+                utterance.started_at,
+                utterance.ended_at,
+                utterance.id,
+            )
+        });
 
         ConversationTimelineSnapshot { turns, utterances }
     }

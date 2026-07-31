@@ -6,6 +6,13 @@ function sortByStart<T extends { started_at: number; ended_at: number; id: numbe
   return [...items].sort((a, b) => a.started_at - b.started_at || a.ended_at - b.ended_at || a.id - b.id);
 }
 
+function sortUtterances(items: ConversationUtterance[]): ConversationUtterance[] {
+  return [...items].sort(
+    (a, b) =>
+      a.received_sequence - b.received_sequence || a.started_at - b.started_at || a.ended_at - b.ended_at || a.id - b.id,
+  );
+}
+
 /** Live Conversation Timeline — turns/utterances, kept in sync via
  * `conversation://timeline-event`. The one hook both the session screen (last remote
  * utterance) and the transcript drawer / developer tools (full history) read from. */
@@ -18,7 +25,7 @@ export function useConversationTimeline() {
     getConversationTimelineSnapshot()
       .then((snapshot) => {
         setTurns(sortByStart(snapshot.turns));
-        setUtterances(sortByStart(snapshot.utterances));
+        setUtterances(sortUtterances(snapshot.utterances));
         setError(null);
       })
       .catch((e) => setError(String(e)));
@@ -56,12 +63,13 @@ export function useConversationTimeline() {
             source: event.source,
             text: "",
             segments: [],
+            received_sequence: event.received_sequence,
             started_at: event.started_at,
             ended_at: event.started_at,
             finalized_at: null,
             revision: 1,
           };
-          return sortByStart([...current.filter((u) => u.id !== next.id), next]);
+          return sortUtterances([...current.filter((u) => u.id !== next.id), next]);
         });
         return;
       }
@@ -75,12 +83,13 @@ export function useConversationTimeline() {
             source: existing?.source ?? event.source,
             text: event.text,
             segments: event.segments,
+            received_sequence: existing?.received_sequence ?? event.received_sequence,
             started_at: existing?.started_at ?? event.started_at,
             ended_at: event.ended_at,
             finalized_at: existing?.finalized_at ?? null,
             revision: existing?.revision ?? 1,
           };
-          return sortByStart([...current.filter((u) => u.id !== next.id), next]);
+          return sortUtterances([...current.filter((u) => u.id !== next.id), next]);
         });
         return;
       }
@@ -88,7 +97,7 @@ export function useConversationTimeline() {
       if (event.type === "utterance_finalized") {
         // Carries the full ConversationUtterance already.
         setUtterances((current) =>
-          sortByStart([...current.filter((u) => u.id !== event.utterance.id), event.utterance]),
+        sortUtterances([...current.filter((u) => u.id !== event.utterance.id), event.utterance]),
         );
         return;
       }

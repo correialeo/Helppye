@@ -1653,6 +1653,7 @@ mod tests {
             source: turn.source,
             text: utterance_text.to_string(),
             segments: vec![SegmentId::next()],
+            received_sequence: 1,
             started_at: turn.started_at,
             ended_at: turn.ended_at,
             finalized_at: Some(turn.ended_at),
