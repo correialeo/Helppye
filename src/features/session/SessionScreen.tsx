@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, FileText, Grip, Loader2, Minus, MoreHorizontal, RefreshCw, Settings, Terminal, X } from "lucide-react";
 import { IconButton } from "../../components/ui/IconButton";
@@ -16,6 +16,12 @@ import type { ConversationUtterance } from "../../types/conversation";
 import type { SuggestionState } from "./responseSuggestionViewModel";
 
 type SessionMode = "combined" | "coordinator" | "ai" | "chat";
+
+const AI_GLASS_STYLE = {
+  backgroundColor: "rgba(7, 7, 9, 0.82)",
+  backdropFilter: "blur(30px) saturate(135%)",
+  WebkitBackdropFilter: "blur(30px) saturate(135%)",
+} satisfies CSSProperties;
 
 interface SessionScreenProps {
   mode?: SessionMode;
@@ -83,12 +89,14 @@ function DraggablePanel({
   position,
   onPositionChange,
   className,
+  style,
   handle,
   children,
 }: {
   position: PanelPosition;
   onPositionChange: (position: PanelPosition) => void;
   className: string;
+  style?: CSSProperties;
   handle: ReactNode;
   children: ReactNode;
 }) {
@@ -120,7 +128,7 @@ function DraggablePanel({
   };
 
   return (
-    <section className={className} style={{ transform: `translate3d(${position.x}px, ${position.y}px, 0)` }}>
+    <section className={className} style={{ ...style, transform: `translate3d(${position.x}px, ${position.y}px, 0)` }}>
       <div
         role="presentation"
         className="cursor-grab select-none active:cursor-grabbing"
@@ -502,7 +510,7 @@ export function SessionScreen({
 
   if (mode === "ai") {
     return (
-      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px] bg-[#16161a]/94 backdrop-blur-md">
+      <div className="flex h-full min-h-screen w-full flex-col overflow-hidden rounded-[22px]" style={AI_GLASS_STYLE}>
         <AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} nativeDrag />
       </div>
     );
@@ -549,7 +557,8 @@ export function SessionScreen({
       <DraggablePanel
         position={aiPosition}
         onPositionChange={setAiPosition}
-        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px] bg-[#16161a]/94 backdrop-blur-md"
+        className="absolute left-0 top-0 z-20 flex h-[190px] w-[calc(100%-24px)] min-w-[320px] flex-col overflow-hidden rounded-[22px]"
+        style={AI_GLASS_STYLE}
         handle={<AiResponsePanel exchange={activeExchange} onRegenerate={handleRegenerate} />}
       >
         {null}
