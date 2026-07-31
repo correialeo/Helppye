@@ -1,39 +1,31 @@
+import { Rocket } from "lucide-react";
 import { BrandMark } from "../../components/ui/BrandMark";
-import { PrimaryButton } from "../../components/ui/PrimaryButton";
-import { GhostButton } from "../../components/ui/GhostButton";
 
 interface WelcomeScreenProps {
   onContinueWithoutLogin: () => void;
   onLogin: () => void;
 }
 
-/**
- * The one screen the spec calls out for maximum restraint: a headline, one line of
- * support copy, and exactly one dominant action. "Continuar sem login" is primary
- * because it's what this version of the product actually offers — "Entrar" is a
- * secondary, honest detour (see features/welcome/CloudLoginScreen.tsx), not a dead end.
- */
 export function WelcomeScreen({ onContinueWithoutLogin, onLogin }: WelcomeScreenProps) {
   return (
-    <div className="flex h-full min-h-screen w-full flex-col items-center justify-center gap-8 bg-app px-8 py-10 text-center">
-      <BrandMark size={44} />
-
-      <div className="flex max-w-xs flex-col gap-3">
-        <h1 className="text-2xl font-semibold leading-tight tracking-tight text-neutral-50">
-          Respostas melhores,
-          <br />
-          no momento certo.
-        </h1>
-        <p className="text-sm leading-relaxed text-neutral-400">
-          O Helppye acompanha entrevistas e reuniões, entende a conversa e sugere o que responder.
-        </p>
-      </div>
-
-      <div className="flex w-full max-w-xs flex-col items-center gap-2">
-        <PrimaryButton fullWidth onClick={onContinueWithoutLogin}>
-          Continuar sem login
-        </PrimaryButton>
-        <GhostButton onClick={onLogin}>Entrar</GhostButton>
+    <div className="flex h-full min-h-screen w-full items-center justify-center bg-black px-5 py-6">
+      <div className="flex w-full max-w-[290px] items-center gap-2 rounded-[14px] border border-white/10 bg-[#101012] p-2 shadow-[0_14px_40px_rgba(0,0,0,.55)]">
+        <button
+          type="button"
+          onClick={onLogin}
+          className="grid h-10 w-10 place-items-center rounded-[10px] border border-white/8 bg-white/[0.04] text-white/76 hover:bg-white/8"
+          aria-label="Entrar"
+        >
+          <BrandMark size={18} />
+        </button>
+        <button
+          type="button"
+          onClick={onContinueWithoutLogin}
+          className="flex h-10 flex-1 items-center justify-center gap-2 rounded-[10px] bg-brand-600 px-3 text-xs font-bold text-white shadow-[0_0_20px_rgba(37,99,235,.42)] hover:bg-brand-500"
+        >
+          <Rocket className="h-4 w-4" />
+          Iniciar Configuracao
+        </button>
       </div>
     </div>
   );

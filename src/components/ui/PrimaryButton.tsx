@@ -17,7 +17,7 @@ export const PrimaryButton = forwardRef<HTMLButtonElement, PrimaryButtonProps>(
       type="button"
       disabled={disabled || loading}
       className={cx(
-        "inline-flex items-center justify-center gap-2 rounded-lg bg-brand-600 px-4 py-2.5 text-sm font-medium text-white shadow-soft transition-colors duration-150",
+        "inline-flex items-center justify-center gap-2 rounded-[9px] bg-brand-600 px-4 py-2.5 text-sm font-bold text-white shadow-[0_0_18px_rgba(37,99,235,.34)] transition-colors duration-150",
         "hover:bg-brand-500 active:bg-brand-700",
         "disabled:cursor-not-allowed disabled:opacity-50",
         fullWidth && "w-full",

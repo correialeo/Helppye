@@ -21,15 +21,15 @@ export function ProviderOption({ name, description, badge, status, selected, onS
       onClick={onSelect}
       aria-pressed={selected}
       className={cx(
-        "flex w-full items-start justify-between gap-3 rounded-lg border px-4 py-3 text-left transition-colors duration-150",
-        selected ? "border-brand-400/70 bg-brand-500/8" : "border-white/10 bg-surface hover:border-white/20",
+        "flex w-full items-start justify-between gap-3 rounded-[8px] border px-4 py-3 text-left transition-colors duration-150",
+        selected ? "border-brand-400/70 bg-brand-500/10" : "border-white/10 bg-[#111112] hover:border-white/20",
       )}
     >
       <div className="flex flex-col gap-0.5">
         <span className="flex items-center gap-2 text-sm font-medium text-neutral-100">
           {name}
           {badge && (
-            <span className="rounded-full bg-brand-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-brand-300">
+              <span className="rounded-full bg-white/10 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-white/62">
               {badge}
             </span>
           )}

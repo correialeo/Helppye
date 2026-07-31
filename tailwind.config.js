@@ -18,17 +18,17 @@ export default {
         // Helppye's single accent color — a refined violet, deliberately distinct from
         // generic Tailwind "indigo". One accent only; no competing hues (see CLAUDE.md).
         brand: {
-          50: "#F2EFFF",
-          100: "#E6E0FF",
-          200: "#CBC0FF",
-          300: "#AB98FF",
-          400: "#8C6FFF",
-          500: "#7C5CFC",
-          600: "#6A46EE",
-          700: "#5636C7",
-          800: "#452B9E",
-          900: "#38257D",
-          950: "#231650",
+          50: "#EFF6FF",
+          100: "#DBEAFE",
+          200: "#BFDBFE",
+          300: "#93C5FD",
+          400: "#60A5FA",
+          500: "#3B82F6",
+          600: "#2563EB",
+          700: "#1D4ED8",
+          800: "#1E40AF",
+          900: "#1E3A8A",
+          950: "#172554",
         },
       },
       borderRadius: {

@@ -5,23 +5,39 @@ import { resolveInitialScreen } from "./appFlow";
 import { AudioCaptureProvider } from "../hooks/useAudioCapture";
 import { useWindowMode } from "../hooks/useWindowMode";
 import { useOnboardingStore } from "../stores/useOnboardingStore";
+import { SessionScreen } from "../features/session/SessionScreen";
+import { getSessionWindowRole, getWindowStartedAt } from "../services/sessionWindowService";
 
-/**
- * Owns only: startup normalization, global providers, window sizing, and the error
- * boundary. Everything about *what screen renders* lives in `app/router.tsx`; everything
- * about *what a screen looks like* lives in `features/`. See docs/frontend-architecture.md.
- */
 export default function App() {
   const screen = useOnboardingStore((s) => s.screen);
+  const windowRole = getSessionWindowRole();
 
   useEffect(() => {
+    if (windowRole !== "main") return;
     const state = useOnboardingStore.getState();
-    const resolved = resolveInitialScreen({ onboardingComplete: state.onboardingComplete, screen: state.screen });
+    const resolved = resolveInitialScreen({
+      onboardingComplete: state.onboardingComplete,
+      screen: state.screen,
+    });
     if (resolved !== state.screen) state.setScreen(resolved);
-    // Runs once, right after the persisted store rehydrates — not on every screen change.
-  }, []);
+  }, [windowRole]);
 
-  useWindowMode(screen);
+  useWindowMode(screen, windowRole === "main");
+
+  if (windowRole !== "main") {
+    return (
+      <ErrorBoundary>
+        <AudioCaptureProvider />
+        <SessionScreen
+          mode={windowRole}
+          startedAt={getWindowStartedAt()}
+          onOpenSettings={() => {}}
+          onOpenDeveloperTools={() => {}}
+          onEndSession={() => window.close()}
+        />
+      </ErrorBoundary>
+    );
+  }
 
   return (
     <ErrorBoundary>

@@ -3,8 +3,8 @@ import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import type { AppScreen } from "../app/appFlow";
 
 const APP_SIZE = new LogicalSize(420, 760);
-const SESSION_SIZE = new LogicalSize(380, 620);
-const SESSION_MIN_SIZE = new LogicalSize(320, 420);
+const SESSION_SIZE = new LogicalSize(290, 84);
+const SESSION_MIN_SIZE = new LogicalSize(270, 76);
 const APP_MIN_SIZE = new LogicalSize(360, 560);
 
 /**
@@ -16,11 +16,12 @@ const APP_MIN_SIZE = new LogicalSize(360, 560);
  * (e.g. running outside Tauri, in a plain browser during `npm run dev` without the
  * Tauri shell) never blocks the screen from rendering.
  */
-export function useWindowMode(screen: AppScreen) {
+export function useWindowMode(screen: AppScreen, enabled = true) {
   useEffect(() => {
+    if (!enabled) return;
     const win = getCurrentWindow();
     const isSession = screen === "session";
     win.setMinSize(isSession ? SESSION_MIN_SIZE : APP_MIN_SIZE).catch(() => {});
     win.setSize(isSession ? SESSION_SIZE : APP_SIZE).catch(() => {});
-  }, [screen]);
+  }, [enabled, screen]);
 }

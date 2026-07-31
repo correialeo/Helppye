@@ -11,7 +11,7 @@ export function BrandMark({ size = 28 }: { size?: number }) {
   return (
     <span
       className={cx(
-        "inline-flex flex-shrink-0 items-center justify-center rounded-lg bg-brand-600 text-white shadow-glow-brand",
+      "inline-flex flex-shrink-0 items-center justify-center rounded-[6px] bg-brand-600 text-white shadow-[0_0_16px_rgba(37,99,235,.32)]",
       )}
       style={{ width: size, height: size }}
       aria-hidden="true"

@@ -8,9 +8,9 @@
  * (brand, defined in tailwind.config.js). No competing hues, no heavy glassmorphism.
  */
 :root {
-  --color-app: 9 9 11;
-  --color-surface: 17 17 20;
-  --color-surface-raised: 26 26 31;
+  --color-app: 0 0 0;
+  --color-surface: 15 15 16;
+  --color-surface-raised: 24 24 26;
 }
 
 html,
