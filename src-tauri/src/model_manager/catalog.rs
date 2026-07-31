@@ -13,6 +13,22 @@ pub enum ModelLanguageSupport {
     EnglishOnly,
 }
 
+impl ModelLanguageSupport {
+    /// Deduz o suporte de idioma pelo nome do arquivo. É best-effort e existe por um único
+    /// motivo: um `.bin` do whisper.cpp não carrega metadado de idioma, então o sufixo `.en`
+    /// da convenção oficial é o único sinal disponível sobre um modelo personalizado
+    /// escolhido pelo usuário. Um arquivo renomeado engana a dedução — o resultado é um
+    /// rótulo errado na tela, nunca uma decisão de transcrição.
+    pub fn from_model_filename(filename: &str) -> Self {
+        let lower = filename.to_ascii_lowercase();
+        if lower.contains(".en.") || lower.ends_with(".en") {
+            ModelLanguageSupport::EnglishOnly
+        } else {
+            ModelLanguageSupport::Multilingual
+        }
+    }
+}
+
 /// Definição estática de um modelo baixável. `sha256` e `approximate_size_bytes` são
 /// valores reais, obtidos baixando o arquivo oficial e computando o checksum localmente
 /// (nunca estimados ou copiados de um header HTTP não confiável, como `x-linked-size`
@@ -43,3 +59,47 @@ pub const DEFAULT_MODEL: ModelDefinition = ModelDefinition {
     approximate_size_bytes: 147_951_465,
     language_support: ModelLanguageSupport::Multilingual,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guarda o que o comentário de `DEFAULT_MODEL` afirma. Trocar `ggml-base.bin` por
+    /// `ggml-base.en.bin` é uma edição de uma linha que passaria despercebida em revisão
+    /// e faria toda reunião em português sair transcrita como inglês fonético.
+    #[test]
+    fn the_default_model_is_multilingual_never_english_only() {
+        assert_eq!(
+            DEFAULT_MODEL.language_support,
+            ModelLanguageSupport::Multilingual
+        );
+        assert_ne!(
+            DEFAULT_MODEL.language_support,
+            ModelLanguageSupport::EnglishOnly
+        );
+        assert_eq!(
+            ModelLanguageSupport::from_model_filename(DEFAULT_MODEL.filename),
+            ModelLanguageSupport::Multilingual,
+            "variante .en é exclusiva de inglês: {}",
+            DEFAULT_MODEL.filename
+        );
+    }
+
+    #[test]
+    fn english_only_models_are_recognized_by_the_en_suffix() {
+        for filename in ["ggml-base.en.bin", "ggml-small.en.bin", "GGML-TINY.EN.BIN"] {
+            assert_eq!(
+                ModelLanguageSupport::from_model_filename(filename),
+                ModelLanguageSupport::EnglishOnly,
+                "{filename}"
+            );
+        }
+        for filename in ["ggml-base.bin", "ggml-large-v3.bin", "meu-modelo.bin"] {
+            assert_eq!(
+                ModelLanguageSupport::from_model_filename(filename),
+                ModelLanguageSupport::Multilingual,
+                "{filename}"
+            );
+        }
+    }
+}

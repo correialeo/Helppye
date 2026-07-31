@@ -27,8 +27,10 @@ pub enum ModelInstallState {
 /// necessários para renderizar a tela de onboarding (nome, propósito, tamanho aproximado).
 /// `custom_model_path` só é preenchido quando a seleção persistida é um modelo local
 /// personalizado (Configurações → Transcrição → Avançado), em vez do modelo padrão.
-/// `language_support` é `None` nesse mesmo caso — um modelo personalizado não tem
-/// suporte de idioma conhecido pelo catálogo.
+/// Para o modelo padrão, `language_support` vem do catálogo; para um personalizado, é
+/// deduzido do sufixo `.en` do nome do arquivo
+/// (`ModelLanguageSupport::from_model_filename`), que é o único sinal de idioma que um
+/// `.bin` do whisper.cpp carrega. `None` fica reservado para quando nem isso existir.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelStatus {
     pub model_id: &'static str,

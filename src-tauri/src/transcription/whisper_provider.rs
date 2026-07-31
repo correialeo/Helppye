@@ -1,4 +1,4 @@
-//! `whisper-rs` (whisper.cpp bindings) implementation of `TranscriptionProvider`. See
+//! `whisper-rs` (whisper.cpp bindings) implementation of `SegmentTranscriber`. See
 //! `docs/local-transcription.md` for the evaluation behind this choice, including the
 //! open gap on Windows build verification.
 
@@ -10,7 +10,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::audio::segment::AudioSegment;
 use crate::transcription::error::TranscriptionError;
-use crate::transcription::provider::TranscriptionProvider;
+use crate::transcription::segment_transcriber::SegmentTranscriber;
 use crate::transcription::types::{
     InferenceDevice, ModelConfig, Transcript, TranscriptionLanguage,
 };
@@ -42,7 +42,7 @@ impl WhisperCppProvider {
 }
 
 #[async_trait]
-impl TranscriptionProvider for WhisperCppProvider {
+impl SegmentTranscriber for WhisperCppProvider {
     async fn load(&self, config: ModelConfig) -> Result<(), TranscriptionError> {
         if config.device == InferenceDevice::Gpu {
             return Err(TranscriptionError::Internal(

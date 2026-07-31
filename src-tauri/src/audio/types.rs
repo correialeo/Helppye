@@ -1,8 +1,11 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::audio::error::AudioCaptureError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// `Deserialize` além de `Serialize` porque a fonte também **entra** no processo, não só
+/// sai: o manifesto de fixtures do harness de benchmark declara de que lado da conversa cada
+/// áudio veio, e essa declaração não pode ser inferida do arquivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AudioSource {
     Microphone,

@@ -22,7 +22,7 @@ use events::MODEL_DOWNLOAD_EVENT;
 use manager::ModelManager;
 use state::ModelStatus;
 
-use crate::transcription::provider::TranscriptionProvider;
+use crate::transcription::segment_transcriber::SegmentTranscriber;
 
 pub struct ModelManagerState(pub Arc<ModelManager>);
 
@@ -31,7 +31,7 @@ pub struct ModelManagerState(pub Arc<ModelManager>);
 /// encaminhar eventos ao frontend).
 pub fn build(
     app: &AppHandle,
-    provider: Arc<dyn TranscriptionProvider>,
+    provider: Arc<dyn SegmentTranscriber>,
 ) -> Result<ModelManagerState, String> {
     let (models_dir, config_path) = paths::resolve_paths(app).map_err(|e| e.to_string())?;
     let app_handle = app.clone();

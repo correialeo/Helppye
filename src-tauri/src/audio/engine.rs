@@ -276,6 +276,10 @@ impl CaptureEngine {
         if let Some(handle) = handle {
             handle.cancel.cancel();
             let _ = handle.forward_task.await;
+            // Depois de a tarefa de encaminhamento terminar — nesse ponto todo segmento
+            // desta fonte já foi entregue. Encerra a sessão de transcrição da fonte de forma
+            // graciosa, sem tocar na outra fonte nem na sessão de conversa.
+            self.transcription_queue.finish_source(source).await;
         }
     }
 }
@@ -288,13 +292,13 @@ mod tests {
     use std::time::Duration;
 
     use crate::transcription::error::TranscriptionError;
-    use crate::transcription::provider::TranscriptionProvider;
+    use crate::transcription::segment_transcriber::SegmentTranscriber;
     use crate::transcription::types::{ModelConfig, Transcript};
 
-    struct NoopTranscriptionProvider;
+    struct NoopSegmentTranscriber;
 
     #[async_trait]
-    impl TranscriptionProvider for NoopTranscriptionProvider {
+    impl SegmentTranscriber for NoopSegmentTranscriber {
         async fn load(&self, _config: ModelConfig) -> Result<(), TranscriptionError> {
             Ok(())
         }
@@ -320,10 +324,17 @@ mod tests {
     }
 
     fn fake_transcription_queue() -> Arc<TranscriptionQueue> {
-        Arc::new(TranscriptionQueue::spawn(
-            Arc::new(NoopTranscriptionProvider),
-            |_event| {},
-        ))
+        let provider: Arc<dyn crate::transcription::provider::TranscriptionProvider> = Arc::new(
+            crate::transcription::whisper_local::WhisperLocalTranscriptionProvider::new(Arc::new(
+                NoopSegmentTranscriber,
+            )),
+        );
+        let runtime = Arc::new(crate::transcription::runtime::TranscriptionRuntime::new(
+            provider,
+            crate::transcription::settings::TranscriptionSettings::default(),
+            Arc::new(|_output| {}),
+        ));
+        Arc::new(TranscriptionQueue::spawn(runtime))
     }
 
     fn temp_config_path(name: &str) -> PathBuf {

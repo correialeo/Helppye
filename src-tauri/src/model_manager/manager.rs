@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::model_manager::catalog::{ModelDefinition, DEFAULT_MODEL};
+use crate::model_manager::catalog::{ModelDefinition, ModelLanguageSupport, DEFAULT_MODEL};
 use crate::model_manager::config_store::{self, TranscriptionModelSelection};
 use crate::model_manager::downloader::{ModelDownloader, ProgressCallback};
 use crate::model_manager::error::ModelManagerError;
 use crate::model_manager::events::ModelDownloadEvent;
 use crate::model_manager::state::{ModelInstallState, ModelStatus};
 use crate::model_manager::verify;
-use crate::transcription::provider::TranscriptionProvider;
+use crate::transcription::segment_transcriber::SegmentTranscriber;
 use crate::transcription::types::{InferenceDevice, ModelConfig, TranscriptionLanguage};
 
 /// Intervalo mínimo entre eventos `Progress` emitidos ao frontend — evita inundar o
@@ -33,7 +33,7 @@ pub struct ModelManager {
     models_dir: PathBuf,
     config_path: PathBuf,
     downloader: Arc<dyn ModelDownloader>,
-    provider: Arc<dyn TranscriptionProvider>,
+    provider: Arc<dyn SegmentTranscriber>,
     on_event: EventSink,
     state: Mutex<ModelInstallState>,
     cancel: Mutex<Option<CancellationToken>>,
@@ -44,7 +44,7 @@ impl ModelManager {
         models_dir: PathBuf,
         config_path: PathBuf,
         downloader: Arc<dyn ModelDownloader>,
-        provider: Arc<dyn TranscriptionProvider>,
+        provider: Arc<dyn SegmentTranscriber>,
         on_event: impl Fn(ModelDownloadEvent) + Send + Sync + 'static,
     ) -> Self {
         ModelManager {
@@ -93,9 +93,9 @@ impl ModelManager {
                 model_id: DEFAULT_MODEL.id,
                 display_name: DEFAULT_MODEL.display_name,
                 approximate_size_bytes: DEFAULT_MODEL.approximate_size_bytes,
+                language_support: Some(ModelLanguageSupport::from_model_filename(&model_path)),
                 state,
                 custom_model_path: Some(model_path),
-                language_support: None,
             });
         }
 
@@ -463,7 +463,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl TranscriptionProvider for FakeProvider {
+    impl SegmentTranscriber for FakeProvider {
         async fn load(
             &self,
             config: ModelConfig,
@@ -525,7 +525,7 @@ mod tests {
     fn manager_with(
         dir: &std::path::Path,
         downloader: Arc<dyn ModelDownloader>,
-        provider: Arc<dyn TranscriptionProvider>,
+        provider: Arc<dyn SegmentTranscriber>,
     ) -> ModelManager {
         manager_with_events(
             dir,
@@ -539,7 +539,7 @@ mod tests {
     fn manager_with_events(
         dir: &std::path::Path,
         downloader: Arc<dyn ModelDownloader>,
-        provider: Arc<dyn TranscriptionProvider>,
+        provider: Arc<dyn SegmentTranscriber>,
         events: Arc<StdMutex<Vec<ModelDownloadEvent>>>,
     ) -> (ModelManager, Arc<StdMutex<Vec<ModelDownloadEvent>>>) {
         std::fs::create_dir_all(dir.join("models")).unwrap();
@@ -628,6 +628,10 @@ mod tests {
 
         manager.download_model(definition).await.unwrap();
 
+        // Tira o snapshot antes de travar `events`: o `StdMutex` não é ciente de async, e
+        // segurá-lo através de um `.await` trava o executor se a chamada ceder.
+        let state = manager.status_snapshot().await.unwrap().state;
+
         let events = events.lock().unwrap();
         assert!(events
             .iter()
@@ -638,10 +642,7 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, ModelDownloadEvent::Completed { .. })));
-        assert_eq!(
-            manager.status_snapshot().await.unwrap().state,
-            ModelInstallState::Ready
-        );
+        assert_eq!(state, ModelInstallState::Ready);
     }
 
     #[tokio::test]
@@ -700,6 +701,29 @@ mod tests {
         let result = manager.download_model(definition).await;
 
         assert!(matches!(result, Err(ModelManagerError::InvalidResponse(_))));
+        assert!(matches!(
+            manager.status_snapshot().await.unwrap().state,
+            ModelInstallState::Failed { .. }
+        ));
+        let part_path = tmp.path().join("models").join(format!("{filename}.part"));
+        assert!(!part_path.exists());
+    }
+
+    /// Queda de rede é o modo de falha mais comum num download de ~150 MB, e é diferente
+    /// de um 404: o arquivo existe, a conexão é que caiu. O contrato é o mesmo — falha
+    /// tipada como `Network`, nada de `.part` sobrando para o retry tropeçar.
+    #[tokio::test]
+    async fn network_failure_surfaces_as_failed_and_leaves_no_files_behind() {
+        let tmp = TempDir::new("network-error");
+        let (definition, _bytes) = test_definition("t8b", "model.bin");
+        let filename = definition.filename;
+        let downloader = Arc::new(FakeDownloader::new(vec![FakeOutcome::NetworkError]));
+        let provider = Arc::new(FakeProvider::new(false));
+        let manager = manager_with(tmp.path(), downloader, provider);
+
+        let result = manager.download_model(definition).await;
+
+        assert!(matches!(result, Err(ModelManagerError::Network(_))));
         assert!(matches!(
             manager.status_snapshot().await.unwrap().state,
             ModelInstallState::Failed { .. }

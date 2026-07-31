@@ -36,6 +36,13 @@ impl SegmentId {
     pub fn next() -> Self {
         SegmentId(NEXT_SEGMENT_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Valor bruto, para compor identificadores derivados (ex.: o `provider_event_id`
+    /// determinístico de um resultado de transcrição). Não use para ordenar: ids são
+    /// únicos por processo, mas a ordem de emissão entre fontes não é significativa.
+    pub fn value(self) -> u64 {
+        self.0
+    }
 }
 
 /// One bounded span of detected speech from a single source, ready for transcription.

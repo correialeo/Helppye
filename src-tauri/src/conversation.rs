@@ -17,10 +17,13 @@ use tracing::{debug, info, warn};
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
 use crate::audio::types::{AudioCaptureEvent, AudioSource};
+use crate::normalization::{NormalizationChange, TranscriptNormalizationResult};
 use crate::response_provider::engine::{
     is_eligible_turn, process_conversation_events, GenerationTrigger,
 };
 use crate::response_provider::ResponseEngineState;
+use crate::transcription::events::FinalTranscript;
+#[cfg(test)]
 use crate::transcription::types::{Transcript, TranscriptEvent};
 
 pub const CONVERSATION_TIMELINE_EVENT: &str = "conversation://timeline-event";
@@ -94,6 +97,13 @@ impl SessionId {
     pub fn value(self) -> u64 {
         self.0
     }
+
+    /// Só para testes: sessões com valor conhecido tornam verificável o descarte de evento
+    /// de sessão anterior, que de outra forma dependeria do estado do contador global.
+    #[cfg(test)]
+    pub(crate) fn from_value(value: u64) -> Self {
+        SessionId(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -101,7 +111,16 @@ pub struct TranscriptSegment {
     pub segment_id: SegmentId,
     pub speaker: ConversationSpeaker,
     pub source: AudioSource,
+    /// Texto **normalizado** — o que a timeline junta, o que vai para o prompt, o que o
+    /// usuário vê. `raw_text` guarda o que o transcritor entregou de fato; os dois nunca
+    /// aparecem juntos no contexto enviado ao modelo (ver `ResponseContextBuilder`).
     pub text: String,
+    /// Texto original do provider, preservado sempre. Serve a diagnóstico e a comparação de
+    /// backends no benchmark; nunca é descartado, mesmo quando a normalização não mudou
+    /// nada.
+    pub raw_text: String,
+    /// O que a normalização mexeu, item a item. Vazio quando o texto já estava correto.
+    pub normalization_changes: Vec<NormalizationChange>,
     pub language: Option<String>,
     pub started_at: AudioTimestamp,
     pub ended_at: AudioTimestamp,
@@ -110,6 +129,11 @@ pub struct TranscriptSegment {
 }
 
 impl TranscriptSegment {
+    /// Caminho **de teste**. Em produção nenhum segmento nasce de um `Transcript` cru: ele
+    /// passa antes pelo `TranscriptionRuntime`, que valida a sessão e normaliza (ver
+    /// `from_normalized`). Manter este construtor restrito a testes é o que impede que uma
+    /// chamada nova pule a validação de sessão sem ninguém perceber.
+    #[cfg(test)]
     fn from_transcript(transcript: Transcript, received_sequence: u64) -> Option<Self> {
         let text = normalize_segment_text(&transcript.text);
         if text.is_empty() {
@@ -120,11 +144,42 @@ impl TranscriptSegment {
             segment_id: transcript.segment_id,
             speaker: ConversationSpeaker::from(transcript.source),
             source: transcript.source,
+            raw_text: transcript.text,
             text,
+            normalization_changes: Vec::new(),
             language: transcript.language,
             started_at: transcript.started_at,
             ended_at: transcript.ended_at,
             processing_time_ms: transcript.processing_time_ms,
+            received_sequence,
+        })
+    }
+
+    /// Segmento a partir de um resultado final já normalizado pelo
+    /// `TranscriptionRuntime` — o caminho de produção. `normalize_segment_text` ainda roda
+    /// por cima como rede de segurança para espaços residuais; ela é idempotente sobre
+    /// texto já normalizado.
+    fn from_normalized(
+        transcript: &FinalTranscript,
+        normalization: &TranscriptNormalizationResult,
+        received_sequence: u64,
+    ) -> Option<Self> {
+        let text = normalize_segment_text(&normalization.normalized_text);
+        if text.is_empty() {
+            return None;
+        }
+
+        Some(TranscriptSegment {
+            segment_id: transcript.segment_id.unwrap_or_else(SegmentId::next),
+            speaker: ConversationSpeaker::from(transcript.source),
+            source: transcript.source,
+            raw_text: normalization.raw_text.clone(),
+            text,
+            normalization_changes: normalization.normalization_changes.clone(),
+            language: transcript.language.clone(),
+            started_at: transcript.started_at,
+            ended_at: transcript.ended_at,
+            processing_time_ms: transcript.processing_time_ms.unwrap_or(0),
             received_sequence,
         })
     }
@@ -957,6 +1012,27 @@ impl ConversationTimeline {
             .same_speaker_utterance_gap_ms = gap_ms;
     }
 
+    /// Caminho de produção: um resultado final **já validado e normalizado** pelo
+    /// `TranscriptionRuntime`. A timeline não faz filtro de sessão aqui de propósito — quando
+    /// este método é chamado, o runtime já garantiu que o resultado pertence à sessão ativa,
+    /// à sessão de transcrição viva daquela fonte e não é reentrega.
+    pub fn ingest_normalized_transcript(
+        &self,
+        transcript: &FinalTranscript,
+        normalization: &TranscriptNormalizationResult,
+    ) -> Vec<ConversationTimelineEvent> {
+        let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        let Some(segment) = TranscriptSegment::from_normalized(transcript, normalization, sequence)
+        else {
+            return Vec::new();
+        };
+        self.ingest_segment(segment)
+    }
+
+    /// Entrada **de teste**, sem normalização: exercita a montagem de utterances/turnos a
+    /// partir de texto cru, isolando esses testes de mudanças no vocabulário técnico. O
+    /// caminho de produção é `ingest_normalized_transcript`.
+    #[cfg(test)]
     pub fn ingest_transcript_event(
         &self,
         event: TranscriptEvent,
@@ -969,7 +1045,10 @@ impl ConversationTimeline {
         let Some(segment) = TranscriptSegment::from_transcript(transcript, sequence) else {
             return Vec::new();
         };
+        self.ingest_segment(segment)
+    }
 
+    fn ingest_segment(&self, segment: TranscriptSegment) -> Vec<ConversationTimelineEvent> {
         let events = self
             .assembler
             .lock()
@@ -1159,13 +1238,23 @@ pub async fn conversation_start_session_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
     response_state: State<'_, ResponseEngineState>,
+    transcription_state: State<'_, crate::transcription::TranscriptionState>,
 ) -> Result<(), String> {
     let engine = response_state.0.clone();
+    // Ordem: transcrição primeiro. Encerrar a camada que *produz* fala antes de encerrar as
+    // que a consomem é o que garante que nenhum resultado em voo entre na sessão nova —
+    // fazer o contrário deixaria uma janela em que a timeline já rodou para a próxima
+    // sessão enquanto um resultado da anterior ainda está a caminho dela.
+    transcription_state.runtime.end_session().await;
     // Encerra o que estiver ativo no motor antes de trocar a fronteira: cancela geração em
     // andamento e limpa contexto da sessão anterior.
     engine.end_session(state.0.session_id());
     let transition = state.0.start_session();
     engine.begin_session(transition.session_id);
+    transcription_state
+        .runtime
+        .begin_session(transition.session_id)
+        .await;
     info!(
         previous_session_id = transition.previous_session_id.value(),
         session_id = transition.session_id.value(),
@@ -1187,8 +1276,12 @@ pub async fn conversation_end_session_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
     response_state: State<'_, ResponseEngineState>,
+    transcription_state: State<'_, crate::transcription::TranscriptionState>,
 ) -> Result<(), String> {
     let engine = response_state.0.clone();
+    // Transcrição primeiro, pela mesma razão de `conversation_start_session_command`:
+    // bloquear a produção de fala nova antes de apagar quem a consome.
+    transcription_state.runtime.end_session().await;
     engine.end_session(state.0.session_id());
     let transition = state.0.end_session();
     info!(
@@ -1198,6 +1291,14 @@ pub async fn conversation_end_session_command(
     );
     emit_conversation_events(&app, transition.events);
     engine.begin_session(transition.session_id);
+    // A timeline não fica sem sessão depois de encerrar: `end_session` já rotaciona para a
+    // próxima. Alinhar o runtime de transcrição a essa fronteira nova é o que impede que
+    // toda transcrição posterior a um "encerrar sessão" fosse descartada por não haver
+    // sessão de transcrição ativa.
+    transcription_state
+        .runtime
+        .begin_session(transition.session_id)
+        .await;
     Ok(())
 }
 
@@ -1279,10 +1380,36 @@ pub async fn conversation_set_utterance_gap_ms_command(
 
 pub fn emit_conversation_events(app: &AppHandle, events: Vec<ConversationTimelineEvent>) {
     for event in events {
+        record_utterance_telemetry(&event);
         if let Err(e) = app.emit(CONVERSATION_TIMELINE_EVENT, &event) {
             warn!(%e, "failed to emit conversation timeline event to frontend");
         }
     }
+}
+
+/// Liga o trace da fala (aberto lá atrás no primeiro chunk de áudio) ao `UtteranceId` que
+/// só passa a existir aqui, e grava o marco `utterance_finalized`.
+///
+/// Feito neste funil, e não dentro do assembler, porque `emit_conversation_events` é o único
+/// ponto por onde **todos** os caminhos de finalização passam: comando Tauri, ingestão de
+/// segmento e o timer dedicado da utterance. Marcar dentro do assembler exigiria repetir a
+/// chamada em cada um deles, e o caminho do timer — justamente o mais importante para
+/// latência — é o mais fácil de esquecer.
+fn record_utterance_telemetry(event: &ConversationTimelineEvent) {
+    let ConversationTimelineEvent::UtteranceFinalized { utterance, .. } = event else {
+        return;
+    };
+    // O último segmento é o que fecha a fala: é o instante dele que separa "parou de falar"
+    // de "a utterance foi declarada terminada".
+    let Some(last_segment) = utterance.segments.last() else {
+        return;
+    };
+    let recorder = crate::telemetry::recorder();
+    let Some(trace) = recorder.trace_for_segment(*last_segment) else {
+        return;
+    };
+    recorder.link_utterance(trace, utterance.id);
+    recorder.mark(trace, crate::telemetry::Milestone::UtteranceFinalized);
 }
 
 fn normalize_segment_text(text: &str) -> String {
