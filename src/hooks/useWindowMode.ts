@@ -1,27 +1,50 @@
 import { useEffect } from "react";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import { currentMonitor, getCurrentWindow, LogicalPosition, LogicalSize } from "@tauri-apps/api/window";
 import type { AppScreen } from "../app/appFlow";
 
-const APP_SIZE = new LogicalSize(420, 760);
-const SESSION_SIZE = new LogicalSize(306, 88);
-const SESSION_MIN_SIZE = new LogicalSize(286, 80);
-const APP_MIN_SIZE = new LogicalSize(360, 560);
+const TASKBAR_SIZE = new LogicalSize(306, 88);
+const TASKBAR_MIN_SIZE = new LogicalSize(286, 80);
+const APP_SIZE = new LogicalSize(820, 760);
+const APP_MIN_SIZE = new LogicalSize(520, 560);
+const BOTTOM_MARGIN = 28;
 
-/**
- * The session window is meant to feel more compact than the rest of the app (see
- * docs/design-system.md §Janela de sessão) — resized here via the existing
- * `@tauri-apps/api/window` JS API (no Rust changes: `core:window:allow-set-size`/
- * `allow-set-min-size` were added to `capabilities/default.json` since the default
- * capability set only grants read-only window queries). Best-effort: a resize failure
- * (e.g. running outside Tauri, in a plain browser during `npm run dev` without the
- * Tauri shell) never blocks the screen from rendering.
- */
+const TASKBAR_SCREENS: AppScreen[] = ["welcome", "ready", "session"];
+
+async function placeBottomCenter(width: number, height: number) {
+  const monitor = await currentMonitor();
+  if (!monitor) return;
+
+  const workPosition = monitor.workArea.position.toLogical(monitor.scaleFactor);
+  const workSize = monitor.workArea.size.toLogical(monitor.scaleFactor);
+  const x = workPosition.x + (workSize.width - width) / 2;
+  const y = workPosition.y + workSize.height - height - BOTTOM_MARGIN;
+
+  await getCurrentWindow().setPosition(new LogicalPosition(Math.round(x), Math.round(y)));
+}
+
+async function placeCenter(width: number, height: number) {
+  const monitor = await currentMonitor();
+  if (!monitor) return;
+
+  const workPosition = monitor.workArea.position.toLogical(monitor.scaleFactor);
+  const workSize = monitor.workArea.size.toLogical(monitor.scaleFactor);
+  const x = workPosition.x + (workSize.width - width) / 2;
+  const y = workPosition.y + (workSize.height - height) / 2;
+
+  await getCurrentWindow().setPosition(new LogicalPosition(Math.round(x), Math.round(y)));
+}
+
 export function useWindowMode(screen: AppScreen, enabled = true) {
   useEffect(() => {
     if (!enabled) return;
+
     const win = getCurrentWindow();
-    const isSession = screen === "session";
-    win.setMinSize(isSession ? SESSION_MIN_SIZE : APP_MIN_SIZE).catch(() => {});
-    win.setSize(isSession ? SESSION_SIZE : APP_SIZE).catch(() => {});
+    const compact = TASKBAR_SCREENS.includes(screen);
+    const size = compact ? TASKBAR_SIZE : APP_SIZE;
+
+    win.setMinSize(compact ? TASKBAR_MIN_SIZE : APP_MIN_SIZE).catch(() => {});
+    win.setSize(size)
+      .then(() => (compact ? placeBottomCenter(size.width, size.height) : placeCenter(size.width, size.height)))
+      .catch(() => {});
   }, [enabled, screen]);
 }

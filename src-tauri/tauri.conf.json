@@ -12,10 +12,18 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Helppye",
-        "width": 480,
-        "height": 720,
+        "width": 306,
+        "height": 88,
+        "minWidth": 286,
+        "minHeight": 80,
         "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
         "theme": "Dark"
       }
     ],

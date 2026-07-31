@@ -1,4 +1,5 @@
-import { Rocket } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Rocket, X } from "lucide-react";
 import { BrandMark } from "../../components/ui/BrandMark";
 
 interface WelcomeScreenProps {
@@ -6,14 +7,19 @@ interface WelcomeScreenProps {
   onLogin: () => void;
 }
 
+function closeWindow() {
+  if (!("__TAURI_INTERNALS__" in window)) return;
+  getCurrentWindow().close().catch(() => {});
+}
+
 export function WelcomeScreen({ onContinueWithoutLogin, onLogin }: WelcomeScreenProps) {
   return (
-    <div className="flex h-full min-h-screen w-full items-center justify-center bg-black px-5 py-6">
-      <div className="flex w-full max-w-[290px] items-center gap-2 rounded-[14px] border border-white/10 bg-[#101012] p-2 shadow-[0_14px_40px_rgba(0,0,0,.55)]">
+    <div className="flex h-full min-h-screen w-full items-center justify-center bg-transparent px-2 py-2">
+      <div className="flex h-[58px] w-full items-center gap-2 rounded-[22px] border border-white/10 bg-[#1c1c1e]/82 p-2 shadow-[0_18px_55px_rgba(0,0,0,.42)] backdrop-blur-2xl">
         <button
           type="button"
           onClick={onLogin}
-          className="grid h-10 w-10 place-items-center rounded-[10px] border border-white/8 bg-white/[0.04] text-white/76 hover:bg-white/8"
+          className="grid h-10 w-10 place-items-center rounded-full bg-white/[0.06] text-white/72 transition hover:bg-white/[0.1]"
           aria-label="Entrar"
         >
           <BrandMark size={18} />
@@ -21,10 +27,18 @@ export function WelcomeScreen({ onContinueWithoutLogin, onLogin }: WelcomeScreen
         <button
           type="button"
           onClick={onContinueWithoutLogin}
-          className="flex h-10 flex-1 items-center justify-center gap-2 rounded-[10px] bg-brand-600 px-3 text-xs font-bold text-white shadow-[0_0_20px_rgba(37,99,235,.42)] hover:bg-brand-500"
+          className="flex h-10 flex-1 items-center justify-center gap-2 rounded-full bg-white px-3 text-xs font-semibold text-black transition hover:bg-white/88"
         >
           <Rocket className="h-4 w-4" />
-          Iniciar Configuracao
+          Configurar
+        </button>
+        <button
+          type="button"
+          onClick={closeWindow}
+          className="grid h-7 w-7 place-items-center rounded-full text-white/34 transition hover:bg-white/[0.08] hover:text-white/72"
+          aria-label="Fechar Helppye"
+        >
+          <X className="h-3.5 w-3.5" />
         </button>
       </div>
     </div>
