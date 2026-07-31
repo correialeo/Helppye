@@ -571,6 +571,117 @@ inspeção manual durante o desenvolvimento.
   `.setup()` com o caminho de configuração resolvido a partir do diretório de dados do
   app.
 
+## Endpoints configuráveis
+
+A partir do momento em que `base_url` e cabeçalhos passam a ser digitados pelo usuário (LM
+Studio, OpenRouter, proxy compatível com a API da OpenAI), o app deixa de falar só com
+hosts que ele mesmo escolheu. E o conteúdo enviado é a **conversa da reunião** — o dado
+mais sensível que este produto manipula. `endpoint.rs` é o único lugar onde uma string
+vira destino aceito.
+
+### Registry de provedores
+
+`registry.rs` guarda **descritores**, não instâncias — ao contrário do registry de
+transcrição. Um provedor de geração é reconstruído a cada troca de configuração (modelo
+novo, endpoint novo, chave nova); guardar instâncias obrigaria a invalidá-las a cada
+`update_config` e abriria a porta para uma geração sair pelo provider com a configuração
+antiga.
+
+| Provedor | `id` | Padrão | Credencial | Headers custom |
+| --- | --- | --- | --- | --- |
+| Ollama | `ollama` | local | não | não |
+| LM Studio | `lm_studio` | local | opcional | sim |
+| OpenAI | `open_ai` | nuvem | sim | sim |
+| DeepSeek | `deep_seek` | nuvem | sim | sim |
+| Anthropic | `anthropic` | nuvem | sim | não |
+| OpenRouter | `open_router` | nuvem | sim | sim |
+| Compatível personalizado | `custom_open_ai_compatible` | definido pelo usuário | opcional | sim |
+| ChatGPT por assinatura | `chat_gpt_codex_account` | — | — | **indisponível** (ver ADR) |
+
+`local` no catálogo é o caso **padrão** de cada um. A instância sabe mais: o mesmo LM
+Studio é `local: true` em `localhost` e `local: false` apontando para outra máquina. Por
+isso `ResponseProviderStatus.capabilities` vem de `ResponseEngine::active_capabilities()`
+— a instância viva —, não de `registry::descriptors()`.
+
+### Validação de URL
+
+Três perguntas, antes de qualquer requisição:
+
+**1. É um esquema que sabemos falar?** Só `http` e `https`. `file://` leria o disco,
+`ftp://`/`gopher://` e afins não são endpoints de chat: superfície de ataque sem
+contrapartida. Qualquer outro esquema é rejeitado com `EndpointError::UnsupportedScheme`.
+
+**2. É local ou remoto?** `EndpointClassification` faz parte do retorno da validação, não é
+detalhe interno:
+
+- `Loopback` — `127.0.0.1`, `::1`, `localhost`. O conteúdo não sai da máquina.
+- `PrivateNetwork` — RFC 1918, link-local, CGNAT, `.local`. Sai da máquina, não da rede.
+- `PublicInternet` — qualquer outro host. A conversa sai para um terceiro.
+
+`leaves_machine()` é o que a UI usa para avisar o usuário. Um app que promete "local-first"
+e manda a reunião para `https://` sem dizer nada quebrou a promessa em silêncio.
+
+**3. Credencial embutida na URL?** `https://user:senha@host` é sintaxe válida e é rejeitada
+(`EndpointError::CredentialsInUrl`): a URL vaza para log, para mensagem de erro e para
+qualquer lugar onde um endpoint apareça. A chave vai pelo campo de API key, que vai para o
+keychain.
+
+### Sanitização
+
+**Nunca a URL inteira.** `?api_key=...` em query string é um jeito comum (e ruim) de
+autenticar. `ValidatedEndpoint::sanitized()` devolve apenas esquema, host e porta — sem
+caminho, sem query, sem userinfo — e é a única forma aceita de colocar um endpoint em log
+ou em mensagem de erro. Todos os providers (`openai_compatible.rs`, `ollama.rs`,
+`anthropic.rs`) passam por `classify_request_error(&self.sanitized_endpoint(), e)`, que
+também mapeia timeout para `ResponseProviderError::Timeout` em vez de `Network`: um
+endpoint local que estoura o tempo quase sempre é modelo grande demais para a máquina, não
+cabo solto, e a UI precisa poder dizer isso.
+
+O corpo de uma resposta de erro entra truncado (`MAX_ERROR_BODY_CHARS = 300`): sem teto, um
+proxy que devolve HTML despeja uma página no log, e um punhado de gateways ecoa o cabeçalho
+recebido — incluindo a credencial — dentro do JSON de erro.
+
+A credencial em memória vive num campo que **nunca** aparece em `Debug`
+(`OpenAiCompatibleProvider` não deriva `Debug`, de propósito) e é enviada com
+`HeaderValue::set_sensitive(true)`.
+
+### Modos de credencial
+
+```rust
+pub enum CredentialMode {
+    None,        // LM Studio e servidores locais sem auth
+    ApiKey,      // header `api-key:` — Azure OpenAI e gateways corporativos
+    BearerToken, // header `Authorization: Bearer` — OpenAI, DeepSeek, OpenRouter (default)
+}
+```
+
+As duas convenções em uso real não são intercambiáveis: quem espera `Authorization: Bearer`
+ignora `api-key`, e vice-versa. `None` existe porque mandar `Authorization` vazio para um
+servidor local produz um 401 confuso.
+
+### Cabeçalhos personalizados
+
+Seis nomes são **reservados** e não podem ser sobrescritos: `authorization`, `host`,
+`content-length`, `content-type`, `connection`, `transfer-encoding`. Sem isso, um
+`Authorization` digitado em texto puro anularia a chave do keychain, e um `Host` forjado
+apontaria para outro serviço atrás do mesmo IP.
+
+### Limites de rede
+
+| Limite | Valor | Por quê |
+| --- | --- | --- |
+| `REQUEST_TIMEOUT` | 60 s | vale para a requisição inteira, não só a conexão: um stream que trava no meio prende o slot de geração do turno |
+| `CONNECT_TIMEOUT` | 10 s | um typo no IP trava até o timeout do SO sem este teto |
+| `MAX_REDIRECTS` | 2 | redirect ilimitado, com `Authorization` reenviado a cada salto, entrega a credencial para o último host da cadeia — que não é o que o usuário digitou |
+
+### Sobre SSRF
+
+Um endpoint apontando para `169.254.169.254` (metadata de nuvem) ou para um host interno é,
+por definição, o que o usuário pediu: este app não recebe URL de terceiros, recebe de quem
+está sentado na frente dele. O que este módulo faz **não** é impedir a escolha de um
+destino — é impedir que um destino escolhido por engano passe despercebido. Daí a
+classificação estar no retorno, e o chamador ter a informação para avisar.
+
 ## Troca de provedor e de credencial
 
 Trocar a configuração (`response_set_provider_config_command`) reconstrói o provedor

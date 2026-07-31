@@ -12,6 +12,14 @@ Audio capture and local transcription foundations implemented:
 - Windows system-output capture via WASAPI Loopback.
 - VAD, speech segmentation, bounded transcription queue.
 - Local Whisper transcription through `whisper-rs`.
+- Pluggable transcription: `TranscriptionProvider`/`TranscriptionSession` contracts, a
+  registry that reports declared capabilities, and per-source session lifecycle with
+  stale/duplicate events dropped in the backend. Whisper local runs through this
+  interface; streaming backends are contractually represented but not implemented — the
+  registry says so instead of pretending. See `docs/transcription-providers.md`.
+- Deterministic transcript normalization (whitespace, repeated punctuation, sentence
+  capitalization, configurable technical vocabulary) between the provider and the
+  timeline. The raw text is never discarded. See `docs/transcript-normalization.md`.
 - Guided download/verification default Whisper Base Multilingual model.
 - Conversation Timeline utterance/turn assembly preserving source, speaker role,
   timestamps, utterance IDs, segment IDs, and diagnostics. A dedicated per-utterance
@@ -21,7 +29,15 @@ Audio capture and local transcription foundations implemented:
   (`speaker = OtherPerson`, `source = SystemOutput`) automatically triggers an LLM call
   (Ollama local by default, or a user-chosen cloud provider) that streams a suggested
   reply — or a `[SKIP]` marker when the speech doesn't need one — back to the frontend.
-  See `docs/response-suggestion.md`.
+  The prompt is built by an explicit, testable `ResponseContextBuilder` with hard limits
+  (4 turns, 5000 chars, current remote utterance only). Response backends live behind a
+  common registry and a generalized OpenAI-compatible client (LM Studio, OpenRouter, any
+  compatible endpoint) with validated `base_url`, credential modes, custom headers, and
+  sanitized logging. See `docs/response-suggestion.md`.
+- End-to-end pipeline telemetry: 12 monotonic milestones per utterance and 5 derived
+  latencies, content redacted by default. See `docs/telemetry.md`.
+- Transcription benchmark harness (`cargo run --bin benchmark`) for comparing backends on
+  latency, WER, and lost technical terms. See `benchmarks/README.md`.
 - A full desktop-app onboarding flow (welcome → profile → language → permissions →
   guided audio test → AI provider → review → ready) and a compact session window
   focused on the suggestion, with technical diagnostics (turn/utterance IDs, latency
@@ -39,7 +55,8 @@ yet.
 - Tauri 2, stable Rust, Tokio
 - React 18, TypeScript (strict), Vite, Tailwind CSS, Zustand
 - `whisper-rs` / whisper.cpp local speech-to-text
-- Ollama (default) or OpenAI/DeepSeek/Anthropic (opt-in) for response suggestion
+- Ollama (default) or LM Studio / OpenAI / DeepSeek / Anthropic / OpenRouter / any
+  OpenAI-compatible endpoint (opt-in) for response suggestion
 - SQLite planned, not implemented yet
 - `tracing` structured logging
 
@@ -52,9 +69,11 @@ yet.
 - `src-tauri/` — Rust core (Tauri commands, audio pipeline, transcription,
   model manager, conversation timeline, response suggestion)
 - `docs/` — architecture audit, design notes, roadmap, including
-  `docs/response-suggestion.md`, `docs/session-experience.md`,
-  `docs/frontend-architecture.md`, `docs/design-system.md`, `docs/onboarding.md`, and
-  `docs/shortcuts.md`
+  `docs/transcription-providers.md`, `docs/transcript-normalization.md`,
+  `docs/response-suggestion.md`, `docs/telemetry.md`, `docs/session-experience.md`,
+  `docs/frontend-architecture.md`, `docs/design-system.md`, `docs/onboarding.md`,
+  `docs/shortcuts.md`, and `docs/adr/` (architecture decision records)
+- `benchmarks/` — transcription benchmark harness fixtures and instructions
 - `prompts/` — LLM prompt templates (added in Ollama integration phase)
 - `tests/` — cross-cutting/integration tests; Rust unit tests live alongside
   modules under `src-tauri/src`; a few lightweight frontend logic tests
@@ -73,6 +92,7 @@ architecture research. See `docs/meetily-audio-audit.md`,
 cd src-tauri
 cargo fmt --check
 cargo check --target x86_64-unknown-linux-gnu
+cargo clippy --target x86_64-unknown-linux-gnu -- -D warnings
 cargo test --target x86_64-unknown-linux-gnu
 cd ..
 npm run typecheck
