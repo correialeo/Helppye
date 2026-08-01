@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { onConversationTimelineEvent, onResponseSuggestionEvent } from "../services/conversationService";
 import {
   applyResponseSuggestionDiagnostics,
@@ -14,10 +14,14 @@ import {
 export function useResponseSuggestions() {
   const [suggestions, setSuggestions] = useState<Record<number, SuggestionState>>({});
   const [diagnostics, setDiagnostics] = useState<Record<number, ResponseSuggestionDiagnostics>>({});
+  const activeSessionId = useRef<number>();
 
   useEffect(() => {
     const unlistenPromise = onResponseSuggestionEvent((event) => {
-      setSuggestions((current) => applyResponseSuggestionEvent(current, event));
+      if (event.session_id !== activeSessionId.current) return;
+      setSuggestions((current) =>
+        applyResponseSuggestionEvent(current, event, activeSessionId.current),
+      );
       setDiagnostics((current) => applyResponseSuggestionDiagnostics(current, event));
     });
     return () => {
@@ -31,6 +35,8 @@ export function useResponseSuggestions() {
   useEffect(() => {
     const unlistenPromise = onConversationTimelineEvent((event) => {
       if (event.type === "session_ended" || event.type === "session_started") {
+        activeSessionId.current =
+          event.type === "session_started" ? event.session_id : undefined;
         setSuggestions({});
         setDiagnostics({});
       }

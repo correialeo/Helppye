@@ -6,6 +6,7 @@
 pub mod anthropic;
 pub mod config_store;
 pub mod context;
+pub mod context_leak_guard;
 pub mod echo_guard;
 pub mod endpoint;
 pub mod engine;
@@ -18,6 +19,7 @@ pub mod registry;
 pub mod secrets;
 pub mod settings;
 pub mod skip_detector;
+pub mod validation;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -122,12 +124,16 @@ pub async fn response_providers_command() -> Vec<registry::ResponseProviderDescr
 }
 
 #[tauri::command]
+// Tauri maps these flat arguments directly from the existing frontend payload. Wrapping
+// them would be a breaking command-shape change for one optional defensive setting.
+#[allow(clippy::too_many_arguments)]
 pub async fn response_set_provider_config_command(
     state: State<'_, ResponseEngineState>,
     provider: ResponseProviderKind,
     model: String,
     base_url: Option<String>,
     ollama_keep_alive: Option<String>,
+    maximum_automatic_generation_age_ms: Option<u64>,
     credential_mode: Option<openai_compatible::CredentialMode>,
     custom_headers: Option<Vec<(String, String)>>,
 ) -> Result<(), String> {
@@ -152,6 +158,9 @@ pub async fn response_set_provider_config_command(
         model,
         base_url,
         ollama_keep_alive,
+        maximum_automatic_generation_age_ms: maximum_automatic_generation_age_ms
+            .unwrap_or_else(|| state.0.current_config().maximum_automatic_generation_age_ms)
+            .clamp(1_000, 300_000),
         credential_mode: credential_mode.unwrap_or_default(),
         custom_headers,
     })

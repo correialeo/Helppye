@@ -64,7 +64,7 @@ export function ExchangeItem({ exchange, isLatest, onRegenerate }: ExchangeItemP
         </p>
       ) : suggestion?.status === "preparing" ? (
         <p className="shimmer-text text-sm font-medium">Preparando uma sugestão...</p>
-      ) : suggestion?.status === "error" ? (
+        ) : suggestion?.status === "error" || suggestion?.status === "invalid" ? (
         <div className="flex flex-col gap-2">
           <p className="text-sm text-neutral-400">Não foi possível gerar a sugestão.</p>
           {canRegenerate && (

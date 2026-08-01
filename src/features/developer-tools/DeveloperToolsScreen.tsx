@@ -119,9 +119,9 @@ export function DeveloperToolsScreen({ onBack }: { onBack: () => void }) {
             {Object.values(diagnostics)
               .sort((a, b) => a.turn_id - b.turn_id)
               .map((d) => (
-                <div key={d.turn_id} className="rounded border border-white/10 bg-surface p-2 text-neutral-400">
+                <div key={d.generation_id} className="rounded border border-white/10 bg-surface p-2 text-neutral-400">
                   <p className="text-neutral-300">
-                    sessão #{d.session_id} · turn #{d.turn_id} · utterance #{d.utterance_id} · geração #
+                    sessão #{d.session_id} · turn #{d.turn_id} · utterance #{d.utterance_id} rev {d.utterance_revision} · geração #
                     {d.generation_id} · {d.provider}/{d.model}
                   </p>
                   <p>
@@ -138,6 +138,21 @@ export function DeveloperToolsScreen({ onBack }: { onBack: () => void }) {
                   </p>
                   <p className="text-emerald-400">
                     end_of_speech_to_first_visible_token_ms: {d.end_of_speech_to_first_visible_token_ms ?? "—"}
+                  </p>
+                  <p>
+                    validation_result: {d.validation_result || "—"} · retry_used: {String(d.retry_used)} · context_leak_score: {d.context_leak_score.toFixed(3)} · terminal_state: {d.terminal_state || "—"}
+                  </p>
+                  <p>
+                    utterance_age_at_generation_start_ms: {d.utterance_age_at_generation_start_ms} · utterance_age_at_first_token_ms: {d.utterance_age_at_first_token_ms ?? "—"}
+                  </p>
+                  <p className="break-all">
+                    speech_ended_at: {d.speech_ended_at} · transcription_completed_at: {d.transcription_completed_at ?? "—"} · utterance_finalized_at: {d.utterance_finalized_at} · generation_triggered_at: {d.generation_triggered_at} · request_started_at: {d.request_started} · first_visible_token_at: {d.first_visible_token_at ?? "—"} · completed_at: {d.completed_at}
+                  </p>
+                  <p className="break-all">
+                    trigger_text_hash: {d.trigger_text_hash || "—"} · context_utterance_ids: {d.context_utterance_ids.join(", ") || "—"}
+                  </p>
+                  <p className="whitespace-pre-wrap break-all text-neutral-500">
+                    trigger_text: {d.trigger_text || "—"}
                   </p>
                   <p>
                     skip_detected: {String(d.skip_detected)} · echo_suppressed_characters:{" "}

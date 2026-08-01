@@ -212,7 +212,7 @@ pub async fn run_fixture(
         normalization_change_count += normalization.change_count();
         raw_parts.push(normalization.raw_text.clone());
         normalized_parts.push(normalization.normalized_text.clone());
-        timeline.ingest_normalized_transcript(transcript, &normalization);
+        timeline.ingest_normalized_transcript(transcript, &normalization, Instant::now());
     }
     timeline.flush();
 

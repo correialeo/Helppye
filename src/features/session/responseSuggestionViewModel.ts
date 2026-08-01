@@ -3,6 +3,7 @@ export type ResponseSuggestionEventType =
   | "delta"
   | "completed"
   | "skipped"
+  | "invalid"
   | "cancelled"
   | "error"
   | "diagnostics";
@@ -14,8 +15,10 @@ export interface ResponseSuggestionEventRef {
   session_id: number;
   turn_id: number;
   generation_id: number;
+  utterance_revision?: number;
   text?: string;
   message?: string;
+  failure?: string;
   // Presentes apenas em eventos "diagnostics" — ver GenerationDiagnostics no backend
   // (src-tauri/src/response_provider/events.rs).
   provider?: string;
@@ -41,6 +44,21 @@ export interface ResponseSuggestionEventRef {
   request_to_first_http_chunk_ms?: number | null;
   request_to_first_visible_token_ms?: number | null;
   end_of_speech_to_first_visible_token_ms?: number | null;
+  trigger_text?: string;
+  trigger_text_hash?: string;
+  context_utterance_ids?: number[];
+  validation_result?: string;
+  retry_used?: boolean;
+  context_leak_score?: number;
+  terminal_state?: string;
+  utterance_age_at_generation_start_ms?: number;
+  utterance_age_at_first_token_ms?: number | null;
+  speech_ended_at?: number;
+  transcription_completed_at?: number | null;
+  utterance_finalized_at?: number;
+  generation_triggered_at?: number;
+  first_visible_token_at?: number | null;
+  completed_at?: number;
 }
 
 export type SuggestionStatus =
@@ -49,6 +67,7 @@ export type SuggestionStatus =
   | "completed_with_text"
   | "completed_empty"
   | "skipped"
+  | "invalid"
   | "cancelled"
   | "error";
 
@@ -57,6 +76,8 @@ export interface SuggestionState {
   utteranceId: number;
   turnId: number;
   generationId: number;
+  sessionId: number;
+  utteranceRevision: number;
   status: SuggestionStatus;
   text: string;
   errorMessage?: string;
@@ -82,18 +103,43 @@ export interface SuggestionState {
 export function applyResponseSuggestionEvent(
   current: Record<number, SuggestionState>,
   event: ResponseSuggestionEventRef,
+  activeSessionId?: number,
 ): Record<number, SuggestionState> {
-  if (event.utterance_id === undefined) {
+  if (
+    event.utterance_id === undefined ||
+    event.utterance_revision === undefined ||
+    (activeSessionId !== undefined && event.session_id !== activeSessionId)
+  ) {
     return current;
   }
 
   if (event.type === "started") {
+    const existing = current[event.utterance_id];
+    if (
+      existing &&
+      (existing.sessionId !== event.session_id ||
+        existing.generationId >= event.generation_id)
+    ) {
+      return current;
+    }
+    const next = { ...current };
+    for (const [key, suggestion] of Object.entries(next)) {
+      if (
+        suggestion.sessionId === event.session_id &&
+        suggestion.turnId === event.turn_id &&
+        (suggestion.status === "preparing" || suggestion.status === "streaming")
+      ) {
+        next[Number(key)] = { ...suggestion, status: "cancelled" };
+      }
+    }
     return {
-      ...current,
+      ...next,
       [event.utterance_id]: {
         utteranceId: event.utterance_id,
         turnId: event.turn_id,
         generationId: event.generation_id,
+        sessionId: event.session_id,
+        utteranceRevision: event.utterance_revision,
         status: "preparing",
         text: "",
       },
@@ -101,7 +147,13 @@ export function applyResponseSuggestionEvent(
   }
 
   const existing = current[event.utterance_id];
-  if (!existing || existing.generationId !== event.generation_id) {
+  if (
+    !existing ||
+    existing.sessionId !== event.session_id ||
+    existing.turnId !== event.turn_id ||
+    existing.utteranceRevision !== event.utterance_revision ||
+    existing.generationId !== event.generation_id
+  ) {
     return current;
   }
 
@@ -129,6 +181,15 @@ export function applyResponseSuggestionEvent(
         ...current,
         [event.utterance_id]: { ...existing, status: "error", errorMessage: event.message },
       };
+    case "invalid":
+      return {
+        ...current,
+        [event.utterance_id]: {
+          ...existing,
+          status: "invalid",
+          errorMessage: event.failure,
+        },
+      };
     default:
       return current;
   }
@@ -138,7 +199,23 @@ export interface ResponseSuggestionDiagnostics {
   session_id: number;
   turn_id: number;
   utterance_id: number;
+  utterance_revision: number;
   generation_id: number;
+  trigger_text: string;
+  trigger_text_hash: string;
+  context_utterance_ids: number[];
+  validation_result: string;
+  retry_used: boolean;
+  context_leak_score: number;
+  terminal_state: string;
+  utterance_age_at_generation_start_ms: number;
+  utterance_age_at_first_token_ms: number | null;
+  speech_ended_at: number;
+  transcription_completed_at: number | null;
+  utterance_finalized_at: number;
+  generation_triggered_at: number;
+  first_visible_token_at: number | null;
+  completed_at: number;
   /** Prompt sanitizado (estrutura + trechos limitados) realmente enviado ao provedor.
    * Só aparece em modo de desenvolvedor — nunca contém credenciais. */
   prompt_preview: string;
@@ -174,17 +251,49 @@ export function applyResponseSuggestionDiagnostics(
   current: Record<number, ResponseSuggestionDiagnostics>,
   event: ResponseSuggestionEventRef,
 ): Record<number, ResponseSuggestionDiagnostics> {
-  if (event.type !== "diagnostics") {
+  if (
+    event.type !== "diagnostics" ||
+    event.utterance_id === undefined ||
+    event.utterance_revision === undefined
+  ) {
+    return current;
+  }
+
+  const existing = current[event.utterance_id];
+  if (
+    existing &&
+    (existing.session_id !== event.session_id ||
+      existing.utterance_revision !== event.utterance_revision ||
+      existing.generation_id > event.generation_id)
+  ) {
     return current;
   }
 
   return {
     ...current,
-    [event.turn_id]: {
+    [event.utterance_id]: {
       session_id: event.session_id,
       turn_id: event.turn_id,
       utterance_id: event.utterance_id ?? 0,
+      utterance_revision: event.utterance_revision ?? 0,
       generation_id: event.generation_id,
+      trigger_text: event.trigger_text ?? "",
+      trigger_text_hash: event.trigger_text_hash ?? "",
+      context_utterance_ids: event.context_utterance_ids ?? [],
+      validation_result: event.validation_result ?? "",
+      retry_used: event.retry_used ?? false,
+      context_leak_score: event.context_leak_score ?? 0,
+      terminal_state: event.terminal_state ?? "",
+      utterance_age_at_generation_start_ms:
+        event.utterance_age_at_generation_start_ms ?? 0,
+      utterance_age_at_first_token_ms:
+        event.utterance_age_at_first_token_ms ?? null,
+      speech_ended_at: event.speech_ended_at ?? 0,
+      transcription_completed_at: event.transcription_completed_at ?? null,
+      utterance_finalized_at: event.utterance_finalized_at ?? 0,
+      generation_triggered_at: event.generation_triggered_at ?? 0,
+      first_visible_token_at: event.first_visible_token_at ?? null,
+      completed_at: event.completed_at ?? 0,
       prompt_preview: event.prompt_preview ?? "",
       context_turn_count: event.context_turn_count ?? 0,
       context_character_count: event.context_character_count ?? 0,

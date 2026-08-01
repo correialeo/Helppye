@@ -8,8 +8,12 @@
 //! é o runtime que sabe a qual sessão de transcrição aquela fonte pertence e é ele quem
 //! publica os resultados. A fila continua sendo só o amortecedor entre produção e consumo.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use serde::Serialize;
 
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -21,28 +25,62 @@ use crate::transcription::runtime::TranscriptionRuntime;
 /// backlog here means transcription has fallen far behind real time, not a transient blip.
 pub const QUEUE_CAPACITY: usize = 16;
 
+struct QueuedSegment {
+    segment: AudioSegment,
+    enqueued_at: Instant,
+}
+
+#[derive(Default)]
+struct QueueState {
+    enqueued_at: Mutex<VecDeque<Instant>>,
+    dropped: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct TranscriptionQueueMetrics {
+    pub queue_depth: usize,
+    pub oldest_segment_age_ms: Option<u64>,
+    pub newest_segment_age_ms: Option<u64>,
+    pub segments_dropped: u64,
+}
+
 /// Owns the single worker task that drains queued segments into the runtime, one at a
 /// time. Never panics on a failed segment; never lets a slow segment stop the next one from
 /// being queued.
 pub struct TranscriptionQueue {
-    sender: mpsc::Sender<AudioSegment>,
-    dropped: AtomicU64,
+    sender: mpsc::Sender<QueuedSegment>,
+    state: Arc<QueueState>,
     runtime: Arc<TranscriptionRuntime>,
 }
 
 impl TranscriptionQueue {
     pub fn spawn(runtime: Arc<TranscriptionRuntime>) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<AudioSegment>(QUEUE_CAPACITY);
+        let (sender, mut receiver) = mpsc::channel::<QueuedSegment>(QUEUE_CAPACITY);
         let worker_runtime = Arc::clone(&runtime);
+        let state = Arc::new(QueueState::default());
+        let worker_state = Arc::clone(&state);
 
         // `tokio::spawn` panics here: `spawn` runs synchronously inside Tauri's
         // `.setup()` hook, outside any Tokio task context. `tauri::async_runtime::spawn`
         // uses Tauri's own managed runtime instead (same reason `audio::start_capture`
         // uses it for its forwarding task).
         tauri::async_runtime::spawn(async move {
-            while let Some(segment) = receiver.recv().await {
+            while let Some(queued) = receiver.recv().await {
+                let queued_age_ms = queued.enqueued_at.elapsed().as_millis() as u64;
+                worker_state
+                    .enqueued_at
+                    .lock()
+                    .expect("transcription queue metrics mutex poisoned")
+                    .pop_front();
+                if queued_age_ms >= 1_000 {
+                    debug!(queued_age_ms, "transcription queue is processing old audio");
+                }
+                let segment = queued.segment;
                 let source = segment.source;
-                if let Err(e) = worker_runtime.push_segment(segment).await {
+                if let Err(e) = worker_runtime
+                    .push_segment_at(segment, queued.enqueued_at)
+                    .await
+                {
                     // Falha de um segmento não derruba o worker: o próximo segmento pode
                     // transcrever normalmente, e o runtime já publicou o evento de erro
                     // correspondente para quem observa.
@@ -53,7 +91,7 @@ impl TranscriptionQueue {
 
         TranscriptionQueue {
             sender,
-            dropped: AtomicU64::new(0),
+            state,
             runtime,
         }
     }
@@ -68,19 +106,54 @@ impl TranscriptionQueue {
     /// Never blocks. A full queue drops `segment` and counts it, logging every 50th drop
     /// rather than every one.
     pub fn try_enqueue(&self, segment: AudioSegment) {
-        if self.sender.try_send(segment).is_err() {
-            let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        let enqueued_at = Instant::now();
+        let mut timestamps = self
+            .state
+            .enqueued_at
+            .lock()
+            .expect("transcription queue metrics mutex poisoned");
+        if self
+            .sender
+            .try_send(QueuedSegment {
+                segment,
+                enqueued_at,
+            })
+            .is_err()
+        {
+            let n = self.state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 50 == 1 {
                 warn!(
                     dropped_segments = n,
                     "transcription queue full, dropping segment"
                 );
             }
+        } else {
+            timestamps.push_back(enqueued_at);
         }
     }
 
     pub fn dropped_segments(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+        self.state.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn metrics(&self) -> TranscriptionQueueMetrics {
+        let now = Instant::now();
+        let timestamps = self
+            .state
+            .enqueued_at
+            .lock()
+            .expect("transcription queue metrics mutex poisoned");
+        let age = |at: &Instant| {
+            now.saturating_duration_since(*at)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64
+        };
+        TranscriptionQueueMetrics {
+            queue_depth: timestamps.len(),
+            oldest_segment_age_ms: timestamps.front().map(age),
+            newest_segment_age_ms: timestamps.back().map(age),
+            segments_dropped: self.dropped_segments(),
+        }
     }
 }
 
@@ -207,5 +280,11 @@ mod tests {
         }
 
         assert!(queue.dropped_segments() > 0);
+        let metrics = queue.metrics();
+        assert!(metrics.queue_depth > 0);
+        assert!(metrics.queue_depth <= QUEUE_CAPACITY);
+        assert!(metrics.oldest_segment_age_ms.is_some());
+        assert!(metrics.newest_segment_age_ms.is_some());
+        assert_eq!(metrics.segments_dropped, queue.dropped_segments());
     }
 }

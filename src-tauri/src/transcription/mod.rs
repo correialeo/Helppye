@@ -143,6 +143,8 @@ pub struct TranscriptionDiagnostics {
     pub loaded_model_name: Option<String>,
     pub dropped_segments: u64,
     #[serde(flatten)]
+    pub queue_metrics: queue::TranscriptionQueueMetrics,
+    #[serde(flatten)]
     pub runtime: TranscriptionRuntimeStats,
     /// Providers efetivamente registrados neste processo — diferente de
     /// `transcription_providers_command`, que lista também os previstos e indisponíveis.
@@ -163,6 +165,7 @@ pub async fn transcription_diagnostics_command(
         provider_id: state.runtime.provider_id(),
         loaded_model_name: state.loaded_model_name.lock().await.clone(),
         dropped_segments: state.queue.dropped_segments(),
+        queue_metrics: state.queue.metrics(),
         runtime: state.runtime.stats(),
         registered_providers: state.registry.registered_ids(),
         active_transcription_sessions: state

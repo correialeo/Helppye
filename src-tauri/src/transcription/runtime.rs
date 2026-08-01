@@ -29,12 +29,13 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 
-use crate::audio::segment::AudioSegment;
+use crate::audio::segment::{AudioSegment, SegmentId};
 use crate::audio::types::AudioSource;
 use crate::conversation::SessionId;
 use crate::normalization::{
@@ -81,6 +82,9 @@ pub enum DiscardReason {
 pub struct NormalizedTranscript {
     pub transcript: FinalTranscript,
     pub normalization: TranscriptNormalizationResult,
+    /// Instante monotônico em que o segmento deixou a captura e entrou na fila.
+    /// Preservá-lo permite que freshness inclua backlog e inferência.
+    pub speech_ended_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +172,8 @@ struct ActiveSession {
     session: Box<dyn TranscriptionSession>,
 }
 
+type PendingSegmentTimings = HashMap<AudioSource, VecDeque<(SegmentId, Instant)>>;
+
 pub struct TranscriptionRuntime {
     provider: StdMutex<Arc<dyn TranscriptionProvider>>,
     settings: StdMutex<TranscriptionSettings>,
@@ -177,6 +183,7 @@ pub struct TranscriptionRuntime {
     /// a extensão seja um registro, não uma refatoração.
     corrector: StdMutex<Option<Arc<dyn ContextualCorrector>>>,
     recent_texts: Arc<StdMutex<VecDeque<String>>>,
+    pending_segment_timings: Arc<StdMutex<PendingSegmentTimings>>,
     gate: Arc<StdMutex<Gate>>,
     sessions: AsyncMutex<HashMap<AudioSource, ActiveSession>>,
     sink: TranscriptionOutputSink,
@@ -213,6 +220,7 @@ impl TranscriptionRuntime {
             correction_mode: StdMutex::new(TranscriptCorrectionMode::default()),
             corrector: StdMutex::new(None),
             recent_texts: Arc::new(StdMutex::new(VecDeque::new())),
+            pending_segment_timings: Arc::new(StdMutex::new(HashMap::new())),
             gate: Arc::new(StdMutex::new(Gate::default())),
             sessions: AsyncMutex::new(HashMap::new()),
             sink,
@@ -324,6 +332,10 @@ impl TranscriptionRuntime {
             .lock()
             .expect("recent texts mutex")
             .clear();
+        self.pending_segment_timings
+            .lock()
+            .expect("segment timing mutex")
+            .clear();
 
         // 2. Cancela os providers. `cancel`, não `finish`: encerrar sessão significa jogar
         //    fora o que estava em voo, não drenar mais resultados para uma conversa que já
@@ -366,7 +378,35 @@ impl TranscriptionRuntime {
     /// descartado por não haver sessão ativa: isso é comportamento esperado entre sessões,
     /// não uma falha de captura.
     pub async fn push_segment(&self, segment: AudioSegment) -> Result<(), TranscriptionError> {
-        self.push_chunk(AudioChunk::from_segment(segment)).await
+        self.push_segment_at(segment, Instant::now()).await
+    }
+
+    /// Igual a `push_segment`, mas conserva o instante real de entrada na fila.
+    pub async fn push_segment_at(
+        &self,
+        segment: AudioSegment,
+        speech_ended_at: Instant,
+    ) -> Result<(), TranscriptionError> {
+        let segment_id = segment.id;
+        let source = segment.source;
+        self.pending_segment_timings
+            .lock()
+            .expect("segment timing mutex")
+            .entry(source)
+            .or_default()
+            .push_back((segment_id, speech_ended_at));
+        let result = self.push_chunk(AudioChunk::from_segment(segment)).await;
+        if result.is_err() {
+            if let Some(pending) = self
+                .pending_segment_timings
+                .lock()
+                .expect("segment timing mutex")
+                .get_mut(&source)
+            {
+                pending.retain(|(id, _)| *id != segment_id);
+            }
+        }
+        result
     }
 
     pub async fn push_chunk(&self, chunk: AudioChunk) -> Result<(), TranscriptionError> {
@@ -465,6 +505,7 @@ impl TranscriptionRuntime {
         let model = self.settings().model;
         let corrector = self.corrector.lock().expect("corrector mutex").clone();
         let recent_texts = Arc::clone(&self.recent_texts);
+        let pending_segment_timings = Arc::clone(&self.pending_segment_timings);
 
         Arc::new(move |event: TranscriptionEvent| {
             let decision = gate.lock().expect("gate mutex").accept(&event);
@@ -512,6 +553,22 @@ impl TranscriptionRuntime {
             downstream(TranscriptionRuntimeOutput::Event(event.clone()));
 
             if let TranscriptionEvent::Final(transcript) = event {
+                let speech_ended_at = {
+                    let mut timings = pending_segment_timings
+                        .lock()
+                        .expect("segment timing mutex");
+                    let pending = timings.get_mut(&transcript.source);
+                    match (pending, transcript.segment_id) {
+                        (Some(pending), Some(segment_id)) => pending
+                            .iter()
+                            .position(|(id, _)| *id == segment_id)
+                            .and_then(|position| pending.remove(position))
+                            .map(|(_, at)| at),
+                        (Some(pending), None) => pending.pop_front().map(|(_, at)| at),
+                        (None, _) => None,
+                    }
+                    .unwrap_or_else(Instant::now)
+                };
                 let deterministic = if correction_mode.applies_deterministic() {
                     normalizer.normalize(TranscriptNormalizationInput {
                         raw_text: transcript.text.clone(),
@@ -554,6 +611,7 @@ impl TranscriptionRuntime {
                                 NormalizedTranscript {
                                     transcript,
                                     normalization: corrected,
+                                    speech_ended_at,
                                 },
                             )));
                         });
@@ -587,6 +645,7 @@ impl TranscriptionRuntime {
                     NormalizedTranscript {
                         transcript,
                         normalization,
+                        speech_ended_at,
                     },
                 )));
             }
@@ -776,6 +835,37 @@ mod tests {
             finals[0].normalization.raw_text, "usamos micro serviços   com ddd",
             "o texto original nunca é descartado"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_segment_preserves_original_speech_end_for_freshness() {
+        let (out, sink) = collector();
+        let (runtime, _log) = runtime_with(
+            FakeBehavior::EmitsFinal {
+                text: "pergunta atual".into(),
+                partials: false,
+            },
+            sink,
+        );
+        runtime.begin_session(SessionId::from_value(1)).await;
+        let speech_ended_at = Instant::now() - Duration::from_secs(12);
+        let segment = AudioSegment::new(
+            AudioSource::SystemOutput,
+            vec![0.0; 160],
+            16_000,
+            AudioTimestamp(0),
+            AudioTimestamp(500),
+        );
+
+        runtime
+            .push_segment_at(segment, speech_ended_at)
+            .await
+            .unwrap();
+
+        let finals = finals(&out);
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].speech_ended_at, speech_ended_at);
+        assert!(finals[0].speech_ended_at.elapsed() >= Duration::from_secs(12));
     }
 
     #[tokio::test]

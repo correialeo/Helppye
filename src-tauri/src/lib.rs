@@ -133,10 +133,11 @@ pub fn run() {
                         tracing::warn!(%e, "failed to emit transcription event to frontend");
                     }
 
-                    let conversation_events = timeline_for_queue.ingest_normalized_transcript(
-                        &normalized.transcript,
-                        &normalized.normalization,
-                    );
+                let conversation_events = timeline_for_queue.ingest_normalized_transcript(
+                    &normalized.transcript,
+                    &normalized.normalization,
+                    normalized.speech_ended_at,
+                );
                     emit_conversation_events(&app_handle, conversation_events.clone());
                     process_conversation_events(
                         &app_handle,
