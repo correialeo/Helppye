@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Helppye — real-time meeting copilot"
 edition = "2021"
 license = "MIT"
+default-run = "helppye"
 
 [lib]
 name = "helppye_lib"
