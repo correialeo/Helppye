@@ -6,6 +6,41 @@ o pipeline atual gera, via LLM e em streaming, uma sugestão real de resposta pa
 usuário — mantendo a filosofia local-first como padrão, mas permitindo que o usuário
 escolha explicitamente um provedor de nuvem quando quiser.
 
+## Contrato atual de isolamento e publicacao
+
+O provider continua sendo consumido como stream, mas texto nao validado nao e mais
+publicado incrementalmente. O `ResponseEngine` acumula uma tentativa, aplica
+`EchoGuard`, `ContextLeakGuard` e `SuggestionValidationFailure`, e somente entao emite o
+texto validado. Isso fecha o caso em que `.` ou uma fala antiga apareciam na UI antes de
+uma validacao tardia.
+
+No trigger, `snapshot_generation_request` cria uma `ResponseGenerationRequest` owned com
+`session_id`, `turn_id`, `utterance_id`, `utterance_revision`, `generation_id`, fala atual,
+contexto selecionado e instantes monotonicos. A task assincrona recebe este snapshot e
+nunca consulta novamente timeline/historico mutavel. O estado ativo e indexado por
+`utterance_id`; o handle guarda o `GenerationContext` completo, e toda publicacao compara
+as cinco chaves.
+
+O contexto nao e mais formado por turnos completos. Ele usa somente utterances
+finalizadas e causalmente anteriores: no maximo duas falas remotas e uma resposta do
+usuario, com teto de 3000 caracteres. Historico so entra quando a fala atual contem uma
+referencia que precisa de antecedente; perguntas autocontidas recebem contexto vazio. Raw
+text, sugestoes anteriores e outras falas recentes ficam fora do prompt e entram apenas
+como referencias do `ContextLeakGuard`.
+
+Uma saida invalida produz exatamente uma retry. O prompt de reparo contem apenas a fala
+atual e a instrucao de reparo; nao inclui a saida invalida nem a conversa completa. Uma
+segunda falha emite `invalid`, nunca `completed`. `[SKIP]` e aceito somente como marcador
+inteiro apos trim; vazio nao e skip.
+
+Geracao automatica usa `maximum_automatic_generation_age_ms` (default 10000 ms). Entrada
+mais velha e descartada antes de `started`/provider e registrada como `stale_input`;
+regeneracao manual ignora explicitamente este limite.
+
+Todos os eventos publicos carregam `session_id`, `turn_id`, `utterance_id`,
+`utterance_revision` e `generation_id`. O frontend exige a mesma identidade e tambem
+mantem um gate da sessao ativa, inclusive para `started` e `diagnostics` atrasados.
+
 ## Visão geral do fluxo
 
 ```
@@ -22,8 +57,8 @@ ResponseEngine::trigger_generation
         │  rejeita gatilho de sessão não-ativa/encerrando (generation_rejected_wrong_session)
         │  cancela geração anterior do mesmo turno, se houver (token filho do token raiz)
         ▼
-context::build_request (histórico **da sessão ativa** + fala atual isolada)
-        │  history_snapshot(session_id) → None se a sessão já mudou ⇒ aborta
+snapshot_generation_request (utterances finalizadas anteriores + fala atual isolada)
+        │  snapshot owned; a task não relê histórico/timeline
         ▼
 ResponseProvider ativo (Ollama | OpenAI | DeepSeek | Anthropic)
         │  stream de ResponseChunk::Delta/Done
@@ -140,7 +175,8 @@ faz. Nenhum estado conversacional atravessa a fronteira.
   ordem em que ocorreram.
 - **`ResponseEngine`** — todo o estado mutável de sessão vive num único
   `Mutex<SessionState>`: `session_id`, flag `ending`, `CancellationToken` raiz, `history`
-  (deque de turnos finalizados) e `generations` (mapa `TurnId → GenerationHandle`).
+  (deque de utterances finalizadas) e `generations` (mapa
+  `UtteranceId → GenerationHandle`, cujo handle guarda o `GenerationContext` completo).
   `begin_session` substitui o `SessionState` inteiro por um novo — token raiz novo,
   histórico vazio, mapa de gerações vazio.
 
@@ -162,9 +198,8 @@ pub struct GenerationContext {
 }
 ```
 
-Esses campos aparecem nos logs estruturados e — exceto `utterance_revision` — em todos os
-eventos públicos de `response://suggestion-event`, para que o frontend consiga descartar
-qualquer coisa que ainda escape.
+Todos esses campos aparecem nos logs estruturados e em todos os eventos públicos de
+`response://suggestion-event`, para que o frontend descarte qualquer identidade stale.
 
 ### Os quatro pontos de validação
 
@@ -174,11 +209,10 @@ ao usuário:
 
 1. **No gatilho** (`trigger_generation`): sessão diferente ou `ending = true` ⇒
    `generation_rejected_wrong_session`, nada é iniciado.
-2. **No histórico** (`push_history` / `history_snapshot`): um turno finalizado que chegue
-   atrasado, de uma sessão encerrada, não entra no histórico; e uma geração cuja sessão
-   mudou entre o gatilho e a montagem do prompt recebe `None` de `history_snapshot` e
-   aborta antes de chamar o provedor. **É este o ponto que corrige a contaminação de
-   prompt na origem** — não existe snapshot "global" de histórico em lugar nenhum.
+2. **No snapshot** (`push_history` / `snapshot_at_trigger`): uma utterance finalizada que
+   chegue atrasada, de uma sessão encerrada, não entra no histórico. Identidade e contexto
+   são copiados sob o lock da sessão no trigger; a task não consulta estado conversacional
+   novamente.
 3. **Antes de cada emissão** (`is_publishable` → `publish_stream_event` /
    `publish_terminal_event`): `started`, cada `delta` e o estado terminal só são emitidos
    se a sessão ainda for a ativa, não estiver encerrando, o token raiz não estiver
@@ -452,10 +486,11 @@ inspeção manual durante o desenvolvimento.
   `http_status` da resposta bem-sucedida vai para `ResponseStreamMeta` porque, sem ele,
   não havia como o diagnóstico de uma geração confirmar que a requisição de fato chegou
   ao provedor e obteve `200` antes de o stream começar a produzir chunks.
-- **`context.rs`** — monta o `ResponseRequest` a partir do histórico de turnos **da sessão
-  ativa** e da utterance que acabou de finalizar, devolvendo um `BuiltContext`
-  (`request`, `context_turn_count`, `context_character_count`, `sanitized_preview`). Teto
-  de 4 turnos e 5000 caracteres de histórico (`MAX_HISTORY_TURNS`, `MAX_HISTORY_CHARS`),
+- **`context.rs`** — cria o snapshot owned no trigger e monta o `ResponseRequest` a partir
+  de utterances finalizadas anteriores da sessão ativa. O teto é 2 falas remotas, 1 fala
+  do usuário e 3000 caracteres (`MAX_CONTEXT_CHARACTERS`); histórico só entra para
+  resolver referência explícita. O retorno inclui request, IDs exatos do contexto,
+  contagem de caracteres e preview sanitizado.
   160 tokens de saída (`MAX_OUTPUT_TOKENS`), `temperature = 0.2` (`TEMPERATURE`) —
   contexto e saída limitados de propósito para manter prompt pequeno e latência baixa em
   vez de reenviar a conversa inteira a cada geração; baixa `temperature` favorece uma
@@ -742,7 +777,7 @@ uma sessão encerrada. Elas existem para a tela não continuar exibindo o que j�
 descartado na origem.
 
 `applyResponseSuggestionDiagnostics` reduz os eventos `diagnostics` separadamente, num
-`Record<TurnId, ResponseSuggestionDiagnostics>` só usado pelas ferramentas de
+`Record<UtteranceId, ResponseSuggestionDiagnostics>` só usado pelas ferramentas de
 desenvolvedor (`features/developer-tools/DeveloperToolsScreen.tsx`) — não afeta
 `SuggestionState`, e não aparece na experiência normal (ver
 `docs/design-system.md` §Complexidade ocultada). Escolher provedor/modelo/URL base/

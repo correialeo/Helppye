@@ -343,8 +343,8 @@ prompt é a parte que se ajusta por experimentação. `ResponseContextInput` é 
 **fechado** e não `&ResponseEngine` — o que não está nele é a lista do que não pode entrar
 no prompt (diagnósticos, IDs, sugestões anteriores, texto bruto, histórico de outra
 sessão), e um builder novo não tem como incluir nada disso por engano porque não recebe.
-Tetos: 4 turnos, 5000 caracteres de histórico, só a utterance remota atual, 160 tokens de
-saída, `temperature = 0.2`.
+Tetos: 2 utterances remotas anteriores, 1 resposta do usuário, 3000 caracteres de
+contexto, utterance remota atual isolada, 160 tokens de saída, `temperature = 0.2`.
 
 **Registry e endpoints.** `registry.rs` guarda **descritores** (não instâncias, ao
 contrário do de transcrição: um provedor de geração é reconstruído a cada troca de
@@ -403,8 +403,8 @@ baixo; nada já exibido é substituído no lugar. Há também `diagnostics` (ver
 `docs/response-suggestion.md` para a arquitetura completa, módulo por módulo, e
 `docs/session-experience.md` para o comportamento fim a fim durante uma sessão ao vivo.
 
-**Latência.** Contexto deliberadamente pequeno (`response_context_turns` = 4 turnos,
-`maximum_context_characters` = 5000, `maximum_response_tokens` = 160,
+**Latência.** Contexto deliberadamente pequeno (2 utterances remotas anteriores,
+1 resposta do usuário, `maximum_context_characters` = 3000, `maximum_response_tokens` = 160,
 `temperature` = 0.2, ver `context.rs`). O provider Ollama reutiliza uma única instância
 de `reqwest::Client` (reconstruída só quando a configuração muda, nunca por chamada),
 envia `keep_alive` configurável (`ResponseProviderConfig::ollama_keep_alive`, default

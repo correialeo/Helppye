@@ -27,10 +27,10 @@ Audio capture and local transcription foundations implemented:
   default 1800ms) — it does not wait for the next segment, a flush, or capture to stop.
 - Streaming response suggestion: an eligible utterance from the other person
   (`speaker = OtherPerson`, `source = SystemOutput`) automatically triggers an LLM call
-  (Ollama local by default, or a user-chosen cloud provider) that streams a suggested
-  reply — or a `[SKIP]` marker when the speech doesn't need one — back to the frontend.
-  The prompt is built by an explicit, testable `ResponseContextBuilder` with hard limits
-  (4 turns, 5000 chars, current remote utterance only). Response backends live behind a
+  (Ollama local by default, or a user-chosen cloud provider). Provider streams are
+  buffered and validated before a reply — or `[SKIP]` — is published to the frontend.
+  The prompt is built from an immutable per-utterance snapshot with hard limits
+  (2 prior remote utterances, 1 prior user answer, 3000 context chars). Response backends live behind a
   common registry and a generalized OpenAI-compatible client (LM Studio, OpenRouter, any
   compatible endpoint) with validated `base_url`, credential modes, custom headers, and
   sanitized logging. See `docs/response-suggestion.md`.

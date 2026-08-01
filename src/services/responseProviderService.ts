@@ -10,6 +10,7 @@ export function setResponseProviderConfig(config: {
   model: string;
   baseUrl: string | null;
   ollamaKeepAlive: string | null;
+  maximumAutomaticGenerationAgeMs?: number;
 }): Promise<void> {
   return invoke("response_set_provider_config_command", config);
 }

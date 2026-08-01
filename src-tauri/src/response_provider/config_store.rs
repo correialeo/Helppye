@@ -64,6 +64,12 @@ fn default_ollama_keep_alive() -> Option<String> {
     Some(crate::response_provider::ollama::DEFAULT_KEEP_ALIVE.to_string())
 }
 
+pub const DEFAULT_MAXIMUM_AUTOMATIC_GENERATION_AGE_MS: u64 = 10_000;
+
+fn default_maximum_automatic_generation_age_ms() -> u64 {
+    DEFAULT_MAXIMUM_AUTOMATIC_GENERATION_AGE_MS
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseProviderConfig {
     pub provider: ResponseProviderKind,
@@ -78,6 +84,10 @@ pub struct ResponseProviderConfig {
     /// arquivos de configuração salvos antes deste campo existir continuem carregando.
     #[serde(default = "default_ollama_keep_alive")]
     pub ollama_keep_alive: Option<String>,
+    /// Uma fala automatica mais velha que este limite nao pode disputar a UI com a
+    /// pergunta atual. Regeneracao manual ignora explicitamente o limite.
+    #[serde(default = "default_maximum_automatic_generation_age_ms")]
+    pub maximum_automatic_generation_age_ms: u64,
     /// Como a credencial viaja para provedores compatíveis com a API da OpenAI. Só é
     /// consultado por eles; Ollama e Anthropic têm forma própria e fixa.
     #[serde(default)]
@@ -98,6 +108,7 @@ impl Default for ResponseProviderConfig {
             model: "llama3.1".to_string(),
             base_url: None,
             ollama_keep_alive: default_ollama_keep_alive(),
+            maximum_automatic_generation_age_ms: default_maximum_automatic_generation_age_ms(),
             credential_mode: CredentialMode::default(),
             custom_headers: Vec::new(),
         }
@@ -169,6 +180,7 @@ mod tests {
             model: "claude-sonnet".to_string(),
             base_url: Some("https://example.com".to_string()),
             ollama_keep_alive: Some("5m".to_string()),
+            maximum_automatic_generation_age_ms: 10_000,
             credential_mode: CredentialMode::BearerToken,
             custom_headers: vec![("x-title".to_string(), "Helppye".to_string())],
         };

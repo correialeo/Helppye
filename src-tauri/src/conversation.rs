@@ -126,6 +126,10 @@ pub struct TranscriptSegment {
     pub ended_at: AudioTimestamp,
     pub processing_time_ms: u64,
     pub received_sequence: u64,
+    #[serde(skip_serializing)]
+    pub transcription_completed_at: Instant,
+    #[serde(skip_serializing)]
+    pub speech_ended_at: Instant,
 }
 
 impl TranscriptSegment {
@@ -152,6 +156,8 @@ impl TranscriptSegment {
             ended_at: transcript.ended_at,
             processing_time_ms: transcript.processing_time_ms,
             received_sequence,
+            transcription_completed_at: Instant::now(),
+            speech_ended_at: Instant::now(),
         })
     }
 
@@ -163,6 +169,7 @@ impl TranscriptSegment {
         transcript: &FinalTranscript,
         normalization: &TranscriptNormalizationResult,
         received_sequence: u64,
+        speech_ended_at: Instant,
     ) -> Option<Self> {
         let text = normalize_segment_text(&normalization.normalized_text);
         if text.is_empty() {
@@ -181,6 +188,8 @@ impl TranscriptSegment {
             ended_at: transcript.ended_at,
             processing_time_ms: transcript.processing_time_ms.unwrap_or(0),
             received_sequence,
+            transcription_completed_at: Instant::now(),
+            speech_ended_at,
         })
     }
 }
@@ -191,6 +200,11 @@ pub struct ConversationUtterance {
     pub speaker: ConversationSpeaker,
     pub source: AudioSource,
     pub text: String,
+    /// Texto bruto agregado dos segmentos desta utterance. Fica disponível apenas no
+    /// backend para diagnóstico e proteção contra vazamento; o prompt usa somente
+    /// `text`, e o frontend não recebe esta cópia.
+    #[serde(skip_serializing)]
+    pub raw_text: String,
     pub segments: Vec<SegmentId>,
     pub received_sequence: u64,
     pub started_at: AudioTimestamp,
@@ -201,6 +215,10 @@ pub struct ConversationUtterance {
     /// a utterance ainda é a mesma que estava aberta quando o timer foi agendado — se a
     /// revisão mudou (ou a utterance já finalizou por outro caminho), o timer é um no-op.
     pub revision: u64,
+    #[serde(skip_serializing)]
+    pub transcription_completed_at: Instant,
+    #[serde(skip_serializing)]
+    pub speech_ended_at: Instant,
 }
 
 impl ConversationUtterance {
@@ -210,20 +228,29 @@ impl ConversationUtterance {
             speaker: segment.speaker,
             source: segment.source,
             text: segment.text.clone(),
+            raw_text: segment.raw_text.clone(),
             segments: vec![segment.segment_id],
             received_sequence: segment.received_sequence,
             started_at: segment.started_at,
             ended_at: segment.ended_at,
             finalized_at: None,
             revision: 1,
+            transcription_completed_at: segment.transcription_completed_at,
+            speech_ended_at: segment.speech_ended_at,
         }
     }
 
     fn append(&mut self, segment: &TranscriptSegment) {
         self.text = join_text(&self.text, &segment.text);
+        self.raw_text = join_text(&self.raw_text, &segment.raw_text);
         self.segments.push(segment.segment_id);
         self.ended_at = std::cmp::max(self.ended_at, segment.ended_at);
         self.revision += 1;
+        self.transcription_completed_at = std::cmp::max(
+            self.transcription_completed_at,
+            segment.transcription_completed_at,
+        );
+        self.speech_ended_at = std::cmp::max(self.speech_ended_at, segment.speech_ended_at);
     }
 
     fn duration_ms(&self) -> u64 {
@@ -237,6 +264,8 @@ pub struct ConversationTurn {
     pub speaker: ConversationSpeaker,
     pub source: AudioSource,
     pub text: String,
+    #[serde(skip_serializing)]
+    pub raw_text: String,
     pub utterances: Vec<UtteranceId>,
     pub started_at: AudioTimestamp,
     pub ended_at: AudioTimestamp,
@@ -250,6 +279,7 @@ impl ConversationTurn {
             speaker: utterance.speaker,
             source: utterance.source,
             text: utterance.text.clone(),
+            raw_text: utterance.raw_text.clone(),
             utterances: vec![utterance.id],
             started_at: utterance.started_at,
             ended_at: utterance.ended_at,
@@ -262,6 +292,7 @@ impl ConversationTurn {
             self.utterances.push(utterance.id);
         }
         self.text = join_text(&self.text, &utterance.text);
+        self.raw_text = join_text(&self.raw_text, &utterance.raw_text);
         self.ended_at = std::cmp::max(self.ended_at, utterance.ended_at);
     }
 
@@ -675,6 +706,8 @@ impl ConversationAssembler {
             turn.utterances.push(utterance.id);
         }
         turn.text = build_turn_text(&turn.utterances, &finalized_utterances, Some(utterance));
+        turn.raw_text =
+            build_turn_raw_text(&turn.utterances, &finalized_utterances, Some(utterance));
         turn.ended_at = std::cmp::max(turn.ended_at, utterance.ended_at);
     }
 
@@ -1033,10 +1066,15 @@ impl ConversationTimeline {
         &self,
         transcript: &FinalTranscript,
         normalization: &TranscriptNormalizationResult,
+        speech_ended_at: Instant,
     ) -> Vec<ConversationTimelineEvent> {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let Some(segment) = TranscriptSegment::from_normalized(transcript, normalization, sequence)
-        else {
+        let Some(segment) = TranscriptSegment::from_normalized(
+            transcript,
+            normalization,
+            sequence,
+            speech_ended_at,
+        ) else {
             return Vec::new();
         };
         self.ingest_segment(segment)
@@ -1354,7 +1392,10 @@ pub async fn conversation_regenerate_suggestion_command(
         utterance_id: last_utterance.id,
         utterance_revision: last_utterance.revision,
         utterance_text: last_utterance.text.clone(),
+        utterance: last_utterance.clone(),
         utterance_finalized_at: Instant::now(),
+        speech_ended_at: Instant::now(),
+        automatic: false,
         finalization_reason: "manual_regenerate".to_string(),
         gap_ms_used: 0,
         silence_detected_ms: None,
@@ -1454,6 +1495,24 @@ fn build_turn_text(
             .or_else(|| open.filter(|u| u.id == *id));
         if let Some(utterance) = utterance {
             text = join_text(&text, &utterance.text);
+        }
+    }
+    text
+}
+
+fn build_turn_raw_text(
+    utterance_ids: &[UtteranceId],
+    finalized: &[ConversationUtterance],
+    open: Option<&ConversationUtterance>,
+) -> String {
+    let mut text = String::new();
+    for id in utterance_ids {
+        let utterance = finalized
+            .iter()
+            .find(|u| u.id == *id)
+            .or_else(|| open.filter(|u| u.id == *id));
+        if let Some(utterance) = utterance {
+            text = join_text(&text, &utterance.raw_text);
         }
     }
     text

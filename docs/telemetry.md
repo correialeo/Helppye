@@ -5,6 +5,22 @@ da sugestão, medida ponta a ponta.
 
 Código: `src-tauri/src/telemetry/`.
 
+## Freshness e diagnostico de geracao
+
+`GenerationDiagnostics` complementa o trace com a prova de vinculacao da resposta:
+`session_id`, `generation_id`, `turn_id`, `utterance_id`, `utterance_revision`,
+`trigger_text` sanitizado, SHA-256 do trigger, `context_utterance_ids`, tamanho do
+contexto, resultado de validacao, uso de retry, score de vazamento, caracteres suprimidos
+pelo EchoGuard e estado terminal. Tambem expoe `speech_ended_at`,
+`transcription_completed_at`, `utterance_finalized_at`, `generation_triggered_at`,
+`request_started`, `first_visible_token_at`, `completed_at`,
+`utterance_age_at_generation_start_ms` e `utterance_age_at_first_token_ms`.
+
+A `TranscriptionQueue` agora reporta `queue_depth`, `oldest_segment_age_ms`,
+`newest_segment_age_ms` e `segments_dropped`. A politica continua `drop_newest`: as
+metricas foram adicionadas antes de qualquer mudanca de descarte, porque nao havia
+evidencia de producao mostrando que o consumidor estava processando audio velho.
+
 ## Por que uma camada nova
 
 As latências já medidas eram parciais e viviam em lugares que não se falam:

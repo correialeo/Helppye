@@ -17,13 +17,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::types::AudioSource;
 use crate::conversation::{
-    ConversationSpeaker, ConversationTimelineEvent, ConversationTurn, SessionId, TurnId,
-    UtteranceFinalizationReason, UtteranceId,
+    ConversationSpeaker, ConversationTimelineEvent, ConversationTurn, ConversationUtterance,
+    SessionId, TurnId, UtteranceFinalizationReason, UtteranceId,
 };
 
 /// Id de geração, monotônico por processo (nunca reiniciado, nem entre sessões): junto com
@@ -37,11 +38,16 @@ impl GenerationId {
     pub fn value(self) -> u64 {
         self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 /// Identidade completa de uma geração. Nenhuma geração existe sem `session_id`: é o campo
 /// verificado antes de iniciar a requisição e antes de publicar qualquer evento.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationContext {
     pub session_id: SessionId,
     pub turn_id: TurnId,
@@ -60,8 +66,8 @@ enum TerminalState {
     Skipped,
     Cancelled,
     Error,
+    Invalid,
     Superseded,
-    SessionEnded,
 }
 
 impl TerminalState {
@@ -71,8 +77,8 @@ impl TerminalState {
             TerminalState::Skipped => "skipped",
             TerminalState::Cancelled => "cancelled",
             TerminalState::Error => "error",
+            TerminalState::Invalid => "invalid",
             TerminalState::Superseded => "superseded",
-            TerminalState::SessionEnded => "session_ended",
         }
     }
 }
@@ -92,7 +98,12 @@ pub struct GenerationTrigger {
     /// a palavra, e mandar isso como "fala mais recente" fazia o modelo decidir sobre uma
     /// pergunta velha (ou responder `[SKIP]` por já ter "visto" tudo aquilo).
     pub utterance_text: String,
+    /// Snapshot da utterance finalizada, incluindo texto bruto apenas para validacao.
+    pub utterance: ConversationUtterance,
     pub utterance_finalized_at: Instant,
+    pub speech_ended_at: Instant,
+    /// Regeneracao manual pode ignorar o limite de idade de entrada.
+    pub automatic: bool,
     pub finalization_reason: String,
     pub gap_ms_used: u64,
     pub silence_detected_ms: Option<u64>,
@@ -100,7 +111,10 @@ pub struct GenerationTrigger {
 
 use super::anthropic::AnthropicProvider;
 use super::config_store::{self, ResponseProviderConfig, ResponseProviderKind};
-use super::context::{DefaultResponseContextBuilder, ResponseContextBuilder, ResponseContextInput};
+use super::context::{
+    snapshot_generation_request, DefaultResponseContextBuilder, ResponseContextBuilder,
+    ResponseGenerationRequest,
+};
 use super::echo_guard::EchoGuard;
 use super::events::{
     emit_response_suggestion_event, GenerationDiagnostics, ResponseSuggestionEvent,
@@ -113,6 +127,9 @@ use super::provider::{
 };
 use super::secrets;
 use super::skip_detector::{SkipDecision, SkipDetector};
+use super::validation::{
+    validate_suggestion, SuggestionValidation, SuggestionValidationFailure, ValidatedSuggestion,
+};
 
 const MAX_HISTORY_TURNS: usize = 20;
 
@@ -123,8 +140,10 @@ const CANCEL_REASON_NEW_UTTERANCE: &str = "new_utterance";
 /// Quantos caracteres brutos (antes do `SkipDetector`) manter para diagnóstico. Cobre
 /// folgadamente o marcador `[SKIP]`, sem acumular texto de respostas longas à toa.
 const RAW_PREFIX_CAP_CHARS: usize = 80;
+#[cfg(test)]
 const MIN_USEFUL_RESPONSE_CHARS: usize = 12;
 
+#[cfg(test)]
 fn normalize_generated_response_for_quality(text: &str) -> String {
     text.chars()
         .map(|ch| {
@@ -140,6 +159,7 @@ fn normalize_generated_response_for_quality(text: &str) -> String {
         .join(" ")
 }
 
+#[cfg(test)]
 fn is_invalid_generated_response(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -180,8 +200,16 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn truncate_for_diagnostics(text: &str, maximum_characters: usize) -> String {
+    if text.chars().count() <= maximum_characters {
+        text.to_string()
+    } else {
+        text.chars().take(maximum_characters).collect()
+    }
+}
+
 struct GenerationHandle {
-    generation_id: GenerationId,
+    context: GenerationContext,
     cancel: CancellationToken,
     /// Marcado na primeira vez que um estado terminal é publicado para esta geração.
     /// Compartilhado com a task que roda a geração, para que nem a substituição
@@ -204,8 +232,9 @@ struct SessionState {
     cancel: CancellationToken,
     /// Histórico rolante usado para montar o prompt — **por sessão**. Era isto que
     /// sobrevivia ao encerramento e fazia perguntas da sessão anterior reaparecerem.
-    history: VecDeque<ConversationTurn>,
-    generations: HashMap<TurnId, GenerationHandle>,
+    history: VecDeque<ConversationUtterance>,
+    generations: HashMap<UtteranceId, GenerationHandle>,
+    last_suggestion: Option<String>,
 }
 
 impl SessionState {
@@ -216,6 +245,7 @@ impl SessionState {
             cancel: CancellationToken::new(),
             history: VecDeque::with_capacity(MAX_HISTORY_TURNS),
             generations: HashMap::new(),
+            last_suggestion: None,
         }
     }
 }
@@ -462,7 +492,7 @@ impl ResponseEngine {
         );
         state.ending = true;
         state.cancel.cancel();
-        for (turn_id, handle) in state.generations.drain() {
+        for (_utterance_id, handle) in state.generations.drain() {
             // `swap` e não `store`: se a geração já tinha publicado seu estado terminal,
             // não há nada a cancelar — só evita que ela publique um segundo.
             let already_terminal = handle.terminal_emitted.swap(true, Ordering::SeqCst);
@@ -470,8 +500,8 @@ impl ResponseEngine {
             if !already_terminal {
                 tracing::info!(
                     session_id = session_id.value(),
-                    turn_id = turn_id.value(),
-                    generation_id = handle.generation_id.value(),
+                    turn_id = handle.context.turn_id.value(),
+                    generation_id = handle.context.generation_id.value(),
                     "generation_cancelled_session_end"
                 );
             }
@@ -532,19 +562,19 @@ impl ResponseEngine {
     /// Só aceita turnos da sessão ativa. Um turno finalizado que chegue atrasado, de uma
     /// sessão já encerrada, é descartado — é ele que, antes, entrava no histórico e
     /// contaminava o prompt da sessão seguinte.
-    fn push_history(&self, session_id: SessionId, turn: ConversationTurn) {
+    fn push_history(&self, session_id: SessionId, utterance: ConversationUtterance) {
         let mut state = self.session.lock().expect("response engine mutex poisoned");
         if state.session_id != session_id || state.ending {
             tracing::debug!(
                 turn_session_id = session_id.value(),
                 active_session_id = state.session_id.value(),
-                turn_id = turn.id.value(),
+                utterance_id = utterance.id.value(),
                 "history turn discarded: not the active session"
             );
             return;
         }
-        state.history.retain(|existing| existing.id != turn.id);
-        state.history.push_back(turn);
+        state.history.retain(|existing| existing.id != utterance.id);
+        state.history.push_back(utterance);
         while state.history.len() > MAX_HISTORY_TURNS {
             state.history.pop_front();
         }
@@ -552,33 +582,13 @@ impl ResponseEngine {
 
     /// Histórico da sessão `session_id`, ou `None` se ela não for mais a sessão ativa —
     /// nunca devolve um histórico "global".
-    fn history_snapshot(&self, session_id: SessionId) -> Option<Vec<ConversationTurn>> {
+    #[cfg(test)]
+    fn history_snapshot(&self, session_id: SessionId) -> Option<Vec<ConversationUtterance>> {
         let state = self.session.lock().expect("response engine mutex poisoned");
         if state.session_id != session_id || state.ending {
             return None;
         }
         Some(state.history.iter().cloned().collect())
-    }
-
-    /// A geração ainda é a corrente para o turno, na sessão ativa, sem cancelamento?
-    /// Consultado antes de `started` e de cada `delta`.
-    fn is_publishable(&self, ctx: &GenerationContext) -> bool {
-        let state = self.session.lock().expect("response engine mutex poisoned");
-        state.session_id == ctx.session_id
-            && !state.ending
-            && !state.cancel.is_cancelled()
-            && state
-                .generations
-                .get(&ctx.turn_id)
-                .is_some_and(|handle| handle.generation_id == ctx.generation_id)
-    }
-
-    /// A sessão dona da geração ainda é a ativa? Condição mínima para publicar um estado
-    /// terminal (que, ao contrário de `delta`, é legítimo mesmo depois de a geração já ter
-    /// saído do mapa de gerações ativas).
-    fn session_is_active(&self, session_id: SessionId) -> bool {
-        let state = self.session.lock().expect("response engine mutex poisoned");
-        state.session_id == session_id && !state.ending
     }
 
     /// Publica um evento de streaming (`started`/`delta`). Silenciosamente descartado —
@@ -590,7 +600,15 @@ impl ResponseEngine {
         ctx: &GenerationContext,
         event: ResponseSuggestionEvent,
     ) -> bool {
-        if !self.is_publishable(ctx) {
+        let state = self.session.lock().expect("response engine mutex poisoned");
+        let publishable = state.session_id == ctx.session_id
+            && !state.ending
+            && !state.cancel.is_cancelled()
+            && state
+                .generations
+                .get(&ctx.utterance_id)
+                .is_some_and(|handle| handle.context == *ctx);
+        if !publishable {
             tracing::debug!(
                 session_id = ctx.session_id.value(),
                 turn_id = ctx.turn_id.value(),
@@ -599,6 +617,8 @@ impl ResponseEngine {
             );
             return false;
         }
+        // O lock permanece vivo ate o emit: nenhuma supersessao pode entrar entre a
+        // validacao da identidade e a publicacao.
         emit_response_suggestion_event(app, event);
         true
     }
@@ -613,6 +633,26 @@ impl ResponseEngine {
         terminal: TerminalState,
         event: Option<ResponseSuggestionEvent>,
     ) -> bool {
+        let state = self.session.lock().expect("response engine mutex poisoned");
+        let publishable = state.session_id == ctx.session_id
+            && !state.ending
+            && !state.cancel.is_cancelled()
+            && state
+                .generations
+                .get(&ctx.utterance_id)
+                .is_some_and(|handle| handle.context == *ctx);
+        if !publishable {
+            tracing::debug!(
+                session_id = ctx.session_id.value(),
+                turn_id = ctx.turn_id.value(),
+                utterance_id = ctx.utterance_id.value(),
+                utterance_revision = ctx.utterance_revision,
+                generation_id = ctx.generation_id.value(),
+                terminal_state = terminal.as_str(),
+                "generation_event_discarded_stale"
+            );
+            return false;
+        }
         if terminal_emitted.swap(true, Ordering::SeqCst) {
             tracing::debug!(
                 session_id = ctx.session_id.value(),
@@ -620,16 +660,6 @@ impl ResponseEngine {
                 generation_id = ctx.generation_id.value(),
                 terminal_state = terminal.as_str(),
                 "generation_event_discarded_stale: terminal state already emitted"
-            );
-            return false;
-        }
-        if !self.session_is_active(ctx.session_id) {
-            tracing::info!(
-                session_id = ctx.session_id.value(),
-                turn_id = ctx.turn_id.value(),
-                generation_id = ctx.generation_id.value(),
-                terminal_state = TerminalState::SessionEnded.as_str(),
-                "terminal_state"
             );
             return false;
         }
@@ -651,9 +681,45 @@ impl ResponseEngine {
         if state.session_id != ctx.session_id {
             return;
         }
-        if state.generations.get(&ctx.turn_id).map(|h| h.generation_id) == Some(ctx.generation_id) {
-            state.generations.remove(&ctx.turn_id);
+        if state
+            .generations
+            .get(&ctx.utterance_id)
+            .map(|handle| handle.context)
+            == Some(*ctx)
+        {
+            state.generations.remove(&ctx.utterance_id);
         }
+    }
+
+    fn snapshot_at_trigger(
+        &self,
+        turn_id: TurnId,
+        generation_id: GenerationId,
+        trigger: &GenerationTrigger,
+    ) -> Option<ResponseGenerationRequest> {
+        let state = self.session.lock().expect("response engine mutex poisoned");
+        if state.session_id != trigger.session_id || state.ending {
+            tracing::warn!(
+                trigger_session_id = trigger.session_id.value(),
+                active_session_id = state.session_id.value(),
+                turn_id = turn_id.value(),
+                "generation_rejected_wrong_session"
+            );
+            return None;
+        }
+        let history: Vec<_> = state.history.iter().cloned().collect();
+        Some(snapshot_generation_request(
+            trigger.session_id,
+            turn_id,
+            &trigger.utterance,
+            generation_id,
+            &history,
+            state.last_suggestion.clone(),
+            None,
+            Instant::now(),
+            trigger.speech_ended_at,
+            trigger.automatic,
+        ))
     }
 
     /// Genérica sobre `R: tauri::Runtime` (em vez do `AppHandle` = `AppHandle<Wry>` fixo
@@ -668,12 +734,15 @@ impl ResponseEngine {
     ) {
         let generation_id =
             GenerationId(self.next_generation_id.fetch_add(1, Ordering::Relaxed) + 1);
+        let Some(request) = self.snapshot_at_trigger(turn.id, generation_id, &trigger) else {
+            return;
+        };
         let ctx = GenerationContext {
-            session_id: trigger.session_id,
-            turn_id: turn.id,
-            utterance_id: trigger.utterance_id,
-            utterance_revision: trigger.utterance_revision,
-            generation_id,
+            session_id: request.session_id,
+            turn_id: request.turn_id,
+            utterance_id: request.utterance_id,
+            utterance_revision: request.utterance_revision,
+            generation_id: request.generation_id,
         };
         let terminal_emitted = Arc::new(AtomicBool::new(false));
 
@@ -700,10 +769,14 @@ impl ResponseEngine {
                 return;
             }
             let cancel_token = state.cancel.child_token();
-            let previous = state.generations.insert(
-                ctx.turn_id,
+            let previous_key = state.generations.iter().find_map(|(utterance_id, handle)| {
+                (handle.context.turn_id == ctx.turn_id).then_some(*utterance_id)
+            });
+            let previous = previous_key.and_then(|key| state.generations.remove(&key));
+            state.generations.insert(
+                ctx.utterance_id,
                 GenerationHandle {
-                    generation_id,
+                    context: ctx,
                     cancel: cancel_token.clone(),
                     terminal_emitted: terminal_emitted.clone(),
                 },
@@ -716,10 +789,7 @@ impl ResponseEngine {
             // A geração substituída termina aqui, em `cancelled`: sua própria task, ao
             // acordar cancelada, encontra `terminal_emitted` já marcado e não publica um
             // segundo estado terminal.
-            let previous_ctx = GenerationContext {
-                generation_id: previous.generation_id,
-                ..ctx
-            };
+            let previous_ctx = previous.context;
             self.publish_terminal_event(
                 &app,
                 &previous_ctx,
@@ -729,7 +799,8 @@ impl ResponseEngine {
                     session_id: previous_ctx.session_id,
                     turn_id: previous_ctx.turn_id,
                     utterance_id: previous_ctx.utterance_id,
-                    generation_id: previous.generation_id,
+                    utterance_revision: previous_ctx.utterance_revision,
+                    generation_id: previous_ctx.generation_id,
                 }),
             );
         }
@@ -737,7 +808,7 @@ impl ResponseEngine {
         let engine = self.clone();
         tauri::async_runtime::spawn(async move {
             engine
-                .run_generation(app, turn, ctx, terminal_emitted, cancel_token, trigger)
+                .run_generation(app, ctx, terminal_emitted, cancel_token, trigger, request)
                 .await;
         });
     }
@@ -745,11 +816,431 @@ impl ResponseEngine {
     async fn run_generation<R: tauri::Runtime>(
         self: Arc<Self>,
         app: AppHandle<R>,
-        turn: ConversationTurn,
         ctx: GenerationContext,
         terminal_emitted: Arc<AtomicBool>,
         cancel_token: CancellationToken,
         trigger: GenerationTrigger,
+        request: ResponseGenerationRequest,
+    ) {
+        let provider = self
+            .provider
+            .lock()
+            .expect("response engine mutex poisoned")
+            .clone();
+        let config = self.current_config();
+        let started_at = Instant::now();
+        let utterance_age_at_generation_start_ms = request
+            .speech_ended_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+
+        if request.automatic
+            && utterance_age_at_generation_start_ms > config.maximum_automatic_generation_age_ms
+        {
+            tracing::info!(
+                session_id = ctx.session_id.value(),
+                generation_id = ctx.generation_id.value(),
+                turn_id = ctx.turn_id.value(),
+                utterance_id = ctx.utterance_id.value(),
+                utterance_revision = ctx.utterance_revision,
+                utterance_age_ms = utterance_age_at_generation_start_ms,
+                maximum_age_ms = config.maximum_automatic_generation_age_ms,
+                "stale_input"
+            );
+            self.clear_if_current(&ctx);
+            return;
+        }
+
+        let built = self.context_builder.build(&request);
+        let trigger_text_hash = format!(
+            "{:x}",
+            Sha256::digest(request.current_remote_utterance.as_bytes())
+        );
+        let now_epoch = epoch_ms();
+        let utterance_finalized_epoch = now_epoch.saturating_sub(
+            trigger
+                .utterance_finalized_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        let speech_ended_epoch = now_epoch.saturating_sub(utterance_age_at_generation_start_ms);
+        let generation_triggered_epoch = now_epoch.saturating_sub(
+            request
+                .created_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        );
+        let mut diagnostics = GenerationDiagnostics {
+            session_id: ctx.session_id,
+            generation_id: ctx.generation_id,
+            turn_id: ctx.turn_id,
+            utterance_id: ctx.utterance_id,
+            utterance_revision: ctx.utterance_revision,
+            provider: provider.provider_name().to_string(),
+            model: config.model,
+            trigger_text: truncate_for_diagnostics(&request.current_remote_utterance, 240),
+            trigger_text_hash,
+            context_utterance_ids: built.context_utterance_ids.clone(),
+            context_turn_count: built.context_turn_count,
+            context_character_count: built.context_character_count,
+            prompt_preview: built.sanitized_preview.clone(),
+            speech_ended_at: speech_ended_epoch,
+            transcription_completed_at: Some(
+                now_epoch.saturating_sub(
+                    request
+                        .transcription_completed_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                ),
+            ),
+            utterance_finalized_at: utterance_finalized_epoch,
+            generation_triggered_at: generation_triggered_epoch,
+            request_started: 0,
+            first_visible_token_at: None,
+            completed_at: 0,
+            utterance_age_at_generation_start_ms,
+            utterance_age_at_first_token_ms: None,
+            http_status: None,
+            first_chunk_received: None,
+            raw_prefix: String::new(),
+            skip_detected: false,
+            echo_suppressed_characters: 0,
+            validation_result: "pending".to_string(),
+            retry_used: false,
+            context_leak_score: 0.0,
+            cancel_reason: None,
+            latency_ms: 0,
+            final_text_length: 0,
+            event_emitted: "started".to_string(),
+            terminal_state: "running".to_string(),
+            finalization_reason: trigger.finalization_reason.clone(),
+            gap_ms_used: trigger.gap_ms_used,
+            silence_detected_ms: trigger.silence_detected_ms,
+            utterance_finalized_to_request_started_ms: None,
+            request_to_first_http_chunk_ms: None,
+            request_to_first_visible_token_ms: None,
+            end_of_speech_to_first_visible_token_ms: None,
+        };
+
+        let request_started_at = Instant::now();
+        diagnostics.request_started = epoch_ms();
+        let mut first_http_chunk_at = None;
+        let mut first_visible_text_at = None;
+
+        macro_rules! finish {
+            () => {{
+                diagnostics.completed_at = epoch_ms();
+                self.finish_generation(
+                    &app,
+                    &ctx,
+                    diagnostics,
+                    started_at,
+                    trigger.utterance_finalized_at,
+                    request_started_at,
+                    first_http_chunk_at,
+                    first_visible_text_at,
+                );
+                return;
+            }};
+        }
+
+        if !self.publish_stream_event(
+            &app,
+            &ctx,
+            ResponseSuggestionEvent::Started {
+                session_id: ctx.session_id,
+                turn_id: ctx.turn_id,
+                utterance_id: ctx.utterance_id,
+                utterance_revision: ctx.utterance_revision,
+                generation_id: ctx.generation_id,
+            },
+        ) {
+            diagnostics.event_emitted = "discarded_stale".to_string();
+            diagnostics.terminal_state = "discarded_stale".to_string();
+            finish!();
+        }
+
+        for attempt in 0..=1 {
+            let attempt_context = if attempt == 0 {
+                built.clone()
+            } else {
+                diagnostics.retry_used = true;
+                self.context_builder.build_repair(&request)
+            };
+            let stream_result = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                    diagnostics.event_emitted = "cancelled".to_string();
+                    diagnostics.terminal_state = "cancelled".to_string();
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Cancelled,
+                        Some(ResponseSuggestionEvent::Cancelled {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            utterance_revision: ctx.utterance_revision,
+                            generation_id: ctx.generation_id,
+                        }),
+                    );
+                    finish!();
+                }
+                result = provider.stream_reply(attempt_context.request) => result,
+            };
+
+            let mut stream = match stream_result {
+                Ok((stream, meta)) => {
+                    diagnostics.http_status = Some(meta.http_status);
+                    stream
+                }
+                Err(error) => {
+                    diagnostics.event_emitted = "error".to_string();
+                    diagnostics.terminal_state = "error".to_string();
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Error,
+                        Some(ResponseSuggestionEvent::Error {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            utterance_revision: ctx.utterance_revision,
+                            generation_id: ctx.generation_id,
+                            message: error.to_string(),
+                        }),
+                    );
+                    finish!();
+                }
+            };
+
+            let mut raw_output = String::new();
+            loop {
+                let next = tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
+                        diagnostics.event_emitted = "cancelled".to_string();
+                        diagnostics.terminal_state = "cancelled".to_string();
+                        self.publish_terminal_event(
+                            &app,
+                            &ctx,
+                            &terminal_emitted,
+                            TerminalState::Cancelled,
+                            Some(ResponseSuggestionEvent::Cancelled {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+                                utterance_id: ctx.utterance_id,
+                                utterance_revision: ctx.utterance_revision,
+                                generation_id: ctx.generation_id,
+                            }),
+                        );
+                        finish!();
+                    }
+                    item = stream.next() => item,
+                };
+                let Some(item) = next else { break };
+                if first_http_chunk_at.is_none() {
+                    first_http_chunk_at = Some(Instant::now());
+                    diagnostics.first_chunk_received = Some(epoch_ms());
+                }
+                match item {
+                    Ok(ResponseChunk::Delta(text)) => raw_output.push_str(&text),
+                    Ok(ResponseChunk::Done) => break,
+                    Err(error) => {
+                        diagnostics.event_emitted = "error".to_string();
+                        diagnostics.terminal_state = "error".to_string();
+                        self.publish_terminal_event(
+                            &app,
+                            &ctx,
+                            &terminal_emitted,
+                            TerminalState::Error,
+                            Some(ResponseSuggestionEvent::Error {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+                                utterance_id: ctx.utterance_id,
+                                utterance_revision: ctx.utterance_revision,
+                                generation_id: ctx.generation_id,
+                                message: error.to_string(),
+                            }),
+                        );
+                        finish!();
+                    }
+                }
+            }
+
+            diagnostics.raw_prefix = raw_output.chars().take(RAW_PREFIX_CAP_CHARS).collect();
+            let mut skip_detector = SkipDetector::new();
+            let skip_decision = match skip_detector.push(&raw_output) {
+                SkipDecision::Pending => skip_detector.finish(),
+                decision => decision,
+            };
+            let trimmed = raw_output.trim();
+            let candidate = if matches!(skip_decision, SkipDecision::Skip)
+                && trimmed.eq_ignore_ascii_case(super::skip_detector::SKIP_MARKER)
+            {
+                trimmed.to_string()
+            } else {
+                let mut echo_guard = EchoGuard::new(&request.current_remote_utterance);
+                let mut guarded = echo_guard.push(&raw_output);
+                guarded.push_str(&echo_guard.finish());
+                diagnostics.echo_suppressed_characters = raw_output
+                    .chars()
+                    .count()
+                    .saturating_sub(guarded.chars().count());
+                guarded
+            };
+            let mut leak_references = request.context_leak_references.clone();
+            if let Some(previous) = request.previous_suggestion.as_ref() {
+                if !leak_references.iter().any(|value| value == previous) {
+                    leak_references.push(previous.clone());
+                }
+            }
+            let validation =
+                if candidate.trim().is_empty() && diagnostics.echo_suppressed_characters > 0 {
+                    SuggestionValidation {
+                        result: Err(SuggestionValidationFailure::EchoOfQuestion),
+                        context_leak_score: 1.0,
+                    }
+                } else {
+                    validate_suggestion(
+                        &candidate,
+                        &request.current_remote_utterance,
+                        &leak_references,
+                    )
+                };
+            diagnostics.context_leak_score = validation.context_leak_score;
+
+            match validation.result {
+                Ok(ValidatedSuggestion::Skip) => {
+                    diagnostics.skip_detected = true;
+                    diagnostics.validation_result = "valid_skip".to_string();
+                    diagnostics.event_emitted = "skipped".to_string();
+                    diagnostics.terminal_state = "skipped".to_string();
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Skipped,
+                        Some(ResponseSuggestionEvent::Skipped {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            utterance_revision: ctx.utterance_revision,
+                            generation_id: ctx.generation_id,
+                        }),
+                    );
+                    finish!();
+                }
+                Ok(ValidatedSuggestion::Text(text)) => {
+                    first_visible_text_at = Some(Instant::now());
+                    diagnostics.first_visible_token_at = Some(epoch_ms());
+                    diagnostics.utterance_age_at_first_token_ms = Some(
+                        request
+                            .speech_ended_at
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
+                    diagnostics.validation_result = "valid".to_string();
+                    diagnostics.final_text_length = text.chars().count();
+                    if !self.publish_stream_event(
+                        &app,
+                        &ctx,
+                        ResponseSuggestionEvent::Delta {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            utterance_revision: ctx.utterance_revision,
+                            generation_id: ctx.generation_id,
+                            text: text.clone(),
+                        },
+                    ) {
+                        diagnostics.event_emitted = "discarded_stale".to_string();
+                        diagnostics.terminal_state = "discarded_stale".to_string();
+                        finish!();
+                    }
+                    self.remember_suggestion_if_current(&ctx, &text);
+                    diagnostics.event_emitted = "completed_with_text".to_string();
+                    diagnostics.terminal_state = "completed".to_string();
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Completed,
+                        Some(ResponseSuggestionEvent::Completed {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            utterance_revision: ctx.utterance_revision,
+                            generation_id: ctx.generation_id,
+                            text,
+                        }),
+                    );
+                    finish!();
+                }
+                Err(failure) if attempt == 0 => {
+                    diagnostics.validation_result = failure.as_str().to_string();
+                    tracing::info!(
+                        session_id = ctx.session_id.value(),
+                        generation_id = ctx.generation_id.value(),
+                        utterance_id = ctx.utterance_id.value(),
+                        validation_result = failure.as_str(),
+                        context_leak_score = diagnostics.context_leak_score,
+                        "invalid suggestion; retrying once"
+                    );
+                }
+                Err(failure) => {
+                    diagnostics.validation_result = failure.as_str().to_string();
+                    diagnostics.event_emitted = "invalid".to_string();
+                    diagnostics.terminal_state = "invalid".to_string();
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Invalid,
+                        Some(ResponseSuggestionEvent::Invalid {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            utterance_revision: ctx.utterance_revision,
+                            generation_id: ctx.generation_id,
+                            failure,
+                        }),
+                    );
+                    finish!();
+                }
+            }
+        }
+    }
+
+    fn remember_suggestion_if_current(&self, ctx: &GenerationContext, text: &str) {
+        let mut state = self.session.lock().expect("response engine mutex poisoned");
+        if state.session_id == ctx.session_id
+            && !state.ending
+            && state
+                .generations
+                .get(&ctx.utterance_id)
+                .is_some_and(|handle| handle.context == *ctx)
+        {
+            state.last_suggestion = Some(text.to_string());
+        }
+    }
+
+    #[cfg(any())]
+    async fn run_generation_legacy<R: tauri::Runtime>(
+        self: Arc<Self>,
+        app: AppHandle<R>,
+        ctx: GenerationContext,
+        terminal_emitted: Arc<AtomicBool>,
+        cancel_token: CancellationToken,
+        trigger: GenerationTrigger,
+        request: ResponseGenerationRequest,
     ) {
         let provider = self
             .provider
@@ -758,25 +1249,28 @@ impl ResponseEngine {
             .clone();
         let model = self.current_config().model;
 
-        // Contexto vem do histórico *da sessão desta geração*. Se a sessão já mudou entre
-        // o disparo e este ponto, não existe contexto legítimo a montar — a geração morre
-        // aqui, sem prompt, sem requisição e sem evento.
-        let Some(history) = self.history_snapshot(ctx.session_id) else {
-            tracing::debug!(
+        let utterance_age_at_generation_start_ms = request
+            .speech_ended_at
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let maximum_age_ms = self.current_config().maximum_automatic_generation_age_ms;
+        if request.automatic && utterance_age_at_generation_start_ms > maximum_age_ms {
+            tracing::info!(
                 session_id = ctx.session_id.value(),
-                turn_id = ctx.turn_id.value(),
                 generation_id = ctx.generation_id.value(),
-                "generation_event_discarded_stale: session changed before context was built"
+                turn_id = ctx.turn_id.value(),
+                utterance_id = ctx.utterance_id.value(),
+                utterance_revision = ctx.utterance_revision,
+                utterance_age_ms = utterance_age_at_generation_start_ms,
+                maximum_age_ms,
+                "stale_input"
             );
             self.clear_if_current(&ctx);
             return;
-        };
-        let built = self.context_builder.build(ResponseContextInput {
-            session_id: ctx.session_id,
-            history: &history,
-            current_turn: &turn,
-            current_utterance_text: &trigger.utterance_text,
-        });
+        }
+
+        let built = self.context_builder.build(&request);
 
         tracing::info!(
             session_id = ctx.session_id.value(),
@@ -1228,10 +1722,8 @@ impl ResponseEngine {
             .map(|t| t.saturating_duration_since(request_started_at).as_millis() as u64);
         diagnostics.request_to_first_visible_token_ms = first_visible_text_at
             .map(|t| t.saturating_duration_since(request_started_at).as_millis() as u64);
-        diagnostics.end_of_speech_to_first_visible_token_ms = first_visible_text_at.map(|t| {
-            t.saturating_duration_since(utterance_finalized_at)
-                .as_millis() as u64
-        });
+        diagnostics.end_of_speech_to_first_visible_token_ms =
+            diagnostics.utterance_age_at_first_token_ms;
         // Marcos gravados com os `Instant` capturados dentro do laço de streaming: pegar o
         // lock do recorder a cada chunk HTTP seria custo no caminho crítico sem ganho, já
         // que o valor medido é o mesmo.
@@ -1258,18 +1750,11 @@ impl ResponseEngine {
         }
 
         tracing::debug!(?diagnostics, "response generation diagnostics");
-        if self.session_is_active(ctx.session_id) {
-            emit_response_suggestion_event(
-                app,
-                ResponseSuggestionEvent::Diagnostics(Box::new(diagnostics)),
-            );
-        } else {
-            tracing::debug!(
-                session_id = ctx.session_id.value(),
-                generation_id = ctx.generation_id.value(),
-                "generation_event_discarded_stale: diagnostics for a finished session"
-            );
-        }
+        let _ = self.publish_stream_event(
+            app,
+            ctx,
+            ResponseSuggestionEvent::Diagnostics(Box::new(diagnostics)),
+        );
         self.clear_if_current(ctx);
     }
 }
@@ -1332,47 +1817,43 @@ pub fn process_conversation_events<R: tauri::Runtime>(
     let utterance_finalized_at = Instant::now();
 
     for event in events {
-        match event {
-            ConversationTimelineEvent::TurnFinalized { turn, session_id } => {
-                engine.push_history(*session_id, turn.clone());
-            }
-            ConversationTimelineEvent::UtteranceFinalized {
-                turn_id,
-                utterance,
-                finalization_reason,
-                gap_ms_used,
-                silence_detected_ms,
-                session_id,
-            } => {
-                tracing::debug!(
-                    session_id = session_id.value(),
-                    turn_id = turn_id.value(),
-                    utterance_id = utterance.id.value(),
-                    utterance_revision = utterance.revision,
-                    reason = finalization_reason.as_str(),
-                    "generation_trigger_received"
-                );
-                if !triggers_generation(*finalization_reason) {
-                    tracing::debug!(
-                        session_id = session_id.value(),
-                        turn_id = turn_id.value(),
-                        reason = finalization_reason.as_str(),
-                        "generation trigger ignored: finalization caused by session/capture teardown"
-                    );
-                    continue;
-                }
-                let Some(turn) = latest_turns.get(turn_id) else {
-                    continue;
-                };
-                if !is_eligible_turn(turn) {
-                    continue;
-                }
+        let ConversationTimelineEvent::UtteranceFinalized {
+            turn_id,
+            utterance,
+            finalization_reason,
+            gap_ms_used,
+            silence_detected_ms,
+            session_id,
+        } = event
+        else {
+            continue;
+        };
+        tracing::debug!(
+            session_id = session_id.value(),
+            turn_id = turn_id.value(),
+            utterance_id = utterance.id.value(),
+            utterance_revision = utterance.revision,
+            reason = finalization_reason.as_str(),
+            "generation_trigger_received"
+        );
+        if !triggers_generation(*finalization_reason) {
+            tracing::debug!(
+                session_id = session_id.value(),
+                turn_id = turn_id.value(),
+                reason = finalization_reason.as_str(),
+                "generation trigger ignored: finalization caused by session/capture teardown"
+            );
+        } else if let Some(turn) = latest_turns.get(turn_id) {
+            if is_eligible_turn(turn) {
                 let trigger = GenerationTrigger {
                     session_id: *session_id,
                     utterance_id: utterance.id,
                     utterance_revision: utterance.revision,
                     utterance_text: utterance.text.clone(),
+                    utterance: utterance.clone(),
                     utterance_finalized_at,
+                    speech_ended_at: utterance.speech_ended_at,
+                    automatic: true,
                     finalization_reason: finalization_reason.as_str().to_string(),
                     gap_ms_used: *gap_ms_used,
                     silence_detected_ms: *silence_detected_ms,
@@ -1381,10 +1862,16 @@ pub fn process_conversation_events<R: tauri::Runtime>(
                     .clone()
                     .trigger_generation(app.clone(), turn.clone(), trigger);
             }
-            _ => {}
         }
+        // O trigger acima materializou o snapshot antes de esta utterance entrar
+        // no historico. Assim a fala atual nunca se duplica no contexto.
+        engine.push_history(*session_id, utterance.clone());
     }
 }
+
+#[cfg(test)]
+#[path = "engine_critical_tests.rs"]
+mod critical_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1425,7 +1912,7 @@ mod tests {
     // This constructor plugs an arbitrary fake `ResponseProvider` directly, bypassing
     // config I/O entirely.
     impl ResponseEngine {
-        fn for_test(provider: Arc<dyn ResponseProvider>) -> Arc<Self> {
+        pub(super) fn for_test(provider: Arc<dyn ResponseProvider>) -> Arc<Self> {
             Arc::new(ResponseEngine {
                 provider: Mutex::new(provider),
                 context_builder: Arc::new(super::super::context::DefaultResponseContextBuilder),
@@ -1611,6 +2098,7 @@ mod tests {
             speaker,
             source,
             text: text.to_string(),
+            raw_text: text.to_string(),
             utterances: Vec::new(),
             started_at: AudioTimestamp(0),
             ended_at: AudioTimestamp(1_000),
@@ -1625,6 +2113,24 @@ mod tests {
             AudioSource::SystemOutput,
             text,
         )
+    }
+
+    fn remote_utterance(id: u64, text: &str) -> ConversationUtterance {
+        ConversationUtterance {
+            id: UtteranceId::from_raw(id),
+            speaker: ConversationSpeaker::OtherPerson,
+            source: AudioSource::SystemOutput,
+            text: text.to_string(),
+            raw_text: text.to_string(),
+            segments: vec![SegmentId::next()],
+            received_sequence: id,
+            started_at: AudioTimestamp(id * 1_000),
+            ended_at: AudioTimestamp(id * 1_000 + 500),
+            finalized_at: Some(AudioTimestamp(id * 1_000 + 500)),
+            revision: 1,
+            transcription_completed_at: Instant::now(),
+            speech_ended_at: Instant::now(),
+        }
     }
 
     /// Lote de eventos equivalente ao que a timeline emite quando uma utterance finaliza
@@ -1648,16 +2154,19 @@ mod tests {
         reason: UtteranceFinalizationReason,
     ) -> Vec<ConversationTimelineEvent> {
         let utterance = ConversationUtterance {
-            id: UtteranceId::from_raw(1),
+            id: UtteranceId::from_raw(turn.id.value()),
             speaker: turn.speaker,
             source: turn.source,
             text: utterance_text.to_string(),
+            raw_text: utterance_text.to_string(),
             segments: vec![SegmentId::next()],
-            received_sequence: 1,
+            received_sequence: turn.id.value(),
             started_at: turn.started_at,
             ended_at: turn.ended_at,
             finalized_at: Some(turn.ended_at),
             revision: 1,
+            transcription_completed_at: Instant::now(),
+            speech_ended_at: Instant::now(),
         };
         vec![
             ConversationTimelineEvent::UtteranceFinalized {
@@ -2293,11 +2802,14 @@ Acho que depende do tamanho do time.",
         let engine = ResponseEngine::for_test(FakeProvider::with_text("ok"));
         let stale_session = SessionId::new();
 
-        engine.push_history(stale_session, remote_turn(1, "fala da sessão anterior"));
+        engine.push_history(
+            stale_session,
+            remote_utterance(1, "fala da sessão anterior"),
+        );
         assert_eq!(engine.history_len_for_test(), 0);
 
         let active = engine.active_session_id();
-        engine.push_history(active, remote_turn(2, "fala da sessão ativa"));
+        engine.push_history(active, remote_utterance(2, "fala da sessão ativa"));
         assert_eq!(engine.history_len_for_test(), 1);
     }
 
@@ -2305,7 +2817,7 @@ Acho que depende do tamanho do time.",
     async fn history_snapshot_is_none_for_a_stale_session() {
         let engine = ResponseEngine::for_test(FakeProvider::with_text("ok"));
         let first = engine.active_session_id();
-        engine.push_history(first, remote_turn(1, "fala"));
+        engine.push_history(first, remote_utterance(1, "fala"));
         assert!(engine.history_snapshot(first).is_some());
 
         engine.end_session(first);
