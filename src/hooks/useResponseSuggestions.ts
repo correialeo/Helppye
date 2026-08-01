@@ -18,6 +18,16 @@ export function useResponseSuggestions() {
 
   useEffect(() => {
     const unlistenPromise = onResponseSuggestionEvent((event) => {
+      // A sessão é aberta antes de `SessionScreen` (e, nas janelas destacadas, antes da
+      // própria janela) montar. Eventos Tauri não são replayados, então o listener pode
+      // legitimamente nunca ter visto `session_started`. O primeiro evento de resposta é
+      // uma fronteira segura para adotar: o backend já valida `session_id` antes de cada
+      // publicação e nunca emite eventos de uma sessão encerrada. Sem esta adoção,
+      // `activeSessionId` ficava `undefined` e started/completed/diagnostics eram todos
+      // descartados apesar de a geração ter terminado no backend.
+      if (activeSessionId.current === undefined) {
+        activeSessionId.current = event.session_id;
+      }
       if (event.session_id !== activeSessionId.current) return;
       setSuggestions((current) =>
         applyResponseSuggestionEvent(current, event, activeSessionId.current),
