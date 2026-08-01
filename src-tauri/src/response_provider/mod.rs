@@ -28,7 +28,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
 use config_store::{ResponseProviderConfig, ResponseProviderKind};
-use engine::ResponseEngine;
+use engine::{GenerationRejectionRecord, ResponseEngine};
 use secrets::SecretError;
 
 pub struct ResponseEngineState(pub Arc<ResponseEngine>);
@@ -212,4 +212,15 @@ pub async fn response_delete_api_key_command(
     secrets::delete_api_key(provider).map_err(secret_error_message)?;
     state.0.reload_provider_if_current(provider);
     Ok(())
+}
+
+/// Último motivo de rejeição de um gatilho automático de geração, se houver. Exposto para
+/// o painel de "Modo de desenvolvedor" (mesmo padrão de
+/// `conversation_get_utterance_gap_ms_command`): sem isso, uma utterance elegível que não
+/// dispara geração some sem deixar rastro visível para diagnóstico fora de logs de backend.
+#[tauri::command]
+pub async fn response_last_rejection_command(
+    state: State<'_, ResponseEngineState>,
+) -> Result<Option<GenerationRejectionRecord>, String> {
+    Ok(state.0.last_rejection())
 }

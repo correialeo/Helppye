@@ -258,6 +258,7 @@ pub fn run() {
             response_provider::response_set_provider_config_command,
             response_provider::response_set_api_key_command,
             response_provider::response_delete_api_key_command,
+            response_provider::response_last_rejection_command,
             transcription::configure_transcription_command,
             transcription::transcription_diagnostics_command,
             transcription::transcription_providers_command,

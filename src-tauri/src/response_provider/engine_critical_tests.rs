@@ -267,3 +267,186 @@ async fn noisy_prior_user_speech_cannot_become_the_high_availability_answer() {
     assert!(!answer.contains("Vou te mandar uma pergunta"));
     assert_eq!(provider.count.load(Ordering::SeqCst), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Fio de ponta a ponta: `ConversationTimeline` real (com o timer dedicado de
+// utterance) até o `ResponseEngine`, exatamente como `lib.rs` conecta os dois via
+// `set_event_sink`. Todos os testes acima disparam `trigger_generation` ou
+// `process_conversation_events` diretamente com um `ConversationTimelineEvent`
+// já pronto — nenhum exercitava o caminho que a produção realmente usa: captura
+// → `ConversationTimeline::ingest_normalized_transcript` → timer de silêncio →
+// sink → `process_conversation_events`. É exatamente essa lacuna que escondia o
+// defeito relatado (utterance finalizada, turno elegível, nenhuma geração).
+mod end_to_end_trigger {
+    use std::time::Duration;
+
+    use super::{next_event, ResponseEngine, SequenceProvider};
+    use crate::audio::segment::{AudioTimestamp, SegmentId};
+    use crate::audio::types::{AudioSource, CaptureStreamId};
+    use crate::conversation::{ConversationAssemblerConfig, ConversationTimeline, SessionId};
+    use crate::normalization::TranscriptNormalizationResult;
+    use crate::response_provider::engine::process_conversation_events;
+    use crate::transcription::envelope::TranscriptionResultEnvelope;
+    use crate::transcription::events::{FinalTranscript, ProviderEventId, TranscriptPayload};
+    use crate::transcription::provider::TranscriptionProviderId;
+    use crate::transcription::session::TranscriptionSessionId;
+
+    /// `same_speaker_utterance_gap_ms` curto o suficiente para o teste não esperar quase 2s
+    /// por chamada, longo o suficiente para não competir com o agendamento do runtime.
+    const TEST_GAP_MS: u64 = 60;
+
+    fn envelope_and_transcript(
+        session_id: SessionId,
+        source: AudioSource,
+        stream: CaptureStreamId,
+        sequence: u64,
+        text: &str,
+        start: u64,
+        end: u64,
+    ) -> (TranscriptionResultEnvelope, FinalTranscript) {
+        let envelope = TranscriptionResultEnvelope {
+            session_id,
+            segment_id: SegmentId::next(),
+            source,
+            capture_stream_id: stream,
+            sequence_number: sequence,
+            raw_text: text.to_string(),
+            normalized_text: text.to_string(),
+        };
+        let transcript = FinalTranscript(TranscriptPayload {
+            session_id,
+            transcription_session_id: TranscriptionSessionId::next(),
+            source,
+            provider: TranscriptionProviderId::WhisperLocal,
+            language: Some("pt".into()),
+            text: text.to_string(),
+            started_at: AudioTimestamp(start),
+            ended_at: AudioTimestamp(end),
+            confidence: Some(0.9),
+            is_final: true,
+            provider_event_id: ProviderEventId::new(&format!("evt-{sequence}")),
+            segment_id: None,
+            processing_time_ms: Some(12),
+        });
+        (envelope, transcript)
+    }
+
+    /// Espelha exatamente a conexão que `lib.rs` registra em produção via
+    /// `timeline.set_event_sink`: toda finalização (reativa ou pelo timer dedicado) chega
+    /// ao `ResponseEngine` pelo mesmo caminho, sem passar por nenhum atalho de teste.
+    fn wire_timeline_to_engine(
+        timeline: &std::sync::Arc<ConversationTimeline>,
+        engine: std::sync::Arc<ResponseEngine>,
+        app: tauri::AppHandle<tauri::test::MockRuntime>,
+    ) {
+        timeline.set_event_sink(std::sync::Arc::new(move |events| {
+            process_conversation_events(&app, engine.clone(), &events);
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_remote_utterance_finalized_by_the_dedicated_timer_reaches_the_response_engine() {
+        let provider = SequenceProvider::new(&["resposta sugerida"]);
+        let engine = ResponseEngine::for_test(provider.clone());
+
+        let mut config = ConversationAssemblerConfig::default();
+        config.same_speaker_utterance_gap_ms = TEST_GAP_MS;
+        let timeline = std::sync::Arc::new(ConversationTimeline::new(config));
+        timeline.attach();
+        // Mesmo alinhamento de fronteira que `lib.rs` faz no boot
+        // (`response_engine.begin_session(timeline.session_id())`): a sessão que importa
+        // é a da timeline, não a que `ResponseEngine::for_test` cunhou sozinho.
+        let session = timeline.session_id();
+        engine.begin_session(session);
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut suggestion_events = super::capture(&handle);
+        wire_timeline_to_engine(&timeline, engine.clone(), handle);
+
+        let stream = CaptureStreamId::next();
+        let (envelope, transcript) = envelope_and_transcript(
+            session,
+            AudioSource::SystemOutput,
+            stream,
+            1,
+            "em qual situação você usaria monolitos?",
+            0,
+            1_500,
+        );
+        let normalization = TranscriptNormalizationResult::unchanged(transcript.0.text.clone());
+        timeline.ingest_normalized_transcript(
+            &envelope,
+            &transcript,
+            &normalization,
+            std::time::Instant::now(),
+        );
+
+        // O turno permanece aberto — a utterance finaliza só por silêncio, via o timer
+        // dedicado, sem nenhum outro segmento, flush ou stop de captura.
+        let started = next_event(&mut suggestion_events, "started").await;
+        assert_eq!(started["session_id"], session.value());
+        let completed = next_event(&mut suggestion_events, "completed").await;
+        assert_eq!(completed["text"], "resposta sugerida");
+    }
+
+    #[tokio::test]
+    async fn a_remote_utterance_inside_a_still_open_turn_is_eligible_for_generation() {
+        let provider = SequenceProvider::new(&["resposta sugerida"]);
+        let engine = ResponseEngine::for_test(provider.clone());
+
+        let mut config = ConversationAssemblerConfig::default();
+        config.same_speaker_utterance_gap_ms = TEST_GAP_MS;
+        let timeline = std::sync::Arc::new(ConversationTimeline::new(config));
+        timeline.attach();
+        let session = timeline.session_id();
+        engine.begin_session(session);
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut suggestion_events = super::capture(&handle);
+        wire_timeline_to_engine(&timeline, engine.clone(), handle);
+
+        let stream = CaptureStreamId::next();
+        for (index, question) in [
+            "em qual situação você usaria monolitos?",
+            "em qual situação você usaria microserviços?",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (envelope, transcript) = envelope_and_transcript(
+                session,
+                AudioSource::SystemOutput,
+                stream,
+                index as u64 + 1,
+                question,
+                index as u64 * 2_000,
+                index as u64 * 2_000 + 1_500,
+            );
+            let normalization = TranscriptNormalizationResult::unchanged(transcript.0.text.clone());
+            timeline.ingest_normalized_transcript(
+                &envelope,
+                &transcript,
+                &normalization,
+                std::time::Instant::now(),
+            );
+            // Gap curto entre os dois segmentos: continuam a mesma utterance, não
+            // disparam o timer entre eles.
+            tokio::time::sleep(Duration::from_millis(TEST_GAP_MS / 3)).await;
+        }
+
+        let snapshot = timeline.snapshot();
+        assert!(
+            snapshot
+                .turns
+                .iter()
+                .any(|turn| turn.finalized_at.is_none()),
+            "o turno segue aberto: só a utterance finaliza por silêncio"
+        );
+
+        let started = next_event(&mut suggestion_events, "started").await;
+        assert_eq!(started["session_id"], session.value());
+        next_event(&mut suggestion_events, "completed").await;
+    }
+}

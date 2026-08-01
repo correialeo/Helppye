@@ -56,6 +56,80 @@ pub struct GenerationContext {
     pub generation_id: GenerationId,
 }
 
+/// Todo motivo pelo qual um gatilho de geração automática **não** vira uma geração.
+/// Nenhum ponto de decisão retorna em silêncio: cada `return`/`continue` early no
+/// caminho do gatilho grava um destes valores via `ResponseEngine::record_rejection`,
+/// consultável em modo de desenvolvedor (`response_last_rejection_command`) mesmo quando
+/// nenhum evento chega a ser publicado. Nem toda variante tem hoje um ponto de código que
+/// a produz — ver `docs/response-suggestion.md`, seção "Motivos de rejeição de geração",
+/// para o que é alcançável agora e o que é reservado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationRejectionReason {
+    /// Não há sessão de conversa ativa no motor (encerrando ou nunca iniciada).
+    NoActiveSession,
+    /// O gatilho pertence a uma sessão diferente da sessão ativa do motor.
+    WrongSession,
+    /// O turno da utterance não é de `ConversationSpeaker::OtherPerson`.
+    WrongSpeaker,
+    /// O turno da utterance não é de `AudioSource::SystemOutput`.
+    WrongSource,
+    /// Reservado: hoje só `ConversationTimelineEvent::UtteranceFinalized` chega a este
+    /// caminho, então uma utterance ainda aberta não tem como disparar o gatilho.
+    UtteranceNotFinalized,
+    /// Já existe uma geração em andamento para a mesma utterance com uma revisão mais
+    /// nova — o gatilho chegou fora de ordem e não pode substituir para trás.
+    RevisionMismatch,
+    /// Já existe uma geração (em andamento ou recém-concluída) para exatamente a mesma
+    /// `(turn_id, utterance_id, utterance_revision)` — reentrega/duplicata do gatilho.
+    AlreadyProcessed,
+    /// A utterance envelheceu demais entre a finalização e o início da geração
+    /// automática (`maximum_automatic_generation_age_ms`).
+    StaleInput,
+    /// Reservado: a normalização de transcrição roda antes da Conversation Timeline: uma
+    /// utterance finalizada sempre carrega `text` (mesmo que a normalização não tenha
+    /// mudado nada), então este caminho não tem hoje um produtor real.
+    MissingNormalizedText,
+    /// Reservado: o motor sempre tem um `ResponseContextBuilder` configurado na
+    /// construção; não existe estado runtime em que ele fique ausente.
+    MissingGenerationEngine,
+    /// Reservado: um provedor mal configurado hoje falha na chamada HTTP em si
+    /// (`TerminalState::Error`, depois de `started` já ter sido publicado), não antes do
+    /// gatilho — não há hoje uma checagem de disponibilidade prévia ao `started`.
+    ProviderUnavailable,
+}
+
+impl GenerationRejectionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoActiveSession => "no_active_session",
+            Self::WrongSession => "wrong_session",
+            Self::WrongSpeaker => "wrong_speaker",
+            Self::WrongSource => "wrong_source",
+            Self::UtteranceNotFinalized => "utterance_not_finalized",
+            Self::RevisionMismatch => "revision_mismatch",
+            Self::AlreadyProcessed => "already_processed",
+            Self::StaleInput => "stale_input",
+            Self::MissingNormalizedText => "missing_normalized_text",
+            Self::MissingGenerationEngine => "missing_generation_engine",
+            Self::ProviderUnavailable => "provider_unavailable",
+        }
+    }
+}
+
+/// Último motivo de rejeição observado pelo motor, para modo de desenvolvedor. Não é
+/// escopado por sessão de propósito: o objetivo é diagnosticar "por que nada apareceu",
+/// inclusive quando a rejeição aconteceu antes de qualquer `session_id` ficar disponível
+/// para comparação (ex.: `NoActiveSession`).
+#[derive(Debug, Clone, Serialize)]
+pub struct GenerationRejectionRecord {
+    pub reason: GenerationRejectionReason,
+    pub turn_id: Option<u64>,
+    pub utterance_id: Option<u64>,
+    pub detail: String,
+    pub at_epoch_ms: u64,
+}
+
 /// Estados terminais possíveis de uma geração. Exatamente um acontece por geração, e
 /// apenas os quatro primeiros viram evento para o frontend — `Superseded` já foi
 /// anunciado como `cancelled` por quem substituiu a geração, e `SessionEnded` não pode
@@ -415,6 +489,11 @@ pub struct ResponseEngine {
     config_path: PathBuf,
     session: Mutex<SessionState>,
     next_generation_id: AtomicU64,
+    /// Último motivo de rejeição de um gatilho automático, para diagnóstico em modo de
+    /// desenvolvedor. Deliberadamente fora do `Mutex<SessionState>`: uma rejeição por
+    /// `NoActiveSession`/`WrongSession` acontece justamente quando não há uma sessão
+    /// coerente para amarrar o registro.
+    last_rejection: Mutex<Option<GenerationRejectionRecord>>,
 }
 
 impl ResponseEngine {
@@ -432,7 +511,49 @@ impl ResponseEngine {
             config_path,
             session: Mutex::new(SessionState::new(SessionId::new())),
             next_generation_id: AtomicU64::new(0),
+            last_rejection: Mutex::new(None),
         }
+    }
+
+    /// Grava o motivo de uma rejeição e loga em `warn` — o ponto único que garante que
+    /// nenhum `return` early do caminho de gatilho automático é silencioso (spec: "nunca
+    /// faça return silencioso").
+    fn record_rejection(
+        &self,
+        reason: GenerationRejectionReason,
+        turn_id: Option<TurnId>,
+        utterance_id: Option<UtteranceId>,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        tracing::warn!(
+            reason = reason.as_str(),
+            turn_id = turn_id.map(|id| id.value()),
+            utterance_id = utterance_id.map(|id| id.value()),
+            detail = %detail,
+            "generation_rejected"
+        );
+        let mut last_rejection = self
+            .last_rejection
+            .lock()
+            .expect("response engine mutex poisoned");
+        *last_rejection = Some(GenerationRejectionRecord {
+            reason,
+            turn_id: turn_id.map(|id| id.value()),
+            utterance_id: utterance_id.map(|id| id.value()),
+            detail,
+            at_epoch_ms: epoch_ms(),
+        });
+    }
+
+    /// Último motivo de rejeição de geração automática — para o painel de modo de
+    /// desenvolvedor mostrar "por que nada apareceu" mesmo quando nenhum evento de
+    /// sugestão chegou a ser publicado.
+    pub fn last_rejection(&self) -> Option<GenerationRejectionRecord> {
+        self.last_rejection
+            .lock()
+            .expect("response engine mutex poisoned")
+            .clone()
     }
 
     /// Sessão ativa do motor. Deve espelhar `ConversationTimeline::session_id`; as duas só
@@ -625,6 +746,12 @@ impl ResponseEngine {
 
     /// Publica **o** estado terminal da geração, no máximo uma vez (`terminal_emitted`
     /// funciona como trava de dupla finalização) e só se a sessão ainda for a ativa.
+    ///
+    /// Diferente de `publish_stream_event`, não exige que a geração ainda esteja
+    /// registrada em `state.generations`: uma geração superseded é removida do mapa
+    /// pelo chamador (`trigger_generation`) antes de publicar o `cancelled` dela — exigir
+    /// presença no mapa aqui tornaria esse `cancelled` estruturalmente impossível de
+    /// publicar. A trava real contra dupla finalização é `terminal_emitted`.
     fn publish_terminal_event<R: tauri::Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -634,13 +761,7 @@ impl ResponseEngine {
         event: Option<ResponseSuggestionEvent>,
     ) -> bool {
         let state = self.session.lock().expect("response engine mutex poisoned");
-        let publishable = state.session_id == ctx.session_id
-            && !state.ending
-            && !state.cancel.is_cancelled()
-            && state
-                .generations
-                .get(&ctx.utterance_id)
-                .is_some_and(|handle| handle.context == *ctx);
+        let publishable = state.session_id == ctx.session_id && !state.ending;
         if !publishable {
             tracing::debug!(
                 session_id = ctx.session_id.value(),
@@ -698,12 +819,28 @@ impl ResponseEngine {
         trigger: &GenerationTrigger,
     ) -> Option<ResponseGenerationRequest> {
         let state = self.session.lock().expect("response engine mutex poisoned");
-        if state.session_id != trigger.session_id || state.ending {
-            tracing::warn!(
-                trigger_session_id = trigger.session_id.value(),
-                active_session_id = state.session_id.value(),
-                turn_id = turn_id.value(),
-                "generation_rejected_wrong_session"
+        if state.ending {
+            drop(state);
+            self.record_rejection(
+                GenerationRejectionReason::NoActiveSession,
+                Some(turn_id),
+                Some(trigger.utterance_id),
+                "session is ending",
+            );
+            return None;
+        }
+        if state.session_id != trigger.session_id {
+            let active_session_id = state.session_id;
+            drop(state);
+            self.record_rejection(
+                GenerationRejectionReason::WrongSession,
+                Some(turn_id),
+                Some(trigger.utterance_id),
+                format!(
+                    "trigger session {} != active session {}",
+                    trigger.session_id.value(),
+                    active_session_id.value()
+                ),
             );
             return None;
         }
@@ -752,21 +889,64 @@ impl ResponseEngine {
         let (cancel_token, superseded) = {
             let mut state = self.session.lock().expect("response engine mutex poisoned");
             if state.session_id != ctx.session_id {
-                tracing::warn!(
-                    trigger_session_id = ctx.session_id.value(),
-                    active_session_id = state.session_id.value(),
-                    turn_id = ctx.turn_id.value(),
-                    "generation_rejected_wrong_session"
+                let active_session_id = state.session_id;
+                drop(state);
+                self.record_rejection(
+                    GenerationRejectionReason::WrongSession,
+                    Some(ctx.turn_id),
+                    Some(ctx.utterance_id),
+                    format!(
+                        "trigger session {} != active session {}",
+                        ctx.session_id.value(),
+                        active_session_id.value()
+                    ),
                 );
                 return;
             }
             if state.ending {
-                tracing::info!(
-                    session_id = ctx.session_id.value(),
-                    turn_id = ctx.turn_id.value(),
-                    "generation_rejected_wrong_session: session is ending"
+                drop(state);
+                self.record_rejection(
+                    GenerationRejectionReason::NoActiveSession,
+                    Some(ctx.turn_id),
+                    Some(ctx.utterance_id),
+                    "session is ending",
                 );
                 return;
+            }
+            // Reentrega/duplicata do mesmo gatilho (mesma chave `turn_id + utterance_id +
+            // utterance_revision`), ou um gatilho fora de ordem para uma revisão mais
+            // velha que a que já está em andamento: nenhum dos dois pode substituir a
+            // geração já registrada para esta utterance.
+            if let Some(existing) = state.generations.get(&ctx.utterance_id) {
+                let existing_generation_id = existing.context.generation_id;
+                let existing_revision = existing.context.utterance_revision;
+                if existing_revision == ctx.utterance_revision {
+                    drop(state);
+                    self.record_rejection(
+                        GenerationRejectionReason::AlreadyProcessed,
+                        Some(ctx.turn_id),
+                        Some(ctx.utterance_id),
+                        format!(
+                            "generation {} already tracks utterance_revision {}",
+                            existing_generation_id.value(),
+                            ctx.utterance_revision
+                        ),
+                    );
+                    return;
+                }
+                if existing_revision > ctx.utterance_revision {
+                    drop(state);
+                    self.record_rejection(
+                        GenerationRejectionReason::RevisionMismatch,
+                        Some(ctx.turn_id),
+                        Some(ctx.utterance_id),
+                        format!(
+                            "trigger revision {} is older than tracked revision {}",
+                            ctx.utterance_revision, existing_revision
+                        ),
+                    );
+                    return;
+                }
             }
             let cancel_token = state.cancel.child_token();
             let previous_key = state.generations.iter().find_map(|(utterance_id, handle)| {
@@ -838,17 +1018,17 @@ impl ResponseEngine {
         if request.automatic
             && utterance_age_at_generation_start_ms > config.maximum_automatic_generation_age_ms
         {
-            tracing::info!(
-                session_id = ctx.session_id.value(),
-                generation_id = ctx.generation_id.value(),
-                turn_id = ctx.turn_id.value(),
-                utterance_id = ctx.utterance_id.value(),
-                utterance_revision = ctx.utterance_revision,
-                utterance_age_ms = utterance_age_at_generation_start_ms,
-                maximum_age_ms = config.maximum_automatic_generation_age_ms,
-                "stale_input"
-            );
             self.clear_if_current(&ctx);
+            self.record_rejection(
+                GenerationRejectionReason::StaleInput,
+                Some(ctx.turn_id),
+                Some(ctx.utterance_id),
+                format!(
+                    "utterance_age_ms {} > maximum_age_ms {}",
+                    utterance_age_at_generation_start_ms,
+                    config.maximum_automatic_generation_age_ms
+                ),
+            );
             return;
         }
 
@@ -948,7 +1128,7 @@ impl ResponseEngine {
             }};
         }
 
-        if !self.publish_stream_event(
+        let published = self.publish_stream_event(
             &app,
             &ctx,
             ResponseSuggestionEvent::Started {
@@ -958,7 +1138,8 @@ impl ResponseEngine {
                 utterance_revision: ctx.utterance_revision,
                 generation_id: ctx.generation_id,
             },
-        ) {
+        );
+        if !published {
             diagnostics.event_emitted = "discarded_stale".to_string();
             diagnostics.terminal_state = "discarded_stale".to_string();
             finish!();
@@ -1101,19 +1282,20 @@ impl ResponseEngine {
                     leak_references.push(previous.clone());
                 }
             }
-            let validation =
-                if candidate.trim().is_empty() && diagnostics.echo_suppressed_characters > 0 {
-                    SuggestionValidation {
-                        result: Err(SuggestionValidationFailure::EchoOfQuestion),
-                        context_leak_score: 1.0,
-                    }
-                } else {
-                    validate_suggestion(
-                        &candidate,
-                        &request.current_remote_utterance,
-                        &leak_references,
-                    )
-                };
+            let candidate_is_full_echo =
+                candidate.trim().is_empty() && diagnostics.echo_suppressed_characters > 0;
+            let validation = if candidate_is_full_echo {
+                SuggestionValidation {
+                    result: Err(SuggestionValidationFailure::EchoOfQuestion),
+                    context_leak_score: 1.0,
+                }
+            } else {
+                validate_suggestion(
+                    &candidate,
+                    &request.current_remote_utterance,
+                    &leak_references,
+                )
+            };
             diagnostics.context_leak_score = validation.context_leak_score;
 
             match validation.result {
@@ -1149,24 +1331,32 @@ impl ResponseEngine {
                     );
                     diagnostics.validation_result = "valid".to_string();
                     diagnostics.final_text_length = text.chars().count();
-                    if !self.publish_stream_event(
-                        &app,
-                        &ctx,
-                        ResponseSuggestionEvent::Delta {
-                            session_id: ctx.session_id,
-                            turn_id: ctx.turn_id,
-                            utterance_id: ctx.utterance_id,
-                            utterance_revision: ctx.utterance_revision,
-                            generation_id: ctx.generation_id,
-                            text: text.clone(),
-                        },
-                    ) {
+                    if !text.is_empty()
+                        && !self.publish_stream_event(
+                            &app,
+                            &ctx,
+                            ResponseSuggestionEvent::Delta {
+                                session_id: ctx.session_id,
+                                turn_id: ctx.turn_id,
+                                utterance_id: ctx.utterance_id,
+                                utterance_revision: ctx.utterance_revision,
+                                generation_id: ctx.generation_id,
+                                text: text.clone(),
+                            },
+                        )
+                    {
                         diagnostics.event_emitted = "discarded_stale".to_string();
                         diagnostics.terminal_state = "discarded_stale".to_string();
                         finish!();
                     }
-                    self.remember_suggestion_if_current(&ctx, &text);
-                    diagnostics.event_emitted = "completed_with_text".to_string();
+                    if !text.is_empty() {
+                        self.remember_suggestion_if_current(&ctx, &text);
+                    }
+                    diagnostics.event_emitted = if text.is_empty() {
+                        "completed_empty".to_string()
+                    } else {
+                        "completed_with_text".to_string()
+                    };
                     diagnostics.terminal_state = "completed".to_string();
                     self.publish_terminal_event(
                         &app,
@@ -1194,6 +1384,32 @@ impl ResponseEngine {
                         context_leak_score = diagnostics.context_leak_score,
                         "invalid suggestion; retrying once"
                     );
+                }
+                Err(SuggestionValidationFailure::EchoOfQuestion) if candidate_is_full_echo => {
+                    // A retry já foi usada e o modelo devolveu o mesmo eco integral de
+                    // novo: não há resposta real para mostrar, mas também não há nada
+                    // para vazar (o texto visível é vazio). Termina como conclusão
+                    // vazia, não como erro — retry de novo só produziria o mesmo eco.
+                    diagnostics.validation_result = SuggestionValidationFailure::EchoOfQuestion
+                        .as_str()
+                        .to_string();
+                    diagnostics.event_emitted = "completed_empty".to_string();
+                    diagnostics.terminal_state = "completed".to_string();
+                    self.publish_terminal_event(
+                        &app,
+                        &ctx,
+                        &terminal_emitted,
+                        TerminalState::Completed,
+                        Some(ResponseSuggestionEvent::Completed {
+                            session_id: ctx.session_id,
+                            turn_id: ctx.turn_id,
+                            utterance_id: ctx.utterance_id,
+                            utterance_revision: ctx.utterance_revision,
+                            generation_id: ctx.generation_id,
+                            text: String::new(),
+                        }),
+                    );
+                    finish!();
                 }
                 Err(failure) => {
                     diagnostics.validation_result = failure.as_str().to_string();
@@ -1861,6 +2077,20 @@ pub fn process_conversation_events<R: tauri::Runtime>(
                 engine
                     .clone()
                     .trigger_generation(app.clone(), turn.clone(), trigger);
+            } else if turn.speaker != ConversationSpeaker::OtherPerson {
+                engine.record_rejection(
+                    GenerationRejectionReason::WrongSpeaker,
+                    Some(*turn_id),
+                    Some(utterance.id),
+                    format!("turn speaker is {:?}, not OtherPerson", turn.speaker),
+                );
+            } else {
+                engine.record_rejection(
+                    GenerationRejectionReason::WrongSource,
+                    Some(*turn_id),
+                    Some(utterance.id),
+                    format!("turn source is {:?}, not SystemOutput", turn.source),
+                );
             }
         }
         // O trigger acima materializou o snapshot antes de esta utterance entrar
@@ -1920,6 +2150,7 @@ mod tests {
                 config_path: PathBuf::from("unused-in-tests.json"),
                 session: Mutex::new(SessionState::new(SessionId::new())),
                 next_generation_id: AtomicU64::new(0),
+                last_rejection: Mutex::new(None),
             })
         }
 
@@ -2184,6 +2415,47 @@ mod tests {
         ]
     }
 
+    /// Como `utterance_finalized_batch_in`, mas com um `utterance_id` explícito e distinto
+    /// do id derivado do turno. Necessário para simular corretamente uma **segunda**
+    /// utterance finalizando dentro do mesmo turno ainda aberto: no pipeline real, cada
+    /// utterance finalizada tem seu próprio `UtteranceId` (mesmo turn_id, id diferente) —
+    /// usar `utterance_finalized_batch_in` duas vezes para o mesmo turno reenvia o
+    /// *mesmo* `utterance_id` (derivado de `turn.id`), que representa reentrega/duplicata
+    /// e é corretamente rejeitada como `AlreadyProcessed`, não uma segunda fala real.
+    fn utterance_finalized_batch_with_utterance_id(
+        turn: &ConversationTurn,
+        utterance_id: u64,
+        session_id: SessionId,
+    ) -> Vec<ConversationTimelineEvent> {
+        let utterance = ConversationUtterance {
+            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
+            id: UtteranceId::from_raw(utterance_id),
+            speaker: turn.speaker,
+            source: turn.source,
+            text: turn.text.clone(),
+            raw_text: turn.text.clone(),
+            segments: vec![SegmentId::next()],
+            received_sequence: utterance_id,
+            started_at: turn.started_at,
+            ended_at: turn.ended_at,
+            finalized_at: Some(turn.ended_at),
+            revision: 1,
+            transcription_completed_at: Instant::now(),
+            speech_ended_at: Instant::now(),
+        };
+        vec![
+            ConversationTimelineEvent::UtteranceFinalized {
+                turn_id: turn.id,
+                utterance,
+                finalization_reason: UtteranceFinalizationReason::InactivityTimeout,
+                gap_ms_used: 1_800,
+                silence_detected_ms: Some(1_800),
+                session_id,
+            },
+            ConversationTimelineEvent::TurnUpdated { turn: turn.clone() },
+        ]
+    }
+
     fn capture_events(
         app: &AppHandle<tauri::test::MockRuntime>,
     ) -> mpsc::UnboundedReceiver<serde_json::Value> {
@@ -2365,7 +2637,10 @@ mod tests {
             &utterance_finalized_batch_in(&remote, session),
         );
 
-        wait_for_event_type(&mut rx, "started").await;
+        // Um único "started" para as duas tentativas: para o frontend, é a mesma
+        // geração (mesmo generation_id) só sendo re-tentada internamente — anunciar
+        // "started" de novo não teria efeito (o reducer ignora um started repetido para
+        // o mesmo generation_id) e só adicionaria ruído.
         wait_for_event_type(&mut rx, "started").await;
         let completed = wait_for_event_type(&mut rx, "completed").await;
 
@@ -2454,13 +2729,17 @@ mod tests {
         let first_started = wait_for_event_type(&mut rx, "started").await;
         let first_generation_id = first_started["generation_id"].clone();
 
-        // A pessoa continua falando no mesmo turno: uma segunda utterance finaliza para o
-        // mesmo turn_id enquanto a primeira geração (que nunca produz nada, de propósito)
-        // ainda está em andamento.
+        // A pessoa continua falando no mesmo turno: uma segunda utterance (id distinto,
+        // mesmo turn_id) finaliza enquanto a primeira geração (que nunca produz nada, de
+        // propósito) ainda está em andamento.
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch_in(&remote, session),
+            &utterance_finalized_batch_with_utterance_id(
+                &remote,
+                remote.id.value() + 1000,
+                session,
+            ),
         );
 
         let cancelled = wait_for_event_type(&mut rx, "cancelled").await;
@@ -2494,7 +2773,11 @@ mod tests {
         process_conversation_events(
             &handle,
             engine.clone(),
-            &utterance_finalized_batch_in(&remote, session),
+            &utterance_finalized_batch_with_utterance_id(
+                &remote,
+                remote.id.value() + 1000,
+                session,
+            ),
         );
 
         let events = drain_for(&mut rx, QUIET_WINDOW).await;
@@ -2788,9 +3071,15 @@ Acho que depende do tamanho do time.",
         assert!(current_speech.contains("Me conta um caso real"));
         let context_block =
             &prompt[prompt.find(super::super::context::CONTEXT_HEADER).unwrap()..speech_start];
+        // O contexto não é mais formado a partir do texto acumulado do turno (ver
+        // `docs/response-suggestion.md`, "Contrato atual de isolamento e publicação"): só
+        // utterances finalizadas e separadas entram, e só quando a fala atual contém uma
+        // referência explícita que precisa de antecedente. "Perfeito." nunca virou uma
+        // utterance própria aqui, então não pode vazar para o contexto — isso seria
+        // exatamente o vazamento de contexto obsoleto que a36744c fechou.
         assert!(
-            context_block.contains("Perfeito."),
-            "o que veio antes na mesma fala continua disponível como contexto"
+            !context_block.contains("Perfeito."),
+            "texto de dentro do mesmo turno não pode vazar para o contexto sem ser sua própria utterance finalizada"
         );
         assert!(
             !context_block.contains("Me conta um caso real"),
@@ -2934,10 +3223,19 @@ Acho que depende do tamanho do time.",
             &utterance_finalized_batch_in(&remote_turn(1, "pergunta lenta"), session_a),
         );
         wait_for_event_type(&mut rx, "started").await;
+        // Texto não validado não é mais publicado incrementalmente (ver
+        // `docs/response-suggestion.md`, "Contrato atual de isolamento e publicação"): não
+        // há `delta` intermediário para esperar. Em vez disso, dá tempo para a task
+        // consumir o chunk e provar que a geração está mesmo em andamento antes da
+        // fronteira de sessão.
         chunks
             .send(ResponseChunk::Delta("primeira parte ".to_string()))
             .unwrap();
-        wait_for_event_type(&mut rx, "delta").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !chunks.is_closed(),
+            "com a geração viva, o stream ainda está sendo lido"
+        );
 
         // Usuário encerra a sessão com a geração ainda em andamento e abre outra na
         // sequência (cenário C da validação manual).
@@ -2978,10 +3276,12 @@ Acho que depende do tamanho do time.",
             &utterance_finalized_batch_in(&remote_turn(1, "pergunta longa"), session),
         );
         wait_for_event_type(&mut rx, "started").await;
+        // Texto não validado não é mais publicado incrementalmente, então não há `delta`
+        // intermediário para esperar aqui — só dar tempo para a task consumir o chunk.
         chunks
             .send(ResponseChunk::Delta("começando".to_string()))
             .unwrap();
-        wait_for_event_type(&mut rx, "delta").await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
             !chunks.is_closed(),
             "com a geração viva, o stream ainda está sendo lido"
