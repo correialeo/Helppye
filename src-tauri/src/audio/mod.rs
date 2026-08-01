@@ -16,12 +16,13 @@ pub mod vad;
 
 use std::sync::Arc;
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use engine::{CaptureEngine, DeviceSelectionSnapshot};
 use pipeline::MicrophoneCaptureProvider;
 use platform::SystemAudioProvider;
-use types::{AudioDevice, AudioSource};
+use types::{AudioCaptureEvent, AudioDevice, AudioSource};
 
 use crate::conversation::{emit_conversation_events, ConversationTimeline};
 use crate::transcription::queue::TranscriptionQueue;
@@ -30,6 +31,52 @@ const CAPTURE_EVENT: &str = "audio://capture-event";
 const DEVICE_SELECTION_FILENAME: &str = "device_selection.json";
 
 pub struct CaptureEngineState(pub Arc<CaptureEngine>);
+
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AudioCaptureFrontendEvent<'a> {
+    Started {
+        device: &'a AudioDevice,
+    },
+    Frame {
+        source: AudioSource,
+        level_db: f32,
+    },
+    DeviceDisconnected {
+        source: AudioSource,
+        device_id: &'a str,
+    },
+    Error {
+        source: AudioSource,
+        message: &'a str,
+    },
+    Stopped {
+        source: AudioSource,
+    },
+}
+
+fn frontend_event(event: &AudioCaptureEvent) -> AudioCaptureFrontendEvent<'_> {
+    match event {
+        AudioCaptureEvent::Started { device } => AudioCaptureFrontendEvent::Started { device },
+        AudioCaptureEvent::Frame(frame) => AudioCaptureFrontendEvent::Frame {
+            source: frame.source,
+            level_db: level_meter::rms_dbfs(&frame.samples),
+        },
+        AudioCaptureEvent::DeviceDisconnected { source, device_id } => {
+            AudioCaptureFrontendEvent::DeviceDisconnected {
+                source: *source,
+                device_id,
+            }
+        }
+        AudioCaptureEvent::Error { source, message } => AudioCaptureFrontendEvent::Error {
+            source: *source,
+            message,
+        },
+        AudioCaptureEvent::Stopped { source } => {
+            AudioCaptureFrontendEvent::Stopped { source: *source }
+        }
+    }
+}
 
 /// Constrói o `CaptureEngine` gerenciado — chamado uma vez em `.setup()`. Único ponto
 /// deste módulo que toca o `AppHandle` diretamente (resolução do diretório de dados do
@@ -56,7 +103,7 @@ pub fn build(
         config_path,
         initial_selection,
         Arc::new(move |event| {
-            if let Err(e) = app_handle.emit(CAPTURE_EVENT, &event) {
+            if let Err(e) = app_handle.emit(CAPTURE_EVENT, frontend_event(&event)) {
                 tracing::warn!(%e, "failed to emit audio capture event to frontend");
             }
             let conversation_events = conversation_timeline.ingest_capture_event(&event);

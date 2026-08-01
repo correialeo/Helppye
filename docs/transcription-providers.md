@@ -52,7 +52,10 @@ A sessão **não devolve** o resultado por retorno de função. Ela emite evento
 `TranscriptionSessionContext`, que carrega a identidade (`session_id`,
 `transcription_session_id`, `source`) e o canal de saída. É o que permite a um backend
 batch emitir um `Final` por chunk e a um backend de streaming emitir dez `Partial` e um
-`Final` sem que o contrato mude.
+`Final` sem que o contrato mude. O ingresso também respeita essa diferença: providers
+com `streaming: true` recebem os frames contínuos da captura; providers batch recebem
+somente segmentos confirmados pelo VAD. A troca de modo é uma fronteira dura e nunca
+reaproveita áudio acumulado no provider anterior.
 
 ### Capacidades declaradas, não descobertas
 
@@ -175,7 +178,11 @@ que um chunk novo reabriria uma sessão recém-cancelada.
 
 ### Falha de uma fonte não derruba a outra
 
-As duas fontes compartilham provider, runtime e fila. O microfone é o caminho que mais falha
+As duas fontes compartilham o provider e o runtime, mas têm filas limitadas e locks de
+sessão independentes. Assim, uma chamada lenta de `push_audio` do microfone não segura a
+saída do sistema. O encerramento de cada fonte percorre a própria fila depois de todo
+áudio aceito, impedindo que um segmento atrasado reabra uma sessão já finalizada. O
+microfone é o caminho que mais falha
 na prática (dispositivo trocado, permissão revogada) e é o menos importante dos dois: quem
 faz a pergunta é a outra pessoa, pela saída do sistema. Uma falha de microfone que levasse a
 saída do sistema junto produziria uma reunião inteira sem sugestão nenhuma e sem nada na
@@ -202,6 +209,15 @@ duas escolhas e tornaria essa combinação inexprimível. Coberto por
 
 Comandos Tauri: `transcription_providers_command`, `transcription_settings_command`,
 `transcription_set_settings_command`, `transcription_diagnostics_command`.
+
+As configurações são persistidas por substituição atômica em
+`transcription_provider.json`. Provider e settings ativos formam uma única configuração
+no runtime; uma troca cancela as duas sessões de fonte e invalida suas identidades antes
+de aceitar áudio novo. Cada item enfileirado leva a revisão monotônica da configuração;
+áudio da revisão anterior é descartado e contabilizado em
+`discarded_stale_configuration`, nunca entregue ao provider novo. Credenciais e parâmetros de transporte de providers remotos ainda
+não pertencem a esse arquivo e devem usar keychain e configuração tipada quando esses
+providers forem implementados.
 
 ## Como adicionar um backend
 

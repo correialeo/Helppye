@@ -10,7 +10,7 @@ import {
   stopCapture as stopCaptureCommand,
 } from "../services/audioService";
 import { useAudioCaptureStore } from "../stores/useAudioCaptureStore";
-import { dbfsToPercent, rmsDbfs } from "../utils/audio";
+import { dbfsToPercent } from "../utils/audio";
 import type { AudioSourceKind } from "../types/audio";
 
 const SOURCES: AudioSourceKind[] = ["microphone", "system_output"];
@@ -65,7 +65,7 @@ export function AudioCaptureProvider() {
       if (event.type === "started") {
         patch(source, { status: { kind: "capturing" } });
       } else if (event.type === "frame") {
-        patch(source, { levelDb: rmsDbfs(event.samples), status: { kind: "capturing" } });
+        patch(source, { levelDb: event.level_db, status: { kind: "capturing" } });
         const timers = decayTimers.current;
         if (timers[source] !== undefined) window.clearTimeout(timers[source]);
         timers[source] = window.setTimeout(() => patch(source, { levelDb: -Infinity }), 300);

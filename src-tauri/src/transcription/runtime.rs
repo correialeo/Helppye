@@ -25,7 +25,6 @@
 //! deixaria uma janela em que um chunk novo reabriria uma sessão que acabou de ser
 //! cancelada.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -36,7 +35,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 
 use crate::audio::segment::{AudioSegment, SegmentId};
-use crate::audio::types::AudioSource;
+use crate::audio::types::{AudioSource, CaptureStreamId};
 use crate::conversation::SessionId;
 use crate::integrity::{
     text_hash, IntegrityStage, IntegrityStatus, OriginIntegrityLog, OriginObservation,
@@ -54,7 +53,7 @@ use crate::transcription::envelope::{
 };
 use crate::transcription::error::TranscriptionError;
 use crate::transcription::events::{FinalTranscript, ProviderEventId, TranscriptionEvent};
-use crate::transcription::provider::TranscriptionProvider;
+use crate::transcription::provider::{TranscriptionCapabilities, TranscriptionProvider};
 use crate::transcription::session::{
     AudioChunk, TranscriptionSession, TranscriptionSessionContext, TranscriptionSessionId,
 };
@@ -126,6 +125,7 @@ struct RuntimeCounters {
     discarded_stale_session: AtomicU64,
     discarded_stale_transcription_session: AtomicU64,
     discarded_duplicate: AtomicU64,
+    discarded_stale_configuration: AtomicU64,
     push_errors: AtomicU64,
 }
 
@@ -137,6 +137,7 @@ pub struct TranscriptionRuntimeStats {
     pub discarded_stale_session: u64,
     pub discarded_stale_transcription_session: u64,
     pub discarded_duplicate: u64,
+    pub discarded_stale_configuration: u64,
     pub push_errors: u64,
 }
 
@@ -147,12 +148,21 @@ pub struct TranscriptionRuntimeStats {
 #[derive(Default)]
 struct Gate {
     session_id: Option<SessionId>,
-    active: HashMap<AudioSource, TranscriptionSessionId>,
+    active: HashMap<AudioSource, ActiveTranscriptionIdentity>,
     seen: HashMap<TranscriptionSessionId, (HashSet<ProviderEventId>, VecDeque<ProviderEventId>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveTranscriptionIdentity {
+    session_id: TranscriptionSessionId,
+    capture_stream_id: CaptureStreamId,
+}
+
 impl Gate {
-    fn accept(&mut self, event: &TranscriptionEvent) -> Result<(), DiscardReason> {
+    fn accept(
+        &mut self,
+        event: &TranscriptionEvent,
+    ) -> Result<ActiveTranscriptionIdentity, DiscardReason> {
         let Some(current) = self.session_id else {
             return Err(DiscardReason::NoActiveSession);
         };
@@ -160,10 +170,10 @@ impl Gate {
             return Err(DiscardReason::StaleSession);
         }
         let transcription_session_id = event.transcription_session_id();
-        match self.active.get(&event.source()) {
-            Some(active) if *active == transcription_session_id => {}
+        let active = match self.active.get(&event.source()).copied() {
+            Some(active) if active.session_id == transcription_session_id => active,
             _ => return Err(DiscardReason::StaleTranscriptionSession),
-        }
+        };
         if let Some(event_id) = event.provider_event_id() {
             let (set, order) = self.seen.entry(transcription_session_id).or_default();
             if !set.insert(event_id.clone()) {
@@ -176,13 +186,34 @@ impl Gate {
                 }
             }
         }
-        Ok(())
+        Ok(active)
     }
 }
 
 struct ActiveSession {
     id: TranscriptionSessionId,
     session: Box<dyn TranscriptionSession>,
+}
+
+struct SourceSessions {
+    microphone: AsyncMutex<Option<ActiveSession>>,
+    system_output: AsyncMutex<Option<ActiveSession>>,
+}
+
+impl SourceSessions {
+    fn new() -> Self {
+        SourceSessions {
+            microphone: AsyncMutex::new(None),
+            system_output: AsyncMutex::new(None),
+        }
+    }
+
+    fn get(&self, source: AudioSource) -> &AsyncMutex<Option<ActiveSession>> {
+        match source {
+            AudioSource::Microphone => &self.microphone,
+            AudioSource::SystemOutput => &self.system_output,
+        }
+    }
 }
 
 /// Uma fila de identidades pendentes **por fluxo de captura**, nunca uma fila global.
@@ -255,9 +286,18 @@ fn resolve_pending_identity(
         .map(|identity| (identity, IdentityResolution::ByStreamFifo))
 }
 
+struct RuntimeConfiguration {
+    provider: Arc<dyn TranscriptionProvider>,
+    settings: TranscriptionSettings,
+}
+
 pub struct TranscriptionRuntime {
-    provider: StdMutex<Arc<dyn TranscriptionProvider>>,
-    settings: StdMutex<TranscriptionSettings>,
+    /// Provider e settings precisam mudar como uma unidade. Duas travas permitiam abrir
+    /// uma sessão com provider novo e modelo/idioma antigos durante troca dinâmica.
+    configuration: StdMutex<RuntimeConfiguration>,
+    /// Monotonic routing epoch captured by queue items. A provider swap must
+    /// never feed already-buffered audio into the replacement provider.
+    configuration_revision: AtomicU64,
     normalizer: StdMutex<Arc<dyn TranscriptNormalizer>>,
     correction_mode: StdMutex<TranscriptCorrectionMode>,
     /// `None` em toda build atual — ver `normalization::correction`. O campo existe para que
@@ -266,7 +306,9 @@ pub struct TranscriptionRuntime {
     recent_texts: Arc<StdMutex<VecDeque<String>>>,
     pending_segment_timings: Arc<StdMutex<PendingSegmentTimings>>,
     gate: Arc<StdMutex<Gate>>,
-    sessions: AsyncMutex<HashMap<AudioSource, ActiveSession>>,
+    /// Uma trava por fonte. Providers de rede podem bloquear em I/O; isso jamais deve
+    /// impedir a outra fonte de alimentar sua própria sessão.
+    sessions: SourceSessions,
     sink: TranscriptionOutputSink,
     counters: Arc<RuntimeCounters>,
     telemetry: Arc<TelemetryRecorder>,
@@ -315,15 +357,17 @@ impl TranscriptionRuntime {
         origin_log: Arc<OriginIntegrityLog>,
     ) -> Self {
         TranscriptionRuntime {
-            provider: StdMutex::new(provider),
-            settings: StdMutex::new(settings),
+            configuration: StdMutex::new(RuntimeConfiguration { provider, settings }),
+            // Even revisions are stable; odd revisions mean a provider swap
+            // is in progress and all ingress must be rejected.
+            configuration_revision: AtomicU64::new(0),
             normalizer: StdMutex::new(Arc::new(DeterministicNormalizer::default())),
             correction_mode: StdMutex::new(TranscriptCorrectionMode::default()),
             corrector: StdMutex::new(None),
             recent_texts: Arc::new(StdMutex::new(VecDeque::new())),
             pending_segment_timings: Arc::new(StdMutex::new(HashMap::new())),
             gate: Arc::new(StdMutex::new(Gate::default())),
-            sessions: AsyncMutex::new(HashMap::new()),
+            sessions: SourceSessions::new(),
             sink,
             counters: Arc::new(RuntimeCounters::default()),
             telemetry,
@@ -340,22 +384,102 @@ impl TranscriptionRuntime {
     }
 
     pub fn settings(&self) -> TranscriptionSettings {
-        self.settings.lock().expect("settings mutex").clone()
+        self.configuration
+            .lock()
+            .expect("transcription configuration mutex")
+            .settings
+            .clone()
+    }
+
+    pub fn configuration_revision(&self) -> u64 {
+        self.configuration_revision.load(Ordering::Acquire)
+    }
+
+    fn is_stale_configuration(&self, expected_revision: Option<u64>) -> bool {
+        let current_revision = self.configuration_revision();
+        let stale = current_revision % 2 == 1
+            || expected_revision.is_some_and(|expected| expected != current_revision);
+        if stale {
+            self.counters
+                .discarded_stale_configuration
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        stale
     }
 
     /// Trocar configuração **não** reconfigura uma sessão já aberta: a nova valeria a partir
     /// da próxima sessão de transcrição. Reconfigurar no meio produziria uma sessão cujo
     /// começo e fim foram transcritos por backends diferentes.
     pub fn set_settings(&self, settings: TranscriptionSettings) {
-        *self.settings.lock().expect("settings mutex") = settings;
+        self.configuration
+            .lock()
+            .expect("transcription configuration mutex")
+            .settings = settings;
     }
 
     pub fn provider_id(&self) -> crate::transcription::provider::TranscriptionProviderId {
-        self.provider.lock().expect("provider mutex").id()
+        self.configuration
+            .lock()
+            .expect("transcription configuration mutex")
+            .provider
+            .id()
+    }
+
+    pub fn provider_capabilities(&self) -> TranscriptionCapabilities {
+        self.configuration
+            .lock()
+            .expect("transcription configuration mutex")
+            .provider
+            .capabilities()
     }
 
     pub fn set_provider(&self, provider: Arc<dyn TranscriptionProvider>) {
-        *self.provider.lock().expect("provider mutex") = provider;
+        self.configuration
+            .lock()
+            .expect("transcription configuration mutex")
+            .provider = provider;
+    }
+
+    pub fn set_provider_and_settings(
+        &self,
+        provider: Arc<dyn TranscriptionProvider>,
+        settings: TranscriptionSettings,
+    ) {
+        *self
+            .configuration
+            .lock()
+            .expect("transcription configuration mutex") =
+            RuntimeConfiguration { provider, settings };
+    }
+
+    /// Troca dinâmica: invalida primeiro as identidades antigas, instala provider e
+    /// settings atomicamente e só então cancela as sessões por fonte. O próximo item de
+    /// cada lane abre uma sessão nova; nenhum evento do provider anterior atravessa a
+    /// fronteira.
+    pub async fn reconfigure(
+        &self,
+        provider: Arc<dyn TranscriptionProvider>,
+        settings: TranscriptionSettings,
+    ) {
+        {
+            let mut gate = self.gate.lock().expect("gate mutex");
+            // The revision transition and event-gate invalidation share this
+            // critical section with `open_session`, which is the linearization
+            // point for the swap.
+            self.configuration_revision.fetch_add(1, Ordering::AcqRel);
+            gate.active.clear();
+            gate.seen.clear();
+        }
+        self.pending_segment_timings
+            .lock()
+            .expect("segment timing mutex")
+            .clear();
+        tokio::join!(
+            self.cancel_source_session(AudioSource::Microphone),
+            self.cancel_source_session(AudioSource::SystemOutput),
+        );
+        self.set_provider_and_settings(provider, settings);
+        self.configuration_revision.fetch_add(1, Ordering::Release);
     }
 
     pub fn set_normalizer(&self, normalizer: Arc<dyn TranscriptNormalizer>) {
@@ -403,6 +527,10 @@ impl TranscriptionRuntime {
                 .discarded_stale_transcription_session
                 .load(Ordering::Relaxed),
             discarded_duplicate: self.counters.discarded_duplicate.load(Ordering::Relaxed),
+            discarded_stale_configuration: self
+                .counters
+                .discarded_stale_configuration
+                .load(Ordering::Relaxed),
             push_errors: self.counters.push_errors.load(Ordering::Relaxed),
         }
     }
@@ -446,11 +574,19 @@ impl TranscriptionRuntime {
         // 2. Cancela os providers. `cancel`, não `finish`: encerrar sessão significa jogar
         //    fora o que estava em voo, não drenar mais resultados para uma conversa que já
         //    acabou.
-        let mut sessions = self.sessions.lock().await;
-        for (source, mut active) in sessions.drain() {
-            if let Err(e) = active.session.cancel().await {
-                debug!(?source, %e, "erro ao cancelar sessão de transcrição");
-            }
+        tokio::join!(
+            self.cancel_source_session(AudioSource::Microphone),
+            self.cancel_source_session(AudioSource::SystemOutput),
+        );
+    }
+
+    async fn cancel_source_session(&self, source: AudioSource) {
+        let mut slot = self.sessions.get(source).lock().await;
+        let Some(mut active) = slot.take() else {
+            return;
+        };
+        if let Err(error) = active.session.cancel().await {
+            debug!(?source, %error, "erro ao cancelar sessão de transcrição");
         }
     }
 
@@ -461,8 +597,8 @@ impl TranscriptionRuntime {
     /// continua cancelando, porque lá a conversa acabou e o que estava em voo não interessa
     /// mais.
     pub async fn finish_source(&self, source: AudioSource) {
-        let active = self.sessions.lock().await.remove(&source);
-        let Some(mut active) = active else {
+        let mut slot = self.sessions.get(source).lock().await;
+        let Some(mut active) = slot.take() else {
             return;
         };
         if let Err(e) = active.session.finish().await {
@@ -471,7 +607,11 @@ impl TranscriptionRuntime {
         // Só depois de drenar: remover do gate antes faria o próprio resultado que o
         // `finish` acabou de liberar ser descartado como sessão de transcrição obsoleta.
         let mut gate = self.gate.lock().expect("gate mutex");
-        if gate.active.get(&source) == Some(&active.id) {
+        if gate
+            .active
+            .get(&source)
+            .is_some_and(|identity| identity.session_id == active.id)
+        {
             gate.active.remove(&source);
         }
     }
@@ -516,8 +656,40 @@ impl TranscriptionRuntime {
         &self,
         item: TranscriptionWorkItem,
     ) -> Result<(), TranscriptionError> {
+        let revision = self.configuration_revision();
+        self.push_work_item_inner(item, Some(revision)).await
+    }
+
+    pub async fn push_work_item_for_revision(
+        &self,
+        item: TranscriptionWorkItem,
+        expected_revision: u64,
+    ) -> Result<(), TranscriptionError> {
+        self.push_work_item_inner(item, Some(expected_revision))
+            .await
+    }
+
+    async fn push_work_item_inner(
+        &self,
+        item: TranscriptionWorkItem,
+        expected_revision: Option<u64>,
+    ) -> Result<(), TranscriptionError> {
+        if self.is_stale_configuration(expected_revision) {
+            return Err(TranscriptionError::Cancelled);
+        }
         let identity = item.identity();
         let key = item.stream_key();
+        let trace = self
+            .telemetry
+            .begin_or_current(item.session_id, item.source);
+        self.telemetry.link_segment(trace, item.segment_id);
+        self.telemetry.record_attributes(
+            trace,
+            TraceAttributes {
+                transcription_queue_wait_ms: Some(item.enqueued_at.elapsed_ms()),
+                ..Default::default()
+            },
+        );
         self.pending_segment_timings
             .lock()
             .expect("segment timing mutex")
@@ -525,7 +697,9 @@ impl TranscriptionRuntime {
             .or_default()
             .push_back(identity);
 
-        let result = self.push_chunk(AudioChunk::from_segment(item.audio)).await;
+        let result = self
+            .push_chunk_inner(AudioChunk::from_segment(item.audio), expected_revision)
+            .await;
         if result.is_err() {
             if let Some(pending) = self
                 .pending_segment_timings
@@ -540,6 +714,23 @@ impl TranscriptionRuntime {
     }
 
     pub async fn push_chunk(&self, chunk: AudioChunk) -> Result<(), TranscriptionError> {
+        let revision = self.configuration_revision();
+        self.push_chunk_inner(chunk, Some(revision)).await
+    }
+
+    pub async fn push_chunk_for_revision(
+        &self,
+        chunk: AudioChunk,
+        expected_revision: u64,
+    ) -> Result<(), TranscriptionError> {
+        self.push_chunk_inner(chunk, Some(expected_revision)).await
+    }
+
+    async fn push_chunk_inner(
+        &self,
+        chunk: AudioChunk,
+        expected_revision: Option<u64>,
+    ) -> Result<(), TranscriptionError> {
         let Some(session_id) = self.active_session_id() else {
             debug!(
                 source = ?chunk.source,
@@ -550,6 +741,7 @@ impl TranscriptionRuntime {
         };
 
         let source = chunk.source;
+        let capture_stream_id = chunk.capture_stream_id;
         // O trace da fala nasce aqui, no primeiro chunk, e é o mesmo que o motor de resposta
         // vai fechar lá na frente — é o que permite medir "fim da fala → token visível"
         // atravessando três subsistemas.
@@ -560,11 +752,17 @@ impl TranscriptionRuntime {
             self.telemetry.link_segment(trace, segment_id);
         }
 
-        let mut sessions = self.sessions.lock().await;
-        let active = match sessions.entry(source) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(self.open_session(session_id, source).await?),
-        };
+        let mut slot = self.sessions.get(source).lock().await;
+        if self.is_stale_configuration(expected_revision) {
+            return Err(TranscriptionError::Cancelled);
+        }
+        if slot.is_none() {
+            *slot = Some(
+                self.open_session(session_id, source, capture_stream_id, expected_revision)
+                    .await?,
+            );
+        }
+        let active = slot.as_mut().expect("session inserted above");
         match active.session.push_audio(chunk).await {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -572,7 +770,7 @@ impl TranscriptionRuntime {
                 // Uma sessão que já não aceita áudio é substituída na próxima entrada em vez
                 // de manter uma sessão morta ocupando a fonte.
                 if matches!(e, TranscriptionError::SessionClosed) {
-                    sessions.remove(&source);
+                    *slot = None;
                     self.gate.lock().expect("gate mutex").active.remove(&source);
                 }
                 Err(e)
@@ -584,9 +782,19 @@ impl TranscriptionRuntime {
         &self,
         session_id: SessionId,
         source: AudioSource,
+        capture_stream_id: CaptureStreamId,
+        expected_revision: Option<u64>,
     ) -> Result<ActiveSession, TranscriptionError> {
-        let provider = Arc::clone(&*self.provider.lock().expect("provider mutex"));
-        let settings = self.settings();
+        let (provider, settings) = {
+            let configuration = self
+                .configuration
+                .lock()
+                .expect("transcription configuration mutex");
+            (
+                Arc::clone(&configuration.provider),
+                configuration.settings.clone(),
+            )
+        };
         let transcription_session_id = TranscriptionSessionId::next();
 
         // Registrar no gate **antes** de abrir a sessão: um provider pode emitir um evento
@@ -594,10 +802,19 @@ impl TranscriptionRuntime {
         // sessão como ativa.
         {
             let mut gate = self.gate.lock().expect("gate mutex");
+            if self.is_stale_configuration(expected_revision) {
+                return Err(TranscriptionError::Cancelled);
+            }
             if gate.session_id != Some(session_id) {
                 return Err(TranscriptionError::SessionClosed);
             }
-            gate.active.insert(source, transcription_session_id);
+            gate.active.insert(
+                source,
+                ActiveTranscriptionIdentity {
+                    session_id: transcription_session_id,
+                    capture_stream_id,
+                },
+            );
         }
 
         let context = TranscriptionSessionContext {
@@ -616,7 +833,11 @@ impl TranscriptionRuntime {
             }),
             Err(e) => {
                 let mut gate = self.gate.lock().expect("gate mutex");
-                if gate.active.get(&source) == Some(&transcription_session_id) {
+                if gate
+                    .active
+                    .get(&source)
+                    .is_some_and(|identity| identity.session_id == transcription_session_id)
+                {
                     gate.active.remove(&source);
                 }
                 Err(e)
@@ -631,40 +852,50 @@ impl TranscriptionRuntime {
         let normalizer = Arc::clone(&*self.normalizer.lock().expect("normalizer mutex"));
         let correction_mode = *self.correction_mode.lock().expect("correction mode mutex");
         let telemetry = Arc::clone(&self.telemetry);
-        let provider_id = self.provider_id();
-        let model = self.settings().model;
+        let (provider_id, model) = {
+            let configuration = self
+                .configuration
+                .lock()
+                .expect("transcription configuration mutex");
+            (
+                configuration.provider.id(),
+                configuration.settings.model.clone(),
+            )
+        };
         let corrector = self.corrector.lock().expect("corrector mutex").clone();
         let recent_texts = Arc::clone(&self.recent_texts);
         let pending_segment_timings = Arc::clone(&self.pending_segment_timings);
         let origin_log = Arc::clone(&self.origin_log);
 
         Arc::new(move |event: TranscriptionEvent| {
-            let decision = gate.lock().expect("gate mutex").accept(&event);
-            if let Err(reason) = decision {
-                let counter = match reason {
-                    DiscardReason::NoActiveSession => &counters.discarded_no_session,
-                    DiscardReason::StaleSession => &counters.discarded_stale_session,
-                    DiscardReason::StaleTranscriptionSession => {
-                        &counters.discarded_stale_transcription_session
-                    }
-                    DiscardReason::DuplicateEvent => &counters.discarded_duplicate,
-                };
-                counter.fetch_add(1, Ordering::Relaxed);
-                debug!(
-                    ?reason,
-                    session_id = event.session_id().value(),
-                    transcription_session_id = event.transcription_session_id().0,
-                    source = ?event.source(),
-                    "evento de transcrição descartado no backend"
-                );
-                downstream(TranscriptionRuntimeOutput::Discarded {
-                    reason,
-                    session_id: event.session_id(),
-                    transcription_session_id: event.transcription_session_id(),
-                    source: event.source(),
-                });
-                return;
-            }
+            let active_identity = match gate.lock().expect("gate mutex").accept(&event) {
+                Ok(identity) => identity,
+                Err(reason) => {
+                    let counter = match reason {
+                        DiscardReason::NoActiveSession => &counters.discarded_no_session,
+                        DiscardReason::StaleSession => &counters.discarded_stale_session,
+                        DiscardReason::StaleTranscriptionSession => {
+                            &counters.discarded_stale_transcription_session
+                        }
+                        DiscardReason::DuplicateEvent => &counters.discarded_duplicate,
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        ?reason,
+                        session_id = event.session_id().value(),
+                        transcription_session_id = event.transcription_session_id().0,
+                        source = ?event.source(),
+                        "evento de transcrição descartado no backend"
+                    );
+                    downstream(TranscriptionRuntimeOutput::Discarded {
+                        reason,
+                        session_id: event.session_id(),
+                        transcription_session_id: event.transcription_session_id(),
+                        source: event.source(),
+                    });
+                    return;
+                }
+            };
 
             // O trace já existe (foi aberto em `push_chunk` para esta sessão/fonte);
             // `begin_or_current` aqui é uma busca, não uma criação.
@@ -712,7 +943,7 @@ impl TranscriptionRuntime {
                             session_id: transcript.session_id,
                             segment_id: transcript.segment_id.unwrap_or_else(SegmentId::next),
                             source: transcript.source,
-                            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
+                            capture_stream_id: active_identity.capture_stream_id,
                             sequence_number: 0,
                             captured_at: MonotonicTimestamp::now(),
                             enqueued_at: MonotonicTimestamp::now(),
@@ -781,16 +1012,12 @@ impl TranscriptionRuntime {
                             telemetry.mark(trace, Milestone::NormalizationCompleted);
                             remember(&recent_texts, &corrected.normalized_text);
                             counters.accepted_finals.fetch_add(1, Ordering::Relaxed);
-                            let envelope = TranscriptionResultEnvelope::from_identity(
-                                identity,
-                                corrected.raw_text.clone(),
-                                corrected.normalized_text.clone(),
-                            );
+                            let envelope = TranscriptionResultEnvelope::from_identity(identity);
                             record_origin_observation(
                                 &origin_log,
                                 &identity,
                                 &transcript,
-                                &envelope,
+                                &corrected,
                                 resolution,
                             );
                             downstream(TranscriptionRuntimeOutput::Final(Box::new(
@@ -828,16 +1055,12 @@ impl TranscriptionRuntime {
                 );
                 telemetry.record_text(trace, &normalization.normalized_text);
                 counters.accepted_finals.fetch_add(1, Ordering::Relaxed);
-                let envelope = TranscriptionResultEnvelope::from_identity(
-                    identity,
-                    normalization.raw_text.clone(),
-                    normalization.normalized_text.clone(),
-                );
+                let envelope = TranscriptionResultEnvelope::from_identity(identity);
                 record_origin_observation(
                     &origin_log,
                     &identity,
                     &transcript,
-                    &envelope,
+                    &normalization,
                     resolution,
                 );
                 downstream(TranscriptionRuntimeOutput::Final(Box::new(
@@ -855,8 +1078,11 @@ impl TranscriptionRuntime {
     /// Só para diagnósticos: qual sessão de transcrição está viva em cada fonte.
     pub fn active_transcription_sessions(&self) -> Vec<(AudioSource, TranscriptionSessionId)> {
         let gate = self.gate.lock().expect("gate mutex");
-        let mut out: Vec<(AudioSource, TranscriptionSessionId)> =
-            gate.active.iter().map(|(s, id)| (*s, *id)).collect();
+        let mut out: Vec<(AudioSource, TranscriptionSessionId)> = gate
+            .active
+            .iter()
+            .map(|(source, identity)| (*source, identity.session_id))
+            .collect();
         out.sort_by_key(|(_, id)| id.0);
         out
     }
@@ -879,7 +1105,7 @@ fn record_origin_observation(
     origin_log: &OriginIntegrityLog,
     identity: &PendingSegmentIdentity,
     transcript: &FinalTranscript,
-    envelope: &TranscriptionResultEnvelope,
+    normalization: &TranscriptNormalizationResult,
     resolution: IdentityResolution,
 ) {
     origin_log.record(OriginObservation {
@@ -895,8 +1121,8 @@ fn record_origin_observation(
         audio_started_at_ms: transcript.started_at.0,
         audio_ended_at_ms: transcript.ended_at.0,
         transcription_completed_at_ms: identity.enqueued_at.elapsed_ms(),
-        raw_text_hash: text_hash(&envelope.raw_text),
-        normalized_text_hash: text_hash(&envelope.normalized_text),
+        raw_text_hash: text_hash(&normalization.raw_text),
+        normalized_text_hash: text_hash(&normalization.normalized_text),
         cross_source_similarity: None,
         integrity_status: match resolution {
             IdentityResolution::BySegmentId => IntegrityStatus::Ok,
@@ -939,6 +1165,8 @@ mod tests {
     fn chunk(source: AudioSource) -> AudioChunk {
         AudioChunk {
             source,
+            capture_stream_id: CaptureStreamId::UNASSIGNED,
+            sequence_number: 0,
             samples: vec![0.0; 160],
             sample_rate: 16_000,
             started_at: AudioTimestamp(0),
@@ -1320,8 +1548,8 @@ mod tests {
         let active = runtime.active_transcription_sessions();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].0, AudioSource::Microphone);
-        let sessions = runtime.sessions.lock().await;
-        assert_eq!(sessions[&AudioSource::Microphone].id(), active[0].1);
+        let session = runtime.sessions.get(AudioSource::Microphone).lock().await;
+        assert_eq!(session.as_ref().unwrap().id(), active[0].1);
     }
 
     /// As duas fontes compartilham provider, runtime e fila. O microfone é o caminho que
@@ -1372,6 +1600,87 @@ mod tests {
             "nenhuma das duas sessões foi derrubada"
         );
         assert_eq!(log.cancel_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_provider_io_on_one_source_does_not_block_the_other_source() {
+        let (out, sink) = collector();
+        let (runtime, _log) = runtime_with(
+            FakeBehavior::EmitsFinalAfter {
+                text: "resultado".into(),
+                delay: Duration::from_millis(120),
+            },
+            sink,
+        );
+        runtime.begin_session(SessionId::from_value(1)).await;
+
+        let microphone_runtime = Arc::clone(&runtime);
+        let microphone = tokio::spawn(async move {
+            microphone_runtime
+                .push_chunk(chunk(AudioSource::Microphone))
+                .await
+        });
+        let system_runtime = Arc::clone(&runtime);
+        let system_output = tokio::spawn(async move {
+            system_runtime
+                .push_chunk(chunk(AudioSource::SystemOutput))
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(120)).await;
+        tokio::task::yield_now().await;
+
+        assert!(microphone.is_finished());
+        assert!(system_output.is_finished());
+        microphone.await.unwrap().unwrap();
+        system_output.await.unwrap().unwrap();
+        assert_eq!(finals(&out).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dynamic_reconfigure_cancels_old_sessions_before_new_audio_is_accepted() {
+        let (out, sink) = collector();
+        let first = Arc::new(FakeTranscriptionProvider::new(FakeBehavior::Silent));
+        let first_log = first.log();
+        let runtime = Arc::new(TranscriptionRuntime::new(
+            first,
+            TranscriptionSettings::default(),
+            sink,
+        ));
+        runtime.begin_session(SessionId::from_value(1)).await;
+        runtime
+            .push_chunk(chunk(AudioSource::SystemOutput))
+            .await
+            .unwrap();
+        let old_revision = runtime.configuration_revision();
+
+        let second = Arc::new(FakeTranscriptionProvider::new(FakeBehavior::EmitsFinal {
+            text: "provider novo".into(),
+            partials: false,
+        }));
+        let second_log = second.log();
+        let settings = TranscriptionSettings {
+            provider: TranscriptionProviderId::Fake,
+            ..TranscriptionSettings::default()
+        };
+        runtime.reconfigure(second, settings.clone()).await;
+        let stale = runtime
+            .push_chunk_for_revision(chunk(AudioSource::SystemOutput), old_revision)
+            .await;
+        assert!(matches!(stale, Err(TranscriptionError::Cancelled)));
+        assert!(second_log.sessions().is_empty());
+        assert_eq!(runtime.stats().discarded_stale_configuration, 1);
+        runtime
+            .push_chunk(chunk(AudioSource::SystemOutput))
+            .await
+            .unwrap();
+
+        assert_eq!(first_log.cancel_count(), 1);
+        assert_eq!(second_log.sessions().len(), 1);
+        assert_eq!(runtime.settings(), settings);
+        assert_eq!(finals(&out).len(), 1);
+        assert_eq!(finals(&out)[0].transcript.text, "provider novo");
     }
 
     /// Encerrar duas vezes acontece de verdade: o usuário clica em "encerrar" e o mesmo

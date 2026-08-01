@@ -196,6 +196,10 @@ impl TelemetryRecorder {
         };
         let attributes = trace.attributes_mut();
         merge(
+            &mut attributes.transcription_queue_wait_ms,
+            update.transcription_queue_wait_ms,
+        );
+        merge(
             &mut attributes.transcription_provider,
             update.transcription_provider,
         );

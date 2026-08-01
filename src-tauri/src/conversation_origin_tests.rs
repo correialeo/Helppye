@@ -44,8 +44,6 @@ fn produced(
         source,
         capture_stream_id: stream,
         sequence_number: sequence,
-        raw_text: text.to_string(),
-        normalized_text: text.to_string(),
     };
     let transcript = final_transcript(source, text, start, end);
     let normalization = TranscriptNormalizationResult::unchanged(text.to_string());
@@ -310,8 +308,6 @@ fn a_segment_whose_source_diverges_from_its_envelope_is_rejected_not_corrected()
         source: AudioSource::SystemOutput,
         capture_stream_id: CaptureStreamId::next(),
         sequence_number: 1,
-        raw_text: "e como você faria isso?".into(),
-        normalized_text: "e como você faria isso?".into(),
     };
     // O transcritor devolveu a fonte errada. O envelope diz `SystemOutput`.
     let transcript = final_transcript(AudioSource::Microphone, "e como você faria isso?", 0, 1_000);
@@ -340,8 +336,6 @@ fn a_rejected_segment_never_reaches_the_timeline() {
         source: AudioSource::SystemOutput,
         capture_stream_id: CaptureStreamId::next(),
         sequence_number: 1,
-        raw_text: "pergunta importante".into(),
-        normalized_text: "pergunta importante".into(),
     };
     let transcript = final_transcript(AudioSource::Microphone, "pergunta importante", 0, 1_000);
     let normalization = TranscriptNormalizationResult::unchanged("pergunta importante".into());

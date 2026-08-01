@@ -63,6 +63,12 @@ transcritor nenhum.
 nuvem sai com custo vazio — o harness não consulta tabela de preço de ninguém, e um número
 inventado seria pior que a ausência dele.
 
+O runner adapta o mesmo fixture ao contrato declarado pelo provider. Providers
+streaming recebem frames contínuos de 100 ms; providers batch recebem segmentos do
+mesmo `Segmenter` usado pela captura, incluindo o flush de fim de arquivo. Portanto o
+benchmark não força Whisper a transcrever pequenos frames artificiais e continua sem
+conter casos especiais por nome de provider.
+
 ## Ler o resultado
 
 Saem dois arquivos por execução, em `results/`: um JSON completo (inclui `raw_transcript` ao

@@ -166,24 +166,16 @@ pub struct TranscriptionResultEnvelope {
     pub source: AudioSource,
     pub capture_stream_id: CaptureStreamId,
     pub sequence_number: u64,
-    pub raw_text: String,
-    pub normalized_text: String,
 }
 
 impl TranscriptionResultEnvelope {
-    pub fn from_identity(
-        identity: PendingSegmentIdentity,
-        raw_text: String,
-        normalized_text: String,
-    ) -> Self {
+    pub fn from_identity(identity: PendingSegmentIdentity) -> Self {
         TranscriptionResultEnvelope {
             session_id: identity.session_id,
             segment_id: identity.segment_id,
             source: identity.source,
             capture_stream_id: identity.capture_stream_id,
             sequence_number: identity.sequence_number,
-            raw_text,
-            normalized_text,
         }
     }
 }
@@ -252,11 +244,7 @@ mod tests {
             captured_at: MonotonicTimestamp::now(),
             enqueued_at: MonotonicTimestamp::now(),
         };
-        let envelope = TranscriptionResultEnvelope::from_identity(
-            identity,
-            "bruto".into(),
-            "normalizado".into(),
-        );
+        let envelope = TranscriptionResultEnvelope::from_identity(identity);
         assert_eq!(envelope.source, AudioSource::SystemOutput);
         assert_eq!(envelope.segment_id, identity.segment_id);
         assert_eq!(envelope.capture_stream_id, identity.capture_stream_id);

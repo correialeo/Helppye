@@ -1,12 +1,6 @@
-//! Bounded queue decoupling segment production (segmentation, running inline on the
-//! capture event-forwarding task) from transcription (potentially slow model inference).
-//! The producer side always uses `try_send`, so a backed-up queue drops the newest
-//! segment and counts it instead of ever blocking capture or the UI thread — the same
-//! drop-and-log-every-50 policy already used for audio frames (`audio::pipeline`).
-//!
-//! O worker entrega cada segmento ao `TranscriptionRuntime`, não a um transcritor direto:
-//! é o runtime que sabe a qual sessão de transcrição aquela fonte pertence e é ele quem
-//! publica os resultados. A fila continua sendo só o amortecedor entre produção e consumo.
+//! Bounded per-source queues decouple segment production from transcription. Producers
+//! always use `try_send`: capture never waits for a model or network provider. Teardown
+//! is a command in the same lane, so `finish_source` cannot overtake queued audio.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,23 +8,41 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::Serialize;
-
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::audio::segment::AudioSegment;
+use crate::audio::types::AudioSource;
 use crate::integrity::{IntegrityStage, SourceIntegrityError};
 use crate::transcription::envelope::{MonotonicTimestamp, TranscriptionWorkItem};
 use crate::transcription::runtime::TranscriptionRuntime;
+use crate::transcription::session::AudioChunk;
 
-/// Small on purpose: segments already represent multiple seconds of speech each, so a deep
-/// backlog here means transcription has fallen far behind real time, not a transient blip.
+/// Small on purpose: segments already represent multiple seconds of speech each, so a
+/// deep backlog means transcription has fallen behind real time.
 pub const QUEUE_CAPACITY: usize = 16;
 
 #[derive(Default)]
-struct QueueState {
+struct LaneMetrics {
     enqueued_at: Mutex<VecDeque<Instant>>,
-    dropped: AtomicU64,
+}
+
+enum QueueCommand {
+    Work {
+        item: TranscriptionWorkItem,
+        configuration_revision: u64,
+    },
+    Chunk {
+        audio: AudioChunk,
+        enqueued_at: MonotonicTimestamp,
+        configuration_revision: u64,
+    },
+    Finish(oneshot::Sender<()>),
+}
+
+struct QueueLane {
+    sender: mpsc::Sender<QueueCommand>,
+    metrics: Arc<LaneMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,81 +53,172 @@ pub struct TranscriptionQueueMetrics {
     pub segments_dropped: u64,
 }
 
-/// Owns the single worker task that drains queued segments into the runtime, one at a
-/// time. Never panics on a failed segment; never lets a slow segment stop the next one from
-/// being queued.
+/// One ordered worker per audio source. A slow microphone provider call can no longer
+/// delay system-output audio before it even reaches its own provider session.
 pub struct TranscriptionQueue {
-    sender: mpsc::Sender<TranscriptionWorkItem>,
-    state: Arc<QueueState>,
+    microphone: QueueLane,
+    system_output: QueueLane,
     runtime: Arc<TranscriptionRuntime>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl TranscriptionQueue {
     pub fn spawn(runtime: Arc<TranscriptionRuntime>) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<TranscriptionWorkItem>(QUEUE_CAPACITY);
-        let worker_runtime = Arc::clone(&runtime);
-        let state = Arc::new(QueueState::default());
-        let worker_state = Arc::clone(&state);
+        let dropped = Arc::new(AtomicU64::new(0));
+        TranscriptionQueue {
+            microphone: Self::spawn_lane(AudioSource::Microphone, Arc::clone(&runtime)),
+            system_output: Self::spawn_lane(AudioSource::SystemOutput, Arc::clone(&runtime)),
+            runtime,
+            dropped,
+        }
+    }
 
-        // `tokio::spawn` panics here: `spawn` runs synchronously inside Tauri's
-        // `.setup()` hook, outside any Tokio task context. `tauri::async_runtime::spawn`
-        // uses Tauri's own managed runtime instead (same reason `audio::start_capture`
-        // uses it for its forwarding task).
+    fn spawn_lane(source: AudioSource, runtime: Arc<TranscriptionRuntime>) -> QueueLane {
+        let (sender, mut receiver) = mpsc::channel::<QueueCommand>(QUEUE_CAPACITY);
+        let metrics = Arc::new(LaneMetrics::default());
+        let worker_metrics = Arc::clone(&metrics);
+
         tauri::async_runtime::spawn(async move {
-            while let Some(item) = receiver.recv().await {
-                let queued_age_ms = item.enqueued_at.elapsed_ms();
-                worker_state
-                    .enqueued_at
-                    .lock()
-                    .expect("transcription queue metrics mutex poisoned")
-                    .pop_front();
-                if queued_age_ms >= 1_000 {
-                    debug!(queued_age_ms, "transcription queue is processing old audio");
-                }
-                let source = item.source;
-                if let Err(e) = worker_runtime.push_work_item(item).await {
-                    // Falha de um segmento não derruba o worker: o próximo segmento pode
-                    // transcrever normalmente, e o runtime já publicou o evento de erro
-                    // correspondente para quem observa.
-                    debug!(?source, %e, "transcription of a segment failed");
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    QueueCommand::Work {
+                        item,
+                        configuration_revision,
+                    } => {
+                        let queued_age_ms = item.enqueued_at.elapsed_ms();
+                        worker_metrics
+                            .enqueued_at
+                            .lock()
+                            .expect("transcription queue metrics mutex poisoned")
+                            .pop_front();
+                        if queued_age_ms >= 1_000 {
+                            debug!(
+                                ?source,
+                                queued_age_ms, "transcription queue processing old audio"
+                            );
+                        }
+                        if let Err(error) = runtime
+                            .push_work_item_for_revision(item, configuration_revision)
+                            .await
+                        {
+                            debug!(?source, %error, "transcription of segment failed");
+                        }
+                    }
+                    QueueCommand::Chunk {
+                        audio,
+                        enqueued_at,
+                        configuration_revision,
+                    } => {
+                        let queued_age_ms = enqueued_at.elapsed_ms();
+                        worker_metrics
+                            .enqueued_at
+                            .lock()
+                            .expect("transcription queue metrics mutex poisoned")
+                            .pop_front();
+                        if queued_age_ms >= 1_000 {
+                            debug!(
+                                ?source,
+                                queued_age_ms, "transcription queue processing old audio"
+                            );
+                        }
+                        if let Err(error) = runtime
+                            .push_chunk_for_revision(audio, configuration_revision)
+                            .await
+                        {
+                            debug!(?source, %error, "streaming transcription chunk failed");
+                        }
+                    }
+                    QueueCommand::Finish(acknowledge) => {
+                        runtime.finish_source(source).await;
+                        let _ = acknowledge.send(());
+                    }
                 }
             }
         });
 
-        TranscriptionQueue {
-            sender,
-            state,
-            runtime,
+        QueueLane { sender, metrics }
+    }
+
+    fn lane(&self, source: AudioSource) -> &QueueLane {
+        match source {
+            AudioSource::Microphone => &self.microphone,
+            AudioSource::SystemOutput => &self.system_output,
         }
     }
 
-    /// Encerramento gracioso da sessão de transcrição de uma fonte, quando a captura dela
-    /// para sem que a sessão de conversa acabe. A fila fica aberta: a outra fonte continua
-    /// entregando normalmente.
-    pub async fn finish_source(&self, source: crate::audio::types::AudioSource) {
-        self.runtime.finish_source(source).await;
+    pub fn accepts_continuous_audio(&self) -> bool {
+        self.runtime.provider_capabilities().streaming
     }
 
-    /// Never blocks. A full queue drops `segment` and counts it, logging every 50th drop
-    /// rather than every one.
-    ///
-    /// É aqui que o segmento vira `TranscriptionWorkItem`: a identidade causal
-    /// (`session_id`, `capture_stream_id`, `sequence_number`) é fixada **uma vez**, no ponto
-    /// de entrada da camada de transcrição, e todo o resto do pipeline lê dela em vez de
-    /// redeclarar a origem. Sem sessão ativa o segmento é descartado aqui mesmo — entrar na
-    /// fila para ser recusado adiante só adiaria a mesma decisão gastando uma vaga.
+    /// Continuous providers receive capture frames directly instead of waiting for the
+    /// local VAD to finalize a segment. The same bounded/drop-newest policy still applies.
+    pub fn try_enqueue_chunk(&self, audio: AudioChunk) {
+        if self.runtime.active_session_id().is_none() {
+            return;
+        }
+        let source = audio.source;
+        let enqueued_at = MonotonicTimestamp::now();
+        let configuration_revision = self.runtime.configuration_revision();
+        let lane = self.lane(source);
+        let mut timestamps = lane
+            .metrics
+            .enqueued_at
+            .lock()
+            .expect("transcription queue metrics mutex poisoned");
+        if lane
+            .sender
+            .try_send(QueueCommand::Chunk {
+                audio,
+                enqueued_at,
+                configuration_revision,
+            })
+            .is_err()
+        {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped % 50 == 1 {
+                warn!(
+                    ?source,
+                    dropped_audio_items = dropped,
+                    "transcription queue full, dropping streaming audio"
+                );
+            }
+        } else {
+            timestamps.push_back(enqueued_at.as_instant());
+        }
+    }
+
+    /// Graceful close is ordered after every accepted work item in this source lane.
+    /// This prevents a slow queued segment from reopening a provider session after capture
+    /// has already reported itself stopped.
+    pub async fn finish_source(&self, source: AudioSource) {
+        let (acknowledge, finished) = oneshot::channel();
+        if self
+            .lane(source)
+            .sender
+            .send(QueueCommand::Finish(acknowledge))
+            .await
+            .is_err()
+        {
+            warn!(
+                ?source,
+                "transcription queue worker unavailable during source finish"
+            );
+            return;
+        }
+        let _ = finished.await;
+    }
+
+    /// Never blocks. A full queue drops the newest segment and records the loss.
     pub fn try_enqueue(&self, segment: AudioSegment) {
         let enqueued_at = MonotonicTimestamp::now();
         let Some(session_id) = self.runtime.active_session_id() else {
             debug!(
                 source = ?segment.source,
-                "segmento descartado: nenhuma sessão de conversa ativa"
+                "segment discarded: no active conversation session"
             );
             return;
         };
-        // Comparação, não atribuição: se o segmento chegou aqui já com uma fonte diferente da
-        // que o próprio segmento declara ter capturado, o dado é rejeitado em vez de entrar
-        // "corrigido". Na prática é sempre `Ok` — o valor está em que deixaria de ser.
+
         if let Err(error) = SourceIntegrityError::check(
             segment.id,
             segment.source,
@@ -125,25 +228,31 @@ impl TranscriptionQueue {
             crate::integrity::origin_log().record_violation(error);
             return;
         }
-        let item = TranscriptionWorkItem::from_segment(
-            session_id,
-            segment,
-            // O segmento fica pronto quando a fala termina; entrar na fila é o instante
-            // seguinte. Nesta borda os dois coincidem, e separá-los é o que permite medir
-            // backlog adiante sem confundi-lo com latência de captura.
-            enqueued_at,
-            enqueued_at,
-        );
-        let mut timestamps = self
-            .state
+
+        let source = segment.source;
+        let configuration_revision = self.runtime.configuration_revision();
+        let item =
+            TranscriptionWorkItem::from_segment(session_id, segment, enqueued_at, enqueued_at);
+        let lane = self.lane(source);
+        let mut timestamps = lane
+            .metrics
             .enqueued_at
             .lock()
             .expect("transcription queue metrics mutex poisoned");
-        if self.sender.try_send(item).is_err() {
-            let n = self.state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 50 == 1 {
+
+        if lane
+            .sender
+            .try_send(QueueCommand::Work {
+                item,
+                configuration_revision,
+            })
+            .is_err()
+        {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped % 50 == 1 {
                 warn!(
-                    dropped_segments = n,
+                    ?source,
+                    dropped_segments = dropped,
                     "transcription queue full, dropping segment"
                 );
             }
@@ -153,13 +262,20 @@ impl TranscriptionQueue {
     }
 
     pub fn dropped_segments(&self) -> u64 {
-        self.state.dropped.load(Ordering::Relaxed)
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn metrics(&self) -> TranscriptionQueueMetrics {
         let now = Instant::now();
-        let timestamps = self
-            .state
+        let microphone = self
+            .microphone
+            .metrics
+            .enqueued_at
+            .lock()
+            .expect("transcription queue metrics mutex poisoned");
+        let system_output = self
+            .system_output
+            .metrics
             .enqueued_at
             .lock()
             .expect("transcription queue metrics mutex poisoned");
@@ -168,10 +284,24 @@ impl TranscriptionQueue {
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64
         };
+
+        let oldest = microphone
+            .front()
+            .into_iter()
+            .chain(system_output.front())
+            .min()
+            .map(age);
+        let newest = microphone
+            .back()
+            .into_iter()
+            .chain(system_output.back())
+            .max()
+            .map(age);
+
         TranscriptionQueueMetrics {
-            queue_depth: timestamps.len(),
-            oldest_segment_age_ms: timestamps.front().map(age),
-            newest_segment_age_ms: timestamps.back().map(age),
+            queue_depth: microphone.len() + system_output.len(),
+            oldest_segment_age_ms: oldest,
+            newest_segment_age_ms: newest,
             segments_dropped: self.dropped_segments(),
         }
     }
@@ -278,6 +408,38 @@ mod tests {
         notify.notified().await;
 
         assert_eq!(*errors.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn finish_is_ordered_after_already_accepted_audio() {
+        let outputs: Arc<StdMutex<Vec<TranscriptionRuntimeOutput>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let sink_outputs = Arc::clone(&outputs);
+        let sink: TranscriptionOutputSink =
+            Arc::new(move |output| sink_outputs.lock().unwrap().push(output));
+        let runtime = runtime_with(
+            FakeBehavior::EmitsFinalAfter {
+                text: "último segmento".into(),
+                delay: std::time::Duration::from_millis(20),
+            },
+            sink,
+        );
+        runtime.begin_session(SessionId::from_value(1)).await;
+        let queue = TranscriptionQueue::spawn(Arc::clone(&runtime));
+
+        queue.try_enqueue(segment());
+        queue.finish_source(AudioSource::SystemOutput).await;
+
+        assert_eq!(
+            outputs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|output| matches!(output, TranscriptionRuntimeOutput::Final(_)))
+                .count(),
+            1
+        );
+        assert!(runtime.active_transcription_sessions().is_empty());
     }
 
     #[tokio::test]

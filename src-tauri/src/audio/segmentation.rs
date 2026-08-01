@@ -152,6 +152,56 @@ impl Segmenter {
         events
     }
 
+    /// Flushes a confirmed speech segment when its source ends. Without this, stopping
+    /// capture or benchmarking a fixture that ends immediately after speech silently
+    /// loses the final phrase because no trailing VAD window arrives.
+    pub fn finish(&mut self) -> Vec<SpeechEvent> {
+        let mut events = Vec::new();
+        let pending = std::mem::take(&mut self.pending);
+        self.samples_seen += pending.len() as u64;
+        let ended_at = self.timestamp_for(self.samples_seen);
+
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        let finalized = match state {
+            State::Speaking {
+                mut buffer,
+                started_at,
+            } => {
+                buffer.extend_from_slice(&pending);
+                Some((buffer, started_at, ended_at))
+            }
+            State::SilencePending {
+                mut buffer,
+                started_at,
+                silence_windows,
+            } => {
+                buffer.extend_from_slice(&pending);
+                let silence_samples = silence_windows as usize * self.window_len;
+                let keep_samples =
+                    (self.config.post_roll_ms as usize * self.sample_rate as usize) / 1_000;
+                let trim_samples = silence_samples.saturating_sub(keep_samples);
+                buffer.truncate(buffer.len().saturating_sub(trim_samples));
+                let trimmed_end =
+                    self.timestamp_for(self.samples_seen.saturating_sub(trim_samples as u64));
+                Some((buffer, started_at, trimmed_end))
+            }
+            State::Idle | State::PossibleSpeech { .. } => None,
+        };
+
+        self.pre_roll.clear();
+        if let Some((buffer, started_at, ended_at)) = finalized {
+            if !buffer.is_empty() {
+                let segment = self.mint_segment(buffer, started_at, ended_at);
+                events.push(SpeechEvent::SegmentReady(segment));
+                events.push(SpeechEvent::Ended {
+                    source: self.source,
+                    timestamp: ended_at,
+                });
+            }
+        }
+        events
+    }
+
     fn timestamp_for(&self, samples: u64) -> AudioTimestamp {
         AudioTimestamp(samples * 1000 / self.sample_rate as u64)
     }
@@ -424,5 +474,29 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, SpeechEvent::Started { .. })));
+    }
+
+    #[test]
+    fn finish_preserves_confirmed_speech_without_trailing_silence() {
+        let mut segmenter = Segmenter::new(
+            AudioSource::SystemOutput,
+            16_000,
+            SegmentationConfig::default(),
+        );
+        let speech = tone(320, 0.9);
+        let mut before_finish = Vec::new();
+        for _ in 0..20 {
+            before_finish.extend(segmenter.push_samples(&speech));
+        }
+        assert!(segment_ready_events(&before_finish).is_empty());
+
+        let finished = segmenter.finish();
+        let segments = segment_ready_events(&finished);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].source, AudioSource::SystemOutput);
+        assert!(segments[0].duration_ms >= 250);
+        assert!(finished
+            .iter()
+            .any(|event| matches!(event, SpeechEvent::Ended { .. })));
     }
 }

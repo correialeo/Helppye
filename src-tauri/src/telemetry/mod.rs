@@ -196,6 +196,9 @@ impl ContentPolicy {
 /// deles é conteúdo.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct TraceAttributes {
+    /// Tempo entre aceitação na fila e início do consumo pelo runtime. Se alto, o
+    /// gargalo é backpressure/throughput antes do provider, não a inferência em si.
+    pub transcription_queue_wait_ms: Option<u64>,
     pub transcription_provider: Option<String>,
     pub transcription_model: Option<String>,
     pub response_provider: Option<String>,

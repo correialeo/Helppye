@@ -18,10 +18,12 @@ use tracing::warn;
 use crate::audio::config::CaptureConfig;
 use crate::audio::error::AudioCaptureError;
 use crate::audio::provider::AudioCaptureProvider;
+use crate::audio::segment::AudioTimestamp;
 use crate::audio::segmentation::{SegmentationConfig, Segmenter, SpeechEvent};
 use crate::audio::selection::{self, DeviceSelectionConfig, ResolvedDevice};
 use crate::audio::types::{AudioCaptureEvent, AudioDevice, AudioSource, CaptureStreamId};
 use crate::transcription::queue::TranscriptionQueue;
+use crate::transcription::session::AudioChunk;
 
 pub type CaptureEventSink = Arc<dyn Fn(AudioCaptureEvent) + Send + Sync>;
 
@@ -33,10 +35,6 @@ pub struct DeviceSelectionSnapshot {
 
 struct CaptureHandle {
     cancel: CancellationToken,
-    /// Kept for observability/tests (`CaptureEngine::selected_device_id` is the one used
-    /// by production code to know what's active); not read elsewhere yet.
-    #[allow(dead_code)]
-    device_id: String,
     session_id: u64,
     forward_task: tauri::async_runtime::JoinHandle<()>,
 }
@@ -224,11 +222,52 @@ impl CaptureEngine {
                 sample_rate,
                 SegmentationConfig::default(),
             );
+            let mut continuous_audio = transcription_queue.accepts_continuous_audio();
+            let mut continuous_sequence = 0u64;
             let mut disconnected = false;
 
             while let Some(event) = rx.recv().await {
                 if let AudioCaptureEvent::Frame(ref frame) = event {
-                    for speech_event in segmenter.push_samples(&frame.samples) {
+                    let requested_mode = transcription_queue.accepts_continuous_audio();
+                    if requested_mode != continuous_audio {
+                        // Provider swaps are hard boundaries. Audio accumulated for the
+                        // old provider must not be replayed into the new protocol.
+                        segmenter = Segmenter::for_stream(
+                            source,
+                            capture_stream_id,
+                            sample_rate,
+                            SegmentationConfig::default(),
+                        );
+                        continuous_audio = requested_mode;
+                    }
+
+                    if continuous_audio {
+                        continuous_sequence += 1;
+                        let started_at = session_timeline_offset_ms + frame.timestamp_ms;
+                        let duration_ms = (frame.samples.len() as u64 * 1_000)
+                            / u64::from(frame.sample_rate.max(1));
+                        transcription_queue.try_enqueue_chunk(AudioChunk {
+                            source,
+                            capture_stream_id,
+                            sequence_number: continuous_sequence,
+                            samples: frame.samples.clone(),
+                            sample_rate: frame.sample_rate,
+                            started_at: AudioTimestamp(started_at),
+                            ended_at: AudioTimestamp(started_at + duration_ms),
+                            segment_id: None,
+                        });
+                    } else {
+                        for speech_event in segmenter.push_samples(&frame.samples) {
+                            if let SpeechEvent::SegmentReady(segment) = speech_event {
+                                transcription_queue.try_enqueue(
+                                    segment.with_timestamp_offset(session_timeline_offset_ms),
+                                );
+                            }
+                        }
+                    }
+                }
+                if !continuous_audio && matches!(event, AudioCaptureEvent::Stopped { .. }) {
+                    for speech_event in segmenter.finish() {
                         if let SpeechEvent::SegmentReady(segment) = speech_event {
                             transcription_queue.try_enqueue(
                                 segment.with_timestamp_offset(session_timeline_offset_ms),
@@ -242,6 +281,24 @@ impl CaptureEngine {
 
                 emit(event);
             }
+
+            // A provider may close its channel without emitting `Stopped` (for
+            // example after an unrecoverable backend failure). Preserve the
+            // last confirmed batch utterance in that path as well. `finish` is
+            // idempotent after the normal `Stopped` flush.
+            if !continuous_audio {
+                for speech_event in segmenter.finish() {
+                    if let SpeechEvent::SegmentReady(segment) = speech_event {
+                        transcription_queue
+                            .try_enqueue(segment.with_timestamp_offset(session_timeline_offset_ms));
+                    }
+                }
+            }
+
+            // O fechamento viaja na mesma lane da fonte e, portanto, só alcança o
+            // runtime depois de todos os segmentos aceitos acima. Isso também cobre
+            // desconexão espontânea, caminho que não passa por `stop_capture`.
+            transcription_queue.finish_source(source).await;
 
             // The channel only closes once every sender clone held by the provider's
             // capture thread has been dropped — i.e. the underlying stream has fully
@@ -268,7 +325,6 @@ impl CaptureEngine {
 
         *guard = Some(CaptureHandle {
             cancel,
-            device_id,
             session_id,
             forward_task,
         });
@@ -286,10 +342,6 @@ impl CaptureEngine {
         if let Some(handle) = handle {
             handle.cancel.cancel();
             let _ = handle.forward_task.await;
-            // Depois de a tarefa de encaminhamento terminar — nesse ponto todo segmento
-            // desta fonte já foi entregue. Encerra a sessão de transcrição da fonte de forma
-            // graciosa, sem tocar na outra fonte nem na sessão de conversa.
-            self.transcription_queue.finish_source(source).await;
         }
     }
 }

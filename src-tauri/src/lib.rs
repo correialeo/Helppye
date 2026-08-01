@@ -32,7 +32,6 @@ use transcription::runtime::{
     TranscriptionOutputSink, TranscriptionRuntime, TranscriptionRuntimeOutput,
 };
 use transcription::segment_transcriber::SegmentTranscriber;
-use transcription::settings::TranscriptionSettings;
 use transcription::types::{Transcript, TranscriptEvent};
 use transcription::whisper_local::WhisperLocalTranscriptionProvider;
 use transcription::whisper_provider::WhisperCppProvider;
@@ -173,9 +172,35 @@ pub fn run() {
             let mut registry = TranscriptionProviderRegistry::new();
             registry.register(whisper_local.clone());
 
+            let transcription_settings_path = app
+                .path()
+                .app_data_dir()
+                .map(|directory| directory.join("transcription_provider.json"))
+                .unwrap_or_else(|error| {
+                    tracing::warn!(
+                        %error,
+                        "app data dir unavailable, transcription settings will not persist reliably"
+                    );
+                    std::path::PathBuf::from("transcription_provider.json")
+                });
+            let mut transcription_settings =
+                transcription::config_store::load(&transcription_settings_path);
+            let active_transcription_provider = match registry.get(transcription_settings.provider) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "persisted transcription provider unavailable; using Whisper local"
+                    );
+                    transcription_settings.provider =
+                        transcription::provider::TranscriptionProviderId::WhisperLocal;
+                    whisper_local.clone()
+                }
+            };
+
             let runtime = Arc::new(TranscriptionRuntime::new(
-                whisper_local,
-                TranscriptionSettings::default(),
+                active_transcription_provider,
+                transcription_settings,
                 sink,
             ));
             // Mesma razão do `response_engine.begin_session` acima: sem alinhar a fronteira
@@ -201,6 +226,7 @@ pub fn run() {
                 queue,
                 runtime,
                 registry,
+                transcription_settings_path,
             ));
 
             let model_manager_state = model_manager::build(app.handle(), transcriber)?;

@@ -18,6 +18,7 @@
 //! entre a segmentação e esta camada — ele só passou a alimentar o runtime em vez de chamar
 //! o transcritor direto.
 
+pub mod config_store;
 pub mod envelope;
 pub mod error;
 pub mod events;
@@ -35,6 +36,7 @@ pub mod whisper_provider;
 #[cfg(test)]
 pub mod fake_provider;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -64,6 +66,7 @@ pub struct TranscriptionState {
     pub queue: Arc<TranscriptionQueue>,
     pub runtime: Arc<TranscriptionRuntime>,
     pub registry: TranscriptionProviderRegistry,
+    settings_path: PathBuf,
     loaded_model_name: tokio::sync::Mutex<Option<String>>,
     /// Vocabulário vigente. Vive aqui, e não dentro do normalizador, porque o runtime guarda
     /// o normalizador atrás de `Arc<dyn TranscriptNormalizer>` — um trait object imutável,
@@ -80,12 +83,14 @@ impl TranscriptionState {
         queue: Arc<TranscriptionQueue>,
         runtime: Arc<TranscriptionRuntime>,
         registry: TranscriptionProviderRegistry,
+        settings_path: PathBuf,
     ) -> Self {
         TranscriptionState {
             transcriber,
             queue,
             runtime,
             registry,
+            settings_path,
             loaded_model_name: tokio::sync::Mutex::new(None),
             vocabulary: std::sync::Mutex::new(TranscriptionVocabulary::default()),
         }
@@ -129,6 +134,7 @@ pub async fn configure_transcription_command(
     let mut settings = state.runtime.settings();
     settings.language = language.into();
     settings.model = Some(model_name.clone());
+    config_store::save(&state.settings_path, &settings)?;
     state.runtime.set_settings(settings);
 
     *state.loaded_model_name.lock().await = Some(model_name);
@@ -272,11 +278,14 @@ pub async fn transcription_set_settings_command(
         .registry
         .get(settings.provider)
         .map_err(|e| e.to_string())?;
+    settings
+        .validate_for(provider.capabilities())
+        .map_err(|error| format!("invalid transcription settings: {error}"))?;
     // Um provider registrado ainda pode estar impedido de rodar (modelo não carregado,
     // credencial ausente). Perguntar antes de trocar transforma "toda transcrição falha em
     // silêncio a partir de agora" numa mensagem de erro na hora da escolha.
     provider.readiness().await.map_err(|e| e.to_string())?;
-    state.runtime.set_provider(provider);
-    state.runtime.set_settings(settings);
+    config_store::save(&state.settings_path, &settings)?;
+    state.runtime.reconfigure(provider, settings).await;
     Ok(())
 }

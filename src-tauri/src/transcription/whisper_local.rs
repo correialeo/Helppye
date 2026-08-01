@@ -285,6 +285,8 @@ mod tests {
     fn chunk(source: AudioSource) -> AudioChunk {
         AudioChunk {
             source,
+            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
+            sequence_number: 0,
             samples: vec![0.0; 1_600],
             sample_rate: 16_000,
             started_at: AudioTimestamp(0),

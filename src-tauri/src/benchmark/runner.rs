@@ -3,14 +3,12 @@
 //! O caminho medido é o caminho real, na mesma ordem do pipeline:
 //!
 //! ```text
-//! WAV → chunks de 100 ms → TranscriptionProvider → TranscriptionEvent::Final
+//! WAV → ingresso batch/streaming do provider → TranscriptionEvent::Final
 //!     → TranscriptNormalizer → ConversationTimeline → ConversationUtterance
 //! ```
 //!
-//! O áudio é entregue em chunks do mesmo tamanho que a captura usa
-//! (`CaptureConfig::frame_duration_ms`) em vez de num bloco só, porque um provider de
-//! streaming se comporta de forma diferente nos dois casos e medir o bloco único favoreceria
-//! artificialmente o backend batch.
+//! Providers streaming recebem chunks contínuos de 100 ms. Providers batch passam pelo
+//! mesmo `Segmenter` da captura e recebem somente segmentos de fala completos.
 //!
 //! **O que este harness não faz:** não simula rede, não estima qualidade semântica e não
 //! roda o provedor de resposta. `estimated_cost_usd` vem de uma tabela de preço declarada
@@ -23,6 +21,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
+use crate::audio::segmentation::{SegmentationConfig, Segmenter, SpeechEvent};
 use crate::audio::types::CaptureStreamId;
 use crate::benchmark::fixtures::BenchmarkFixture;
 use crate::benchmark::wav::{self, WavError};
@@ -151,23 +150,57 @@ pub async fn run_fixture(
         .await
         .map_err(|e| RunnerError::SessionStart(e.to_string()))?;
 
-    let samples_per_chunk = (TARGET_SAMPLE_RATE as u64 * CHUNK_DURATION_MS / 1000) as usize;
     let mut errors = Vec::new();
-    let mut offset_ms = 0u64;
-    for chunk in samples.chunks(samples_per_chunk.max(1)) {
-        let chunk_ms = duration_ms(chunk.len(), TARGET_SAMPLE_RATE);
-        let audio = AudioChunk {
-            source: fixture.source,
-            samples: chunk.to_vec(),
-            sample_rate: TARGET_SAMPLE_RATE,
-            started_at: AudioTimestamp(offset_ms),
-            ended_at: AudioTimestamp(offset_ms + chunk_ms),
-            segment_id: None,
-        };
-        if let Err(e) = session.push_audio(audio).await {
-            errors.push(e.to_string());
+    if provider.capabilities().streaming {
+        let samples_per_chunk = (TARGET_SAMPLE_RATE as u64 * CHUNK_DURATION_MS / 1000) as usize;
+        let mut offset_ms = 0u64;
+        for (sequence, chunk) in samples.chunks(samples_per_chunk.max(1)).enumerate() {
+            let chunk_ms = duration_ms(chunk.len(), TARGET_SAMPLE_RATE);
+            let audio = AudioChunk {
+                source: fixture.source,
+                capture_stream_id: CaptureStreamId::UNASSIGNED,
+                sequence_number: sequence as u64,
+                samples: chunk.to_vec(),
+                sample_rate: TARGET_SAMPLE_RATE,
+                started_at: AudioTimestamp(offset_ms),
+                ended_at: AudioTimestamp(offset_ms + chunk_ms),
+                segment_id: None,
+            };
+            if let Err(error) = session.push_audio(audio).await {
+                errors.push(error.to_string());
+            }
+            offset_ms += chunk_ms;
         }
-        offset_ms += chunk_ms;
+    } else {
+        let frame_samples = crate::audio::config::CaptureConfig::default().frame_len_samples();
+        let mut segmenter = Segmenter::new(
+            fixture.source,
+            TARGET_SAMPLE_RATE,
+            SegmentationConfig::default(),
+        );
+        let mut segments = Vec::new();
+        for frame in samples.chunks(frame_samples.max(1)) {
+            segments.extend(segmenter.push_samples(frame).into_iter().filter_map(
+                |event| match event {
+                    SpeechEvent::SegmentReady(segment) => Some(segment),
+                    _ => None,
+                },
+            ));
+        }
+        segments.extend(
+            segmenter
+                .finish()
+                .into_iter()
+                .filter_map(|event| match event {
+                    SpeechEvent::SegmentReady(segment) => Some(segment),
+                    _ => None,
+                }),
+        );
+        for segment in segments {
+            if let Err(error) = session.push_audio(AudioChunk::from_segment(segment)).await {
+                errors.push(error.to_string());
+            }
+        }
     }
 
     if let Err(e) = session.finish().await {
@@ -224,8 +257,6 @@ pub async fn run_fixture(
             source: transcript.source,
             capture_stream_id: CaptureStreamId::UNASSIGNED,
             sequence_number: index as u64,
-            raw_text: normalization.raw_text.clone(),
-            normalized_text: normalization.normalized_text.clone(),
         };
         timeline.ingest_normalized_transcript(
             &envelope,

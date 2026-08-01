@@ -12,10 +12,7 @@ export type AudioCaptureEvent =
   | {
       type: "frame";
       source: AudioSourceKind;
-      samples: number[];
-      sample_rate: number;
-      channels: number;
-      timestamp_ms: number;
+      level_db: number;
     }
   | { type: "device_disconnected"; source: AudioSourceKind; device_id: string }
   | { type: "error"; source: AudioSourceKind; message: string }

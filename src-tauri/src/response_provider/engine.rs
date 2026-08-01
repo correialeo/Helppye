@@ -279,14 +279,6 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn truncate_for_diagnostics(text: &str, maximum_characters: usize) -> String {
-    if text.chars().count() <= maximum_characters {
-        text.to_string()
-    } else {
-        text.chars().take(maximum_characters).collect()
-    }
-}
-
 struct GenerationHandle {
     context: GenerationContext,
     cancel: CancellationToken,
@@ -482,15 +474,21 @@ pub fn is_eligible_turn(turn: &ConversationTurn) -> bool {
     turn.speaker == ConversationSpeaker::OtherPerson && turn.source == AudioSource::SystemOutput
 }
 
+struct ActiveProvider {
+    provider: Arc<dyn ResponseProvider>,
+    config: ResponseProviderConfig,
+}
+
 pub struct ResponseEngine {
-    provider: Mutex<Arc<dyn ResponseProvider>>,
+    /// Provider e configuração formam um único snapshot. Separá-los permitia que uma
+    /// geração concorrente observasse o provider novo com modelo/limites antigos.
+    active_provider: Mutex<ActiveProvider>,
     /// Montagem de prompt como dependência, não como chamada direta a uma função livre.
     /// Não é `Mutex` porque não há caminho de troca em runtime: o builder é escolhido na
     /// construção do motor. O ganho é de isolamento — quem monta contexto vê apenas
     /// `ResponseContextInput` e não tem acesso ao estado de sessão, às gerações ativas ou
     /// aos diagnósticos.
     context_builder: Arc<dyn ResponseContextBuilder>,
-    config: Mutex<ResponseProviderConfig>,
     config_path: PathBuf,
     session: Mutex<SessionState>,
     next_generation_id: AtomicU64,
@@ -510,9 +508,8 @@ impl ResponseEngine {
         let config = config_store::load(&config_path);
         let provider = build_provider(&config);
         ResponseEngine {
-            provider: Mutex::new(provider),
+            active_provider: Mutex::new(ActiveProvider { provider, config }),
             context_builder: Arc::new(DefaultResponseContextBuilder),
-            config: Mutex::new(config),
             config_path,
             session: Mutex::new(SessionState::new(SessionId::new())),
             next_generation_id: AtomicU64::new(0),
@@ -642,9 +639,10 @@ impl ResponseEngine {
     }
 
     pub fn current_config(&self) -> ResponseProviderConfig {
-        self.config
+        self.active_provider
             .lock()
             .expect("response engine mutex poisoned")
+            .config
             .clone()
     }
 
@@ -654,9 +652,10 @@ impl ResponseEngine {
     /// outra máquina. Um provedor mal configurado responde `none()` e a UI mostra isso em
     /// vez de prometer streaming que não vai acontecer.
     pub fn active_capabilities(&self) -> ResponseProviderCapabilities {
-        self.provider
+        self.active_provider
             .lock()
             .expect("response engine mutex poisoned")
+            .provider
             .capabilities()
     }
 
@@ -664,10 +663,9 @@ impl ResponseEngine {
         config_store::save(&self.config_path, &config)?;
         let provider = build_provider(&config);
         *self
-            .provider
+            .active_provider
             .lock()
-            .expect("response engine mutex poisoned") = provider;
-        *self.config.lock().expect("response engine mutex poisoned") = config;
+            .expect("response engine mutex poisoned") = ActiveProvider { provider, config };
         Ok(())
     }
 
@@ -678,10 +676,13 @@ impl ResponseEngine {
         let config = self.current_config();
         if config.provider == changed {
             let provider = build_provider(&config);
-            *self
-                .provider
+            let mut active = self
+                .active_provider
                 .lock()
-                .expect("response engine mutex poisoned") = provider;
+                .expect("response engine mutex poisoned");
+            if active.config == config {
+                active.provider = provider;
+            }
         }
     }
 
@@ -1007,12 +1008,13 @@ impl ResponseEngine {
         trigger: GenerationTrigger,
         request: ResponseGenerationRequest,
     ) {
-        let provider = self
-            .provider
-            .lock()
-            .expect("response engine mutex poisoned")
-            .clone();
-        let config = self.current_config();
+        let (provider, config) = {
+            let active = self
+                .active_provider
+                .lock()
+                .expect("response engine mutex poisoned");
+            (Arc::clone(&active.provider), active.config.clone())
+        };
         let started_at = Instant::now();
         let utterance_age_at_generation_start_ms = request
             .speech_ended_at
@@ -1050,10 +1052,19 @@ impl ResponseEngine {
             context_character_count = built.context_character_count,
             "response generation request built"
         );
-        let trigger_text_hash = format!(
-            "{:x}",
-            Sha256::digest(request.current_remote_utterance.as_bytes())
-        );
+        let content_policy = crate::telemetry::recorder().content_policy();
+        // An unsalted hash of common speech still permits dictionary attacks.
+        // UtteranceId already provides correlation, so retain the hash only in
+        // the explicit developer content mode.
+        let trigger_text_hash = content_policy
+            .sanitize(&request.current_remote_utterance)
+            .map(|_| {
+                format!(
+                    "{:x}",
+                    Sha256::digest(request.current_remote_utterance.as_bytes())
+                )
+            })
+            .unwrap_or_default();
         let now_epoch = epoch_ms();
         let utterance_finalized_epoch = now_epoch.saturating_sub(
             trigger
@@ -1078,12 +1089,16 @@ impl ResponseEngine {
             utterance_revision: ctx.utterance_revision,
             provider: provider.provider_name().to_string(),
             model: config.model,
-            trigger_text: truncate_for_diagnostics(&request.current_remote_utterance, 240),
+            trigger_text: content_policy
+                .sanitize(&request.current_remote_utterance)
+                .unwrap_or_default(),
             trigger_text_hash,
             context_utterance_ids: built.context_utterance_ids.clone(),
             context_turn_count: built.context_turn_count,
             context_character_count: built.context_character_count,
-            prompt_preview: built.sanitized_preview.clone(),
+            prompt_preview: content_policy
+                .sanitize(&built.sanitized_preview)
+                .unwrap_or_default(),
             speech_ended_at: speech_ended_epoch,
             transcription_completed_at: Some(
                 now_epoch.saturating_sub(
@@ -1282,7 +1297,10 @@ impl ResponseEngine {
                 }
             }
 
-            diagnostics.raw_prefix = raw_output.chars().take(RAW_PREFIX_CAP_CHARS).collect();
+            diagnostics.raw_prefix = content_policy
+                .sanitize(&raw_output)
+                .map(|text| text.chars().take(RAW_PREFIX_CAP_CHARS).collect())
+                .unwrap_or_default();
             let mut skip_detector = SkipDetector::new();
             let skip_decision = match skip_detector.push(&raw_output) {
                 SkipDecision::Pending => skip_detector.finish(),
@@ -1475,471 +1493,8 @@ impl ResponseEngine {
         }
     }
 
-    #[cfg(any())]
-    async fn run_generation_legacy<R: tauri::Runtime>(
-        self: Arc<Self>,
-        app: AppHandle<R>,
-        ctx: GenerationContext,
-        terminal_emitted: Arc<AtomicBool>,
-        cancel_token: CancellationToken,
-        trigger: GenerationTrigger,
-        request: ResponseGenerationRequest,
-    ) {
-        let provider = self
-            .provider
-            .lock()
-            .expect("response engine mutex poisoned")
-            .clone();
-        let model = self.current_config().model;
-
-        let utterance_age_at_generation_start_ms = request
-            .speech_ended_at
-            .elapsed()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        let maximum_age_ms = self.current_config().maximum_automatic_generation_age_ms;
-        if request.automatic && utterance_age_at_generation_start_ms > maximum_age_ms {
-            tracing::info!(
-                session_id = ctx.session_id.value(),
-                generation_id = ctx.generation_id.value(),
-                turn_id = ctx.turn_id.value(),
-                utterance_id = ctx.utterance_id.value(),
-                utterance_revision = ctx.utterance_revision,
-                utterance_age_ms = utterance_age_at_generation_start_ms,
-                maximum_age_ms,
-                "stale_input"
-            );
-            self.clear_if_current(&ctx);
-            return;
-        }
-
-        let built = self.context_builder.build(&request);
-
-        tracing::info!(
-            session_id = ctx.session_id.value(),
-            turn_id = ctx.turn_id.value(),
-            utterance_id = ctx.utterance_id.value(),
-            generation_id = ctx.generation_id.value(),
-            context_turn_count = built.context_turn_count,
-            context_character_count = built.context_character_count,
-            "context_built"
-        );
-        tracing::debug!(
-            session_id = ctx.session_id.value(),
-            generation_id = ctx.generation_id.value(),
-            prompt_preview = %built.sanitized_preview,
-            "context_built (sanitized prompt)"
-        );
-
-        tracing::info!(
-            provider = provider.provider_name(),
-            session_id = ctx.session_id.value(),
-            turn_id = ctx.turn_id.value(),
-            utterance_id = ctx.utterance_id.value(),
-            utterance_revision = ctx.utterance_revision,
-            generation_id = ctx.generation_id.value(),
-            "starting response generation"
-        );
-
-        // O trace desta fala foi aberto no primeiro chunk de áudio e ligado ao
-        // `UtteranceId` quando a timeline finalizou a utterance. Ligá-lo agora à geração é
-        // o último elo: sem ele, "fim da fala → primeiro token visível" não fecharia,
-        // porque o trecho de transcrição e o de geração viveriam em traces distintos.
-        let telemetry = crate::telemetry::recorder();
-        let trace = telemetry.trace_for_utterance(ctx.utterance_id);
-        if let Some(trace) = trace {
-            telemetry.link_generation(trace, ctx.generation_id.value());
-            telemetry.mark(trace, crate::telemetry::Milestone::GenerationStarted);
-            telemetry.record_attributes(
-                trace,
-                crate::telemetry::TraceAttributes {
-                    response_provider: Some(provider.provider_name().to_string()),
-                    response_model: Some(model.clone()),
-                    context_turn_count: Some(built.context_turn_count),
-                    context_character_count: Some(built.context_character_count),
-                    ..Default::default()
-                },
-            );
-        }
-
-        let started_at = Instant::now();
-        let mut diagnostics = GenerationDiagnostics {
-            session_id: ctx.session_id,
-            generation_id: ctx.generation_id,
-            turn_id: ctx.turn_id,
-            utterance_id: ctx.utterance_id,
-            provider: provider.provider_name().to_string(),
-            model,
-            request_started: epoch_ms(),
-            http_status: None,
-            first_chunk_received: None,
-            raw_prefix: String::new(),
-            skip_detected: false,
-            echo_suppressed_characters: 0,
-            cancel_reason: None,
-            latency_ms: 0,
-            final_text_length: 0,
-            event_emitted: String::new(),
-            finalization_reason: trigger.finalization_reason.clone(),
-            gap_ms_used: trigger.gap_ms_used,
-            silence_detected_ms: trigger.silence_detected_ms,
-            context_turn_count: built.context_turn_count,
-            context_character_count: built.context_character_count,
-            prompt_preview: built.sanitized_preview.clone(),
-            utterance_finalized_to_request_started_ms: None,
-            request_to_first_http_chunk_ms: None,
-            request_to_first_visible_token_ms: None,
-            end_of_speech_to_first_visible_token_ms: None,
-        };
-        let utterance_finalized_at = trigger.utterance_finalized_at;
-        // Marcos de latência com relógio monotônico — computados em `finish_generation`,
-        // chamada em todo caminho de saída, para não repetir a conta em cada `return`.
-        let request_started_at = Instant::now();
-        let mut first_http_chunk_at: Option<Instant> = None;
-        let mut first_visible_text_at: Option<Instant> = None;
-
-        macro_rules! finish {
-            ($diagnostics:expr) => {
-                self.finish_generation(
-                    &app,
-                    &ctx,
-                    $diagnostics,
-                    started_at,
-                    utterance_finalized_at,
-                    request_started_at,
-                    first_http_chunk_at,
-                    first_visible_text_at,
-                )
-            };
-        }
-
-        if !self.publish_stream_event(
-            &app,
-            &ctx,
-            ResponseSuggestionEvent::Started {
-                session_id: ctx.session_id,
-                turn_id: ctx.turn_id,
-                utterance_id: ctx.utterance_id,
-                generation_id: ctx.generation_id,
-            },
-        ) {
-            diagnostics.event_emitted = "discarded_stale".to_string();
-            finish!(diagnostics);
-            return;
-        }
-
-        let mut invalid_retry_available = true;
-
-        'generation_attempt: loop {
-            let stream_result = tokio::select! {
-                        _ = cancel_token.cancelled() => {
-                            diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                            diagnostics.event_emitted = "cancelled".to_string();
-                            self.publish_terminal_event(
-                                &app,
-                                &ctx,
-                                &terminal_emitted,
-                                TerminalState::Cancelled,
-                                Some(ResponseSuggestionEvent::Cancelled {
-                                    session_id: ctx.session_id,
-                                    turn_id: ctx.turn_id,
-            utterance_id: ctx.utterance_id,
-                                    generation_id: ctx.generation_id,
-                                }),
-                            );
-                            finish!(diagnostics);
-                            return;
-                        }
-                result = provider.stream_reply(built.request.clone()) => result,
-            };
-
-            let mut stream = match stream_result {
-                Ok((s, meta)) => {
-                    diagnostics.http_status = Some(meta.http_status);
-                    s
-                }
-                Err(e) => {
-                    diagnostics.event_emitted = "error".to_string();
-                    self.publish_terminal_event(
-                        &app,
-                        &ctx,
-                        &terminal_emitted,
-                        TerminalState::Error,
-                        Some(ResponseSuggestionEvent::Error {
-                            session_id: ctx.session_id,
-                            turn_id: ctx.turn_id,
-                            utterance_id: ctx.utterance_id,
-                            generation_id: ctx.generation_id,
-                            message: e.to_string(),
-                        }),
-                    );
-                    finish!(diagnostics);
-                    return;
-                }
-            };
-
-            let mut detector = SkipDetector::new();
-            // Segundo filtro, depois do `SkipDetector` e antes de qualquer `Delta`: o modelo às
-            // vezes começa repetindo a fala em vez de respondê-la, e a sugestão saía sendo a
-            // própria pergunta. Ver `echo_guard.rs` — não é detecção de pergunta, é comparação
-            // com a fala conhecida que originou esta geração.
-            let mut echo_guard = EchoGuard::new(&trigger.utterance_text);
-            // Tudo que o `SkipDetector` liberou, tenha o guarda deixado passar ou não — a
-            // diferença para `full_text` no fim é exatamente o que foi suprimido como eco.
-            let mut fed_characters = 0usize;
-            let mut full_text = String::new();
-
-            loop {
-                let next = tokio::select! {
-                                _ = cancel_token.cancelled() => {
-                                    diagnostics.cancel_reason = Some(CANCEL_REASON_NEW_UTTERANCE.to_string());
-                                    diagnostics.event_emitted = "cancelled".to_string();
-                                    self.publish_terminal_event(
-                                        &app,
-                                        &ctx,
-                                        &terminal_emitted,
-                                        TerminalState::Cancelled,
-                                        Some(ResponseSuggestionEvent::Cancelled {
-                                            session_id: ctx.session_id,
-                                            turn_id: ctx.turn_id,
-                utterance_id: ctx.utterance_id,
-                                            generation_id: ctx.generation_id,
-                                        }),
-                                    );
-                                    finish!(diagnostics);
-                                    return;
-                                }
-                                item = stream.next() => item,
-                            };
-
-                let Some(item) = next else {
-                    break;
-                };
-
-                if diagnostics.first_chunk_received.is_none() {
-                    diagnostics.first_chunk_received = Some(epoch_ms());
-                }
-                if first_http_chunk_at.is_none() {
-                    first_http_chunk_at = Some(Instant::now());
-                }
-
-                match item {
-                    Ok(ResponseChunk::Delta(text)) => {
-                        if diagnostics.raw_prefix.chars().count() < RAW_PREFIX_CAP_CHARS {
-                            diagnostics.raw_prefix.push_str(&text);
-                        }
-                        match detector.push(&text) {
-                            SkipDecision::Pending => {}
-                            SkipDecision::Skip => {
-                                diagnostics.skip_detected = true;
-                                diagnostics.event_emitted = "skipped".to_string();
-                                tracing::info!(
-                                    session_id = ctx.session_id.value(),
-                                    turn_id = ctx.turn_id.value(),
-                                    generation_id = ctx.generation_id.value(),
-                                    "skip_detected"
-                                );
-                                self.publish_terminal_event(
-                                    &app,
-                                    &ctx,
-                                    &terminal_emitted,
-                                    TerminalState::Skipped,
-                                    Some(ResponseSuggestionEvent::Skipped {
-                                        session_id: ctx.session_id,
-                                        turn_id: ctx.turn_id,
-                                        utterance_id: ctx.utterance_id,
-                                        generation_id: ctx.generation_id,
-                                    }),
-                                );
-                                finish!(diagnostics);
-                                return;
-                            }
-                            SkipDecision::NotSkip { flush } => {
-                                fed_characters += flush.chars().count();
-                                let visible = echo_guard.push(&flush);
-                                if !visible.is_empty() {
-                                    if first_visible_text_at.is_none() {
-                                        first_visible_text_at = Some(Instant::now());
-                                    }
-                                    full_text.push_str(&visible);
-                                    if !self.publish_stream_event(
-                                        &app,
-                                        &ctx,
-                                        ResponseSuggestionEvent::Delta {
-                                            session_id: ctx.session_id,
-                                            turn_id: ctx.turn_id,
-                                            utterance_id: ctx.utterance_id,
-                                            generation_id: ctx.generation_id,
-                                            text: visible,
-                                        },
-                                    ) {
-                                        // Sessão encerrada ou geração substituída no meio do
-                                        // stream: para de consumir e não publica mais nada.
-                                        diagnostics.event_emitted = "discarded_stale".to_string();
-                                        finish!(diagnostics);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(ResponseChunk::Done) => break,
-                    Err(e) => {
-                        diagnostics.event_emitted = "error".to_string();
-                        self.publish_terminal_event(
-                            &app,
-                            &ctx,
-                            &terminal_emitted,
-                            TerminalState::Error,
-                            Some(ResponseSuggestionEvent::Error {
-                                session_id: ctx.session_id,
-                                turn_id: ctx.turn_id,
-                                utterance_id: ctx.utterance_id,
-                                generation_id: ctx.generation_id,
-                                message: e.to_string(),
-                            }),
-                        );
-                        finish!(diagnostics);
-                        return;
-                    }
-                }
-            }
-
-            match detector.finish() {
-                SkipDecision::Skip => {
-                    diagnostics.skip_detected = true;
-                    diagnostics.event_emitted = "skipped".to_string();
-                    tracing::info!(
-                        session_id = ctx.session_id.value(),
-                        turn_id = ctx.turn_id.value(),
-                        generation_id = ctx.generation_id.value(),
-                        "skip_detected"
-                    );
-                    self.publish_terminal_event(
-                        &app,
-                        &ctx,
-                        &terminal_emitted,
-                        TerminalState::Skipped,
-                        Some(ResponseSuggestionEvent::Skipped {
-                            session_id: ctx.session_id,
-                            turn_id: ctx.turn_id,
-                            utterance_id: ctx.utterance_id,
-                            generation_id: ctx.generation_id,
-                        }),
-                    );
-                }
-                SkipDecision::NotSkip { flush } => {
-                    // Fim do stream: o que o guarda ainda estiver segurando precisa sair agora
-                    // (ou ser descartado agora), senão uma resposta curta sem pontuação final
-                    // nunca chegaria à UI.
-                    fed_characters += flush.chars().count();
-                    let mut visible = echo_guard.push(&flush);
-                    visible.push_str(&echo_guard.finish());
-                    if !visible.is_empty() {
-                        if first_visible_text_at.is_none() {
-                            first_visible_text_at = Some(Instant::now());
-                        }
-                        full_text.push_str(&visible);
-                        self.publish_stream_event(
-                            &app,
-                            &ctx,
-                            ResponseSuggestionEvent::Delta {
-                                session_id: ctx.session_id,
-                                turn_id: ctx.turn_id,
-                                utterance_id: ctx.utterance_id,
-                                generation_id: ctx.generation_id,
-                                text: visible,
-                            },
-                        );
-                    }
-                    if is_invalid_generated_response(&full_text) && invalid_retry_available {
-                        invalid_retry_available = false;
-                        diagnostics.raw_prefix.clear();
-                        diagnostics.first_chunk_received = None;
-                        diagnostics.event_emitted = "retry_invalid_generation".to_string();
-                        let _ = self.publish_stream_event(
-                            &app,
-                            &ctx,
-                            ResponseSuggestionEvent::Started {
-                                session_id: ctx.session_id,
-                                turn_id: ctx.turn_id,
-                                utterance_id: ctx.utterance_id,
-                                generation_id: ctx.generation_id,
-                            },
-                        );
-                        continue 'generation_attempt;
-                    }
-
-                    diagnostics.event_emitted = if full_text.trim().is_empty() {
-                        "completed_empty".to_string()
-                    } else {
-                        "completed_with_text".to_string()
-                    };
-                    self.publish_terminal_event(
-                        &app,
-                        &ctx,
-                        &terminal_emitted,
-                        TerminalState::Completed,
-                        Some(ResponseSuggestionEvent::Completed {
-                            session_id: ctx.session_id,
-                            turn_id: ctx.turn_id,
-                            utterance_id: ctx.utterance_id,
-                            generation_id: ctx.generation_id,
-                            text: full_text.clone(),
-                        }),
-                    );
-                }
-                SkipDecision::Pending => {
-                    if is_invalid_generated_response(&full_text) && invalid_retry_available {
-                        invalid_retry_available = false;
-                        diagnostics.raw_prefix.clear();
-                        diagnostics.first_chunk_received = None;
-                        diagnostics.event_emitted = "retry_invalid_generation".to_string();
-                        let _ = self.publish_stream_event(
-                            &app,
-                            &ctx,
-                            ResponseSuggestionEvent::Started {
-                                session_id: ctx.session_id,
-                                turn_id: ctx.turn_id,
-                                utterance_id: ctx.utterance_id,
-                                generation_id: ctx.generation_id,
-                            },
-                        );
-                        continue 'generation_attempt;
-                    }
-
-                    diagnostics.event_emitted = if full_text.trim().is_empty() {
-                        "completed_empty".to_string()
-                    } else {
-                        "completed_with_text".to_string()
-                    };
-                    self.publish_terminal_event(
-                        &app,
-                        &ctx,
-                        &terminal_emitted,
-                        TerminalState::Completed,
-                        Some(ResponseSuggestionEvent::Completed {
-                            session_id: ctx.session_id,
-                            turn_id: ctx.turn_id,
-                            utterance_id: ctx.utterance_id,
-                            generation_id: ctx.generation_id,
-                            text: full_text.clone(),
-                        }),
-                    );
-                }
-            }
-
-            diagnostics.final_text_length = full_text.chars().count();
-            diagnostics.echo_suppressed_characters =
-                fed_characters.saturating_sub(diagnostics.final_text_length);
-            finish!(diagnostics);
-            break;
-        }
-    }
-
-    /// Fecha uma geração: registra `latency_ms`, computa as métricas de latência de ponta
-    /// a ponta (relógio monotônico, não epoch), emite o evento de diagnóstico (só se a
-    /// sessão dona ainda for a ativa) e libera o slot de `generations` se ainda for a
+    /// Finaliza a geração, publica diagnósticos (somente se a sessão dona ainda estiver
+    /// ativa) e libera o slot de `generations` se ainda for a
     /// geração corrente para o turno. Chamada em todo caminho de saída de
     /// `run_generation` (skip, erro, cancelamento, descarte por sessão ou conclusão), para
     /// que uma geração seguinte nunca veja um estado "fantasma" da anterior.
@@ -2346,15 +1901,22 @@ mod tests {
     // config I/O entirely.
     impl ResponseEngine {
         pub(super) fn for_test(provider: Arc<dyn ResponseProvider>) -> Arc<Self> {
+            let config = ResponseProviderConfig::default();
             Arc::new(ResponseEngine {
-                provider: Mutex::new(provider),
+                active_provider: Mutex::new(ActiveProvider { provider, config }),
                 context_builder: Arc::new(super::super::context::DefaultResponseContextBuilder),
-                config: Mutex::new(ResponseProviderConfig::default()),
                 config_path: PathBuf::from("unused-in-tests.json"),
                 session: Mutex::new(SessionState::new(SessionId::new())),
                 next_generation_id: AtomicU64::new(0),
                 last_rejection: Mutex::new(None),
             })
+        }
+
+        fn set_provider_for_test(&self, provider: Arc<dyn ResponseProvider>) {
+            self.active_provider
+                .lock()
+                .expect("response engine mutex poisoned")
+                .provider = provider;
         }
 
         /// Token raiz da sessão ativa — só os testes precisam olhar para ele diretamente,
@@ -3729,7 +3291,7 @@ Acho que depende do tamanho do time.",
             }],
         );
 
-        *engine.provider.lock().unwrap() = FakeProvider::with_text("[SKIP]");
+        engine.set_provider_for_test(FakeProvider::with_text("[SKIP]"));
         let ack = remote_turn(2, "Perfeito.");
         process_conversation_events(
             &handle,
@@ -3746,7 +3308,7 @@ Acho que depende do tamanho do time.",
 
         // --- Sessão B: começa vazia; a nova pergunta é respondida sem nenhum resquício de A.
         let answering_b = FakeProvider::with_text("Reduzi o custo por request com cache.");
-        *engine.provider.lock().unwrap() = answering_b.clone();
+        engine.set_provider_for_test(answering_b.clone());
         let boundary_events = drain_for(&mut rx, QUIET_WINDOW).await;
         assert!(
             boundary_events.is_empty(),
@@ -3780,7 +3342,7 @@ Acho que depende do tamanho do time.",
         engine.end_session(session_b);
         let session_c = SessionId::new();
         engine.begin_session(session_c);
-        *engine.provider.lock().unwrap() = scripted.clone();
+        engine.set_provider_for_test(scripted.clone());
 
         process_conversation_events(
             &handle,
@@ -3830,10 +3392,14 @@ Acho que depende do tamanho do time.",
         assert!(diagnostics["request_to_first_visible_token_ms"].is_u64());
         assert!(diagnostics["utterance_finalized_to_request_started_ms"].is_u64());
         assert_eq!(diagnostics["event_emitted"], "completed_with_text");
-        assert!(diagnostics["prompt_preview"]
-            .as_str()
-            .unwrap()
-            .contains(super::super::context::CURRENT_SPEECH_HEADER));
+        assert_eq!(
+            diagnostics["prompt_preview"].as_str(),
+            Some(""),
+            "redacted diagnostics must never expose prompt content"
+        );
+        assert_eq!(diagnostics["trigger_text"].as_str(), Some(""));
+        assert_eq!(diagnostics["trigger_text_hash"].as_str(), Some(""));
+        assert_eq!(diagnostics["raw_prefix"].as_str(), Some(""));
         assert!(diagnostics["context_character_count"].is_u64());
     }
 }

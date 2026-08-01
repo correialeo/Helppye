@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
-use crate::audio::types::AudioSource;
+use crate::audio::types::{AudioSource, CaptureStreamId};
 use crate::conversation::SessionId;
 use crate::transcription::error::TranscriptionError;
 use crate::transcription::events::TranscriptionEvent;
@@ -52,6 +52,8 @@ impl std::fmt::Display for TranscriptionSessionId {
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
     pub source: AudioSource,
+    pub capture_stream_id: CaptureStreamId,
+    pub sequence_number: u64,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub started_at: AudioTimestamp,
@@ -65,6 +67,8 @@ impl AudioChunk {
     pub fn from_segment(segment: crate::audio::segment::AudioSegment) -> Self {
         AudioChunk {
             source: segment.source,
+            capture_stream_id: segment.capture_stream_id,
+            sequence_number: segment.sequence_number,
             samples: segment.samples,
             sample_rate: segment.sample_rate,
             started_at: segment.started_at,

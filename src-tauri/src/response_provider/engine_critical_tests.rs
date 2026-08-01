@@ -315,8 +315,6 @@ mod end_to_end_trigger {
             source,
             capture_stream_id: stream,
             sequence_number: sequence,
-            raw_text: text.to_string(),
-            normalized_text: text.to_string(),
         };
         let transcript = FinalTranscript(TranscriptPayload {
             session_id,

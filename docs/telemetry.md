@@ -9,7 +9,8 @@ Código: `src-tauri/src/telemetry/`.
 
 `GenerationDiagnostics` complementa o trace com a prova de vinculacao da resposta:
 `session_id`, `generation_id`, `turn_id`, `utterance_id`, `utterance_revision`,
-`trigger_text` sanitizado, SHA-256 do trigger, `context_utterance_ids`, tamanho do
+`trigger_text` sanitizado, SHA-256 do trigger somente no modo Developer,
+`context_utterance_ids`, tamanho do
 contexto, resultado de validacao, uso de retry, score de vazamento, caracteres suprimidos
 pelo EchoGuard e estado terminal. Tambem expoe `speech_ended_at`,
 `transcription_completed_at`, `utterance_finalized_at`, `generation_triggered_at`,
@@ -103,14 +104,15 @@ devolve `None` quando qualquer um dos dois marcos falta.
 Não temporais, e nenhum deles é conteúdo:
 
 ```
-transcription_provider · transcription_model
+transcription_provider · transcription_model · transcription_queue_wait_ms
 response_provider      · response_model
 raw_text_length        · normalized_text_length · normalization_change_count
 context_turn_count     · context_character_count
 sanitized_text                  (só sob ContentPolicy::Developer)
 ```
 
-`raw_text_length` vs. `normalized_text_length` mais `normalization_change_count` dão o
+`transcription_queue_wait_ms` separa contenção/backpressure do tempo gasto dentro do
+provider. `raw_text_length` vs. `normalized_text_length` mais `normalization_change_count` dão o
 suficiente para investigar a normalização sem reter a fala.
 
 ## Recorder
