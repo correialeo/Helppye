@@ -271,21 +271,26 @@ async fn noisy_prior_user_speech_cannot_become_the_high_availability_answer() {
 // ---------------------------------------------------------------------------
 // Fio de ponta a ponta: `ConversationTimeline` real (com o timer dedicado de
 // utterance) até o `ResponseEngine`, exatamente como `lib.rs` conecta os dois via
-// `set_event_sink`. Todos os testes acima disparam `trigger_generation` ou
+// broadcast interno + event loop. Todos os testes acima disparam `trigger_generation` ou
 // `process_conversation_events` diretamente com um `ConversationTimelineEvent`
 // já pronto — nenhum exercitava o caminho que a produção realmente usa: captura
 // → `ConversationTimeline::ingest_normalized_transcript` → timer de silêncio →
-// sink → `process_conversation_events`. É exatamente essa lacuna que escondia o
+// canal → consumer → `process_conversation_events`. É exatamente essa lacuna que escondia o
 // defeito relatado (utterance finalizada, turno elegível, nenhuma geração).
 mod end_to_end_trigger {
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use super::{next_event, ResponseEngine, SequenceProvider};
     use crate::audio::segment::{AudioTimestamp, SegmentId};
     use crate::audio::types::{AudioSource, CaptureStreamId};
-    use crate::conversation::{ConversationAssemblerConfig, ConversationTimeline, SessionId};
+    use crate::conversation::{
+        emit_conversation_events, ConversationAssemblerConfig, ConversationTimeline, SessionId,
+    };
     use crate::normalization::TranscriptNormalizationResult;
-    use crate::response_provider::engine::process_conversation_events;
+    use crate::response_provider::engine::{
+        start_response_engine_event_loop, GenerationRejectionReason,
+    };
     use crate::transcription::envelope::TranscriptionResultEnvelope;
     use crate::transcription::events::{FinalTranscript, ProviderEventId, TranscriptPayload};
     use crate::transcription::provider::TranscriptionProviderId;
@@ -331,17 +336,21 @@ mod end_to_end_trigger {
         (envelope, transcript)
     }
 
-    /// Espelha exatamente a conexão que `lib.rs` registra em produção via
-    /// `timeline.set_event_sink`: toda finalização (reativa ou pelo timer dedicado) chega
-    /// ao `ResponseEngine` pelo mesmo caminho, sem passar por nenhum atalho de teste.
+    /// Espelha exatamente a conexão que `lib.rs` registra em produção: assina o broadcast
+    /// interno da timeline e inicia o único consumer do `ResponseEngine`.
     fn wire_timeline_to_engine(
         timeline: &std::sync::Arc<ConversationTimeline>,
         engine: std::sync::Arc<ResponseEngine>,
         app: tauri::AppHandle<tauri::test::MockRuntime>,
     ) {
-        timeline.set_event_sink(std::sync::Arc::new(move |events| {
-            process_conversation_events(&app, engine.clone(), &events);
-        }));
+        let receiver = timeline.subscribe_internal_events();
+        let frontend_app = app.clone();
+        timeline
+            .set_frontend_event_sink(std::sync::Arc::new(move |events| {
+                emit_conversation_events(&frontend_app, events);
+            }))
+            .expect("frontend sink is registered once per test timeline");
+        start_response_engine_event_loop(app, engine, receiver);
     }
 
     #[tokio::test]
@@ -399,7 +408,7 @@ mod end_to_end_trigger {
         config.same_speaker_utterance_gap_ms = TEST_GAP_MS;
         let timeline = std::sync::Arc::new(ConversationTimeline::new(config));
         timeline.attach();
-        let session = timeline.session_id();
+        let session = timeline.start_session().session_id;
         engine.begin_session(session);
 
         let app = tauri::test::mock_app();
@@ -448,5 +457,130 @@ mod end_to_end_trigger {
         let started = next_event(&mut suggestion_events, "started").await;
         assert_eq!(started["session_id"], session.value());
         next_event(&mut suggestion_events, "completed").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inactivity_timeout_reaches_the_engine_without_a_test_only_callback() {
+        let provider = SequenceProvider::new(&["resposta sugerida"]);
+        let engine = ResponseEngine::for_test(provider.clone());
+
+        let mut config = ConversationAssemblerConfig::default();
+        config.same_speaker_utterance_gap_ms = TEST_GAP_MS;
+        let timeline = std::sync::Arc::new(ConversationTimeline::new(config));
+        timeline.attach();
+        let session = timeline.start_session().session_id;
+        engine.begin_session(session);
+
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        let mut suggestion_events = super::capture(&handle);
+        wire_timeline_to_engine(&timeline, engine.clone(), handle);
+
+        let stream = CaptureStreamId::next();
+        let fixture = "Em qual situação você escolheria usar monolitos?\nEm qual situação você escolheria usar microserviços?";
+        let (envelope, transcript) = envelope_and_transcript(
+            session,
+            AudioSource::SystemOutput,
+            stream,
+            1,
+            fixture,
+            2_713,
+            8_713,
+        );
+        let normalization = TranscriptNormalizationResult::unchanged(transcript.0.text.clone());
+        timeline.ingest_normalized_transcript(
+            &envelope,
+            &transcript,
+            &normalization,
+            std::time::Instant::now(),
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(TEST_GAP_MS + 1)).await;
+        tokio::task::yield_now().await;
+
+        let snapshot = timeline.snapshot();
+        assert!(snapshot
+            .turns
+            .iter()
+            .any(|turn| turn.finalized_at.is_none()));
+        assert!(snapshot
+            .utterances
+            .iter()
+            .any(|utterance| utterance.finalized_at.is_some()));
+        let mut started = None;
+        let mut diagnostics = Vec::new();
+        for _ in 0..10_000 {
+            while let Ok(event) = suggestion_events.try_recv() {
+                match event["type"].as_str() {
+                    Some("started") => started = Some(event),
+                    Some("diagnostics") => diagnostics.push(event),
+                    _ => {}
+                }
+            }
+            if started.is_some() && diagnostics.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::yield_now();
+        }
+        let started = started.expect("generation_started must be emitted");
+        assert_eq!(started["type"], "started");
+        assert_eq!(provider.count.load(Ordering::SeqCst), 1);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["generation_id"], started["generation_id"]);
+        assert!(engine.last_rejection().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ineligible_microphone_utterance_records_rejection_before_generation_creation() {
+        let provider = SequenceProvider::new(&["não deve ser usada"]);
+        let engine = ResponseEngine::for_test(provider.clone());
+
+        let mut config = ConversationAssemblerConfig::default();
+        config.same_speaker_utterance_gap_ms = TEST_GAP_MS;
+        let timeline = std::sync::Arc::new(ConversationTimeline::new(config));
+        timeline.attach();
+        let session = timeline.start_session().session_id;
+        engine.begin_session(session);
+
+        let app = tauri::test::mock_app();
+        wire_timeline_to_engine(&timeline, engine.clone(), app.handle().clone());
+
+        let (envelope, transcript) = envelope_and_transcript(
+            session,
+            AudioSource::Microphone,
+            CaptureStreamId::next(),
+            1,
+            "Eu escolheria monólitos para começar.",
+            2_713,
+            8_713,
+        );
+        let normalization = TranscriptNormalizationResult::unchanged(transcript.0.text.clone());
+        timeline.ingest_normalized_transcript(
+            &envelope,
+            &transcript,
+            &normalization,
+            std::time::Instant::now(),
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(TEST_GAP_MS + 1)).await;
+        for _ in 0..100 {
+            if engine.last_rejection().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            std::thread::yield_now();
+        }
+
+        assert_eq!(provider.count.load(Ordering::SeqCst), 0);
+        let rejection = engine
+            .last_rejection()
+            .expect("ineligible finalized utterance must leave a diagnostic rejection");
+        assert!(matches!(
+            rejection.reason,
+            GenerationRejectionReason::WrongSpeaker | GenerationRejectionReason::WrongSource
+        ));
     }
 }

@@ -19,12 +19,13 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::AppHandle;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::audio::types::AudioSource;
 use crate::conversation::{
     ConversationSpeaker, ConversationTimelineEvent, ConversationTurn, ConversationUtterance,
-    SessionId, TurnId, UtteranceFinalizationReason, UtteranceId,
+    InternalConversationEventBatch, SessionId, TurnId, UtteranceFinalizationReason, UtteranceId,
 };
 
 /// Id de geração, monotônico por processo (nunca reiniciado, nem entre sessões): junto com
@@ -70,6 +71,9 @@ pub enum GenerationRejectionReason {
     NoActiveSession,
     /// O gatilho pertence a uma sessão diferente da sessão ativa do motor.
     WrongSession,
+    /// O transporte interno não conseguiu entregar um evento utilizável ao motor (canal
+    /// atrasado ou lote sem o snapshot do turno necessário para avaliar o gatilho).
+    EngineNotReady,
     /// O turno da utterance não é de `ConversationSpeaker::OtherPerson`.
     WrongSpeaker,
     /// O turno da utterance não é de `AudioSource::SystemOutput`.
@@ -104,6 +108,7 @@ impl GenerationRejectionReason {
         match self {
             Self::NoActiveSession => "no_active_session",
             Self::WrongSession => "wrong_session",
+            Self::EngineNotReady => "engine_not_ready",
             Self::WrongSpeaker => "wrong_speaker",
             Self::WrongSource => "wrong_source",
             Self::UtteranceNotFinalized => "utterance_not_finalized",
@@ -531,7 +536,7 @@ impl ResponseEngine {
             turn_id = turn_id.map(|id| id.value()),
             utterance_id = utterance_id.map(|id| id.value()),
             detail = %detail,
-            "generation_rejected"
+            "response_engine_trigger_rejected"
         );
         let mut last_rejection = self
             .last_rejection
@@ -1033,6 +1038,18 @@ impl ResponseEngine {
         }
 
         let built = self.context_builder.build(&request);
+        tracing::info!(
+            session_id = ctx.session_id.value(),
+            turn_id = ctx.turn_id.value(),
+            utterance_id = ctx.utterance_id.value(),
+            revision = ctx.utterance_revision,
+            generation_id = ctx.generation_id.value(),
+            provider = provider.provider_name(),
+            model = %config.model,
+            context_turn_count = built.context_turn_count,
+            context_character_count = built.context_character_count,
+            "response generation request built"
+        );
         let trigger_text_hash = format!(
             "{:x}",
             Sha256::digest(request.current_remote_utterance.as_bytes())
@@ -1144,6 +1161,16 @@ impl ResponseEngine {
             diagnostics.terminal_state = "discarded_stale".to_string();
             finish!();
         }
+
+        tracing::info!(
+            provider = provider.provider_name(),
+            session_id = ctx.session_id.value(),
+            turn_id = ctx.turn_id.value(),
+            utterance_id = ctx.utterance_id.value(),
+            revision = ctx.utterance_revision,
+            generation_id = ctx.generation_id.value(),
+            "starting response generation"
+        );
 
         for attempt in 0..=1 {
             let attempt_context = if attempt == 0 {
@@ -2003,6 +2030,156 @@ fn triggers_generation(reason: UtteranceFinalizationReason) -> bool {
     }
 }
 
+fn log_conversation_event_received(engine: &ResponseEngine, event: &ConversationTimelineEvent) {
+    let active_session_id = engine
+        .session
+        .lock()
+        .expect("response engine mutex poisoned")
+        .session_id;
+    let (session_id, turn_id, utterance_id, revision, speaker, source) = match event {
+        ConversationTimelineEvent::UtteranceStarted {
+            utterance_id,
+            turn_id,
+            speaker,
+            source,
+            ..
+        }
+        | ConversationTimelineEvent::UtteranceUpdated {
+            utterance_id,
+            turn_id,
+            speaker,
+            source,
+            ..
+        } => (
+            active_session_id,
+            Some(*turn_id),
+            Some(*utterance_id),
+            None,
+            Some(*speaker),
+            Some(*source),
+        ),
+        ConversationTimelineEvent::UtteranceFinalized {
+            turn_id,
+            utterance,
+            session_id,
+            ..
+        } => (
+            *session_id,
+            Some(*turn_id),
+            Some(utterance.id),
+            Some(utterance.revision),
+            Some(utterance.speaker),
+            Some(utterance.source),
+        ),
+        ConversationTimelineEvent::TurnStarted {
+            turn_id,
+            speaker,
+            source,
+            ..
+        } => (
+            active_session_id,
+            Some(*turn_id),
+            None,
+            None,
+            Some(*speaker),
+            Some(*source),
+        ),
+        ConversationTimelineEvent::TurnUpdated { turn } => (
+            active_session_id,
+            Some(turn.id),
+            None,
+            None,
+            Some(turn.speaker),
+            Some(turn.source),
+        ),
+        ConversationTimelineEvent::TurnFinalized { turn, session_id } => (
+            *session_id,
+            Some(turn.id),
+            None,
+            None,
+            Some(turn.speaker),
+            Some(turn.source),
+        ),
+        ConversationTimelineEvent::SessionEnded { session_id }
+        | ConversationTimelineEvent::SessionStarted { session_id } => {
+            (*session_id, None, None, None, None, None)
+        }
+    };
+
+    tracing::info!(
+        event_type = event.event_type(),
+        session_id = session_id.value(),
+        turn_id = turn_id.map(TurnId::value),
+        utterance_id = utterance_id.map(UtteranceId::value),
+        revision,
+        speaker = ?speaker,
+        source = ?source,
+        "response_engine_conversation_event_received"
+    );
+}
+
+/// Único consumer do canal interno da `ConversationTimeline`. Ele nasce uma vez no setup
+/// da aplicação e atravessa as trocas de sessão; sessão nova troca apenas o estado isolado
+/// do motor, nunca o receiver. `broadcast` permite receivers adicionais de diagnóstico sem
+/// fazer duas tasks disputarem um mesmo evento.
+pub async fn run_response_engine_event_loop<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    engine: Arc<ResponseEngine>,
+    mut receiver: broadcast::Receiver<InternalConversationEventBatch>,
+) {
+    tracing::info!("response_engine_event_loop_started");
+    loop {
+        match receiver.recv().await {
+            Ok(batch) => {
+                for event in &batch.events {
+                    log_conversation_event_received(&engine, event);
+                }
+                process_conversation_events_at(
+                    &app,
+                    engine.clone(),
+                    &batch.events,
+                    batch.published_at,
+                );
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::error!(skipped, "response_engine_event_loop_error");
+                engine.record_rejection(
+                    GenerationRejectionReason::EngineNotReady,
+                    None,
+                    None,
+                    format!("conversation event receiver lagged by {skipped} batches"),
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                tracing::info!("response_engine_event_loop_stopped");
+                break;
+            }
+        }
+    }
+}
+
+/// Inicia o worker e um supervisor separado. O supervisor observa `JoinError`, portanto um
+/// panic da task nunca vira um `let _ = spawn(...)` silencioso.
+pub fn start_response_engine_event_loop<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    engine: Arc<ResponseEngine>,
+    receiver: broadcast::Receiver<InternalConversationEventBatch>,
+) {
+    let worker = tauri::async_runtime::spawn(run_response_engine_event_loop(app, engine, receiver));
+    let supervisor = tauri::async_runtime::spawn(async move {
+        if let Err(error) = worker.await {
+            tracing::error!(%error, "response_engine_event_loop_error");
+            tracing::info!(
+                reason = "worker_join_error",
+                "response_engine_event_loop_stopped"
+            );
+        }
+    });
+    // Dropar um JoinHandle do Tokio apenas destaca a task; o supervisor continua vivo e
+    // observa o worker até o encerramento ou panic.
+    drop(supervisor);
+}
+
 /// Chamado a cada lote de eventos da Conversation Timeline. Mantém o histórico rolante
 /// e dispara geração quando uma utterance de um turno elegível finaliza. Genérica sobre
 /// `R: tauri::Runtime` pelo mesmo motivo de `trigger_generation`.
@@ -2010,10 +2187,20 @@ fn triggers_generation(reason: UtteranceFinalizationReason) -> bool {
 /// Todo evento carrega a sessão dona; nada aqui é aceito "no escuro". Turnos de uma sessão
 /// que não é mais a ativa não entram no histórico, e utterances de uma sessão encerrada não
 /// disparam geração.
+#[cfg(test)]
 pub fn process_conversation_events<R: tauri::Runtime>(
     app: &AppHandle<R>,
     engine: Arc<ResponseEngine>,
     events: &[ConversationTimelineEvent],
+) {
+    process_conversation_events_at(app, engine, events, Instant::now());
+}
+
+fn process_conversation_events_at<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    engine: Arc<ResponseEngine>,
+    events: &[ConversationTimelineEvent],
+    utterance_finalized_at: Instant,
 ) {
     let mut latest_turns: HashMap<TurnId, ConversationTurn> = HashMap::new();
     for event in events {
@@ -2025,12 +2212,6 @@ pub fn process_conversation_events<R: tauri::Runtime>(
             _ => {}
         }
     }
-
-    // Capturado uma única vez, antes do loop: a finalização da utterance (reativa ou pelo
-    // timer dedicado) e este processamento acontecem na mesma pilha de chamada síncrona,
-    // então este `Instant` é, na prática, o instante de finalização — ver
-    // `GenerationTrigger`.
-    let utterance_finalized_at = Instant::now();
 
     for event in events {
         let ConversationTimelineEvent::UtteranceFinalized {
@@ -2044,23 +2225,38 @@ pub fn process_conversation_events<R: tauri::Runtime>(
         else {
             continue;
         };
-        tracing::debug!(
+        tracing::info!(
             session_id = session_id.value(),
             turn_id = turn_id.value(),
             utterance_id = utterance.id.value(),
-            utterance_revision = utterance.revision,
-            reason = finalization_reason.as_str(),
-            "generation_trigger_received"
+            revision = utterance.revision,
+            speaker = ?utterance.speaker,
+            source = ?utterance.source,
+            finalization_reason = finalization_reason.as_str(),
+            "response_engine_trigger_considered"
         );
         if !triggers_generation(*finalization_reason) {
-            tracing::debug!(
+            tracing::info!(
                 session_id = session_id.value(),
                 turn_id = turn_id.value(),
-                reason = finalization_reason.as_str(),
-                "generation trigger ignored: finalization caused by session/capture teardown"
+                utterance_id = utterance.id.value(),
+                revision = utterance.revision,
+                finalization_reason = finalization_reason.as_str(),
+                rejection_reason = "finalization_does_not_trigger_generation",
+                "response_engine_trigger_rejected"
             );
         } else if let Some(turn) = latest_turns.get(turn_id) {
             if is_eligible_turn(turn) {
+                tracing::info!(
+                    session_id = session_id.value(),
+                    turn_id = turn_id.value(),
+                    utterance_id = utterance.id.value(),
+                    revision = utterance.revision,
+                    speaker = ?utterance.speaker,
+                    source = ?utterance.source,
+                    finalization_reason = finalization_reason.as_str(),
+                    "response_engine_trigger_accepted"
+                );
                 let trigger = GenerationTrigger {
                     session_id: *session_id,
                     utterance_id: utterance.id,
@@ -2092,6 +2288,13 @@ pub fn process_conversation_events<R: tauri::Runtime>(
                     format!("turn source is {:?}, not SystemOutput", turn.source),
                 );
             }
+        } else {
+            engine.record_rejection(
+                GenerationRejectionReason::EngineNotReady,
+                Some(*turn_id),
+                Some(utterance.id),
+                "utterance_finalized batch did not contain TurnUpdated/TurnFinalized",
+            );
         }
         // O trigger acima materializou o snapshot antes de esta utterance entrar
         // no historico. Assim a fala atual nunca se duplica no contexto.

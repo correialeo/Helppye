@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -22,9 +23,7 @@ use crate::integrity::{
     CrossSourceDiagnosis, IntegrityStage, SourceIntegrityError, TranscriptSegmentOrigin,
 };
 use crate::normalization::{NormalizationChange, TranscriptNormalizationResult};
-use crate::response_provider::engine::{
-    is_eligible_turn, process_conversation_events, GenerationTrigger,
-};
+use crate::response_provider::engine::{is_eligible_turn, GenerationTrigger};
 use crate::response_provider::ResponseEngineState;
 use crate::transcription::envelope::TranscriptionResultEnvelope;
 use crate::transcription::events::FinalTranscript;
@@ -38,6 +37,7 @@ pub const CONVERSATION_TIMELINE_EVENT: &str = "conversation://timeline-event";
 /// sessão inteira cresceria com a duração da reunião dentro do caminho crítico da latência,
 /// justamente onde a métrica de UX é medida.
 const CROSS_SOURCE_COMPARISON_WINDOW: usize = 6;
+const INTERNAL_EVENT_CHANNEL_CAPACITY: usize = 128;
 
 /// Fecha o rastro de origem daquele resultado com o que só a timeline conhece: a fonte com
 /// que o segmento de fato entrou e o speaker derivado dela. `cross_source_similarity` vem do
@@ -574,6 +574,21 @@ pub enum ConversationTimelineEvent {
     },
 }
 
+impl ConversationTimelineEvent {
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::UtteranceStarted { .. } => "utterance_started",
+            Self::UtteranceUpdated { .. } => "utterance_updated",
+            Self::UtteranceFinalized { .. } => "utterance_finalized",
+            Self::TurnStarted { .. } => "turn_started",
+            Self::TurnUpdated { .. } => "turn_updated",
+            Self::TurnFinalized { .. } => "turn_finalized",
+            Self::SessionEnded { .. } => "session_ended",
+            Self::SessionStarted { .. } => "session_started",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ConversationAssemblerConfig {
     pub same_speaker_utterance_gap_ms: u64,
@@ -932,15 +947,30 @@ impl ConversationAssembler {
         };
         utterance.finalized_at = Some(utterance.ended_at);
         self.update_open_turn_tail(&utterance);
+        self.finalized_utterances.push(utterance.clone());
         info!(
+            session_id = self.session_id.value(),
             utterance_id = utterance.id.0,
             turn_id = self.open_turn_id().0,
             speaker = ?utterance.speaker,
+            source = ?utterance.source,
+            capture_stream_id = utterance.capture_stream_id.value(),
+            revision = utterance.revision,
             segments = utterance.segments.len(),
             reason = reason.as_str(),
             "conversation utterance finalized"
         );
-        self.finalized_utterances.push(utterance.clone());
+        info!(
+            session_id = self.session_id.value(),
+            turn_id = self.open_turn_id().value(),
+            utterance_id = utterance.id.value(),
+            revision = utterance.revision,
+            speaker = ?utterance.speaker,
+            source = ?utterance.source,
+            capture_stream_id = utterance.capture_stream_id.value(),
+            finalization_reason = reason.to_utterance_reason().as_str(),
+            "utterance_finalization_committed"
+        );
         vec![
             ConversationTimelineEvent::UtteranceFinalized {
                 turn_id: self.open_turn_id(),
@@ -1165,13 +1195,20 @@ pub struct ConversationTimelineSnapshot {
     pub utterances: Vec<ConversationUtterance>,
 }
 
-/// Recebe eventos produzidos fora do fluxo síncrono de `ingest_transcript_event` — hoje,
-/// só o timer dedicado da utterance (ver `reschedule_utterance_timer`). O chamador (
-/// `lib.rs`) registra aqui a mesma sequência `emit_conversation_events` +
-/// `process_conversation_events` que já usa manualmente para eventos síncronos, para que
-/// uma utterance finalizada por silêncio chegue ao frontend e ao `ResponseEngine` do
-/// mesmo jeito que uma finalizada por um novo segmento.
-pub type ConversationEventSink = Arc<dyn Fn(Vec<ConversationTimelineEvent>) + Send + Sync>;
+/// Envelope exclusivo do transporte backend. `published_at` preserva o instante
+/// monotônico da finalização para que a latência do canal também entre no diagnóstico;
+/// esse campo não pertence ao contrato serializado da Timeline para o frontend.
+#[derive(Debug, Clone)]
+pub struct InternalConversationEventBatch {
+    pub events: Vec<ConversationTimelineEvent>,
+    pub published_at: Instant,
+}
+
+/// Emissão exclusivamente visual para eventos produzidos sem um chamador Tauri síncrono
+/// (hoje, o timer de silêncio). O transporte interno do `ResponseEngine` é o canal
+/// `internal_events`; manter os dois mecanismos nomeados separadamente impede que um evento
+/// visível no frontend seja confundido com uma notificação entregue ao backend.
+pub type TimelineFrontendEventSink = Arc<dyn Fn(Vec<ConversationTimelineEvent>) + Send + Sync>;
 
 /// Resultado de uma transição de sessão. `events` já vem na ordem em que deve chegar ao
 /// frontend (finalizações da sessão que acabou, depois a fronteira).
@@ -1184,7 +1221,11 @@ pub struct SessionTransition {
 pub struct ConversationTimeline {
     assembler: Mutex<ConversationAssembler>,
     next_sequence: AtomicU64,
-    sink: OnceLock<ConversationEventSink>,
+    frontend_sink: OnceLock<TimelineFrontendEventSink>,
+    /// Broadcast interno com um único publisher (esta timeline) e receivers independentes.
+    /// Diferente de um `mpsc`, receivers adicionais de diagnóstico não disputam eventos com
+    /// o `ResponseEngine`.
+    internal_events: broadcast::Sender<InternalConversationEventBatch>,
     /// Token raiz da sessão atual: cancelado (e substituído por um novo) em toda
     /// transição de sessão, para que nenhum timer de utterance agendado na sessão
     /// anterior chegue a rodar. A checagem de `session_id`/revisão em
@@ -1206,10 +1247,12 @@ impl Default for ConversationTimeline {
 
 impl ConversationTimeline {
     pub fn new(config: ConversationAssemblerConfig) -> Self {
+        let (internal_events, _) = broadcast::channel(INTERNAL_EVENT_CHANNEL_CAPACITY);
         ConversationTimeline {
             assembler: Mutex::new(ConversationAssembler::new(config)),
             next_sequence: AtomicU64::new(0),
-            sink: OnceLock::new(),
+            frontend_sink: OnceLock::new(),
+            internal_events,
             session_cancel: Mutex::new(CancellationToken::new()),
             self_weak: OnceLock::new(),
         }
@@ -1222,8 +1265,110 @@ impl ConversationTimeline {
         let _ = self.self_weak.set(Arc::downgrade(self));
     }
 
-    pub fn set_event_sink(&self, sink: ConversationEventSink) {
-        let _ = self.sink.set(sink);
+    pub fn set_frontend_event_sink(
+        &self,
+        sink: TimelineFrontendEventSink,
+    ) -> Result<(), &'static str> {
+        self.frontend_sink
+            .set(sink)
+            .map_err(|_| "timeline frontend event sink already registered")
+    }
+
+    /// Receiver novo do pipeline interno. A aplicação cria exatamente um receiver para o
+    /// `ResponseEngine` durante o `setup`; testes podem criar outro sem roubar mensagens.
+    pub fn subscribe_internal_events(&self) -> broadcast::Receiver<InternalConversationEventBatch> {
+        self.internal_events.subscribe()
+    }
+
+    fn publish_internal_events(&self, events: &[ConversationTimelineEvent]) {
+        if events.is_empty() {
+            return;
+        }
+
+        let receiver_count = self.internal_events.receiver_count();
+        for event in events {
+            if let ConversationTimelineEvent::UtteranceFinalized {
+                turn_id,
+                utterance,
+                finalization_reason,
+                session_id,
+                ..
+            } = event
+            {
+                info!(
+                    session_id = session_id.value(),
+                    turn_id = turn_id.value(),
+                    utterance_id = utterance.id.value(),
+                    revision = utterance.revision,
+                    speaker = ?utterance.speaker,
+                    source = ?utterance.source,
+                    capture_stream_id = utterance.capture_stream_id.value(),
+                    finalization_reason = finalization_reason.as_str(),
+                    receiver_count,
+                    "utterance_finalized_event_building"
+                );
+            }
+        }
+
+        let batch = InternalConversationEventBatch {
+            events: events.to_vec(),
+            published_at: Instant::now(),
+        };
+        match self.internal_events.send(batch) {
+            Ok(send_result) => {
+                for event in events {
+                    if let ConversationTimelineEvent::UtteranceFinalized {
+                        turn_id,
+                        utterance,
+                        finalization_reason,
+                        session_id,
+                        ..
+                    } = event
+                    {
+                        info!(
+                            session_id = session_id.value(),
+                            turn_id = turn_id.value(),
+                            utterance_id = utterance.id.value(),
+                            revision = utterance.revision,
+                            speaker = ?utterance.speaker,
+                            source = ?utterance.source,
+                            capture_stream_id = utterance.capture_stream_id.value(),
+                            finalization_reason = finalization_reason.as_str(),
+                            receiver_count = send_result,
+                            send_result = "ok",
+                            "utterance_finalized_event_sent"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                for event in events {
+                    if let ConversationTimelineEvent::UtteranceFinalized {
+                        turn_id,
+                        utterance,
+                        finalization_reason,
+                        session_id,
+                        ..
+                    } = event
+                    {
+                        tracing::error!(
+                            session_id = session_id.value(),
+                            turn_id = turn_id.value(),
+                            utterance_id = utterance.id.value(),
+                            revision = utterance.revision,
+                            speaker = ?utterance.speaker,
+                            source = ?utterance.source,
+                            capture_stream_id = utterance.capture_stream_id.value(),
+                            finalization_reason = finalization_reason.as_str(),
+                            receiver_count,
+                            send_result = "no_receivers",
+                            error = %error,
+                            "utterance_finalized_event_send_failed"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Sessão ativa neste momento. Todo evento/tarefa que se refira à conversa carrega
@@ -1272,11 +1417,13 @@ impl ConversationTimeline {
             previous_session_id = previous_session_id.0,
             "session_started"
         );
-        SessionTransition {
+        let transition = SessionTransition {
             previous_session_id,
             session_id,
             events: vec![ConversationTimelineEvent::SessionStarted { session_id }],
-        }
+        };
+        self.publish_internal_events(&transition.events);
+        transition
     }
 
     /// `same_speaker_utterance_gap_ms` atualmente em uso — configurável em runtime via
@@ -1393,6 +1540,7 @@ impl ConversationTimeline {
             .lock()
             .expect("conversation timeline mutex poisoned")
             .ingest_segment(segment);
+        self.publish_internal_events(&events);
         self.reschedule_utterance_timer();
         events
     }
@@ -1470,8 +1618,16 @@ impl ConversationTimeline {
         if events.is_empty() {
             return;
         }
-        if let Some(sink) = self.sink.get() {
+        self.publish_internal_events(&events);
+        if let Some(sink) = self.frontend_sink.get() {
             sink(events);
+        } else {
+            tracing::error!(
+                session_id = session_id.value(),
+                utterance_id = utterance_id.value(),
+                revision,
+                "timeline_frontend_event_sink_missing"
+            );
         }
     }
 
@@ -1482,17 +1638,23 @@ impl ConversationTimeline {
         let AudioCaptureEvent::Stopped { source } = event else {
             return Vec::new();
         };
-        self.assembler
+        let events = self
+            .assembler
             .lock()
             .expect("conversation timeline mutex poisoned")
-            .finalize_source(*source, FinalizationReason::Paused)
+            .finalize_source(*source, FinalizationReason::Paused);
+        self.publish_internal_events(&events);
+        events
     }
 
     pub fn flush(&self) -> Vec<ConversationTimelineEvent> {
-        self.assembler
+        let events = self
+            .assembler
             .lock()
             .expect("conversation timeline mutex poisoned")
-            .flush()
+            .flush();
+        self.publish_internal_events(&events);
+        events
     }
 
     /// Encerra a sessão ativa: finaliza o que estava aberto (para o frontend ver a
@@ -1526,11 +1688,13 @@ impl ConversationTimeline {
             "session_ended"
         );
 
-        SessionTransition {
+        let transition = SessionTransition {
             previous_session_id,
             session_id,
             events,
-        }
+        };
+        self.publish_internal_events(&transition.events);
+        transition
     }
 
     pub fn snapshot(&self) -> ConversationTimelineSnapshot {
@@ -1561,11 +1725,9 @@ pub async fn conversation_timeline_snapshot_command(
 pub async fn conversation_flush_turns_command(
     app: AppHandle,
     state: State<'_, ConversationTimelineState>,
-    response_state: State<'_, ResponseEngineState>,
 ) -> Result<(), String> {
     let events = state.0.flush();
-    emit_conversation_events(&app, events.clone());
-    process_conversation_events(&app, response_state.0.clone(), &events);
+    emit_conversation_events(&app, events);
     Ok(())
 }
 
@@ -1605,11 +1767,10 @@ pub async fn conversation_start_session_command(
 
 /// Encerramento atômico e ordenado: marca a sessão como encerrando (nenhum gatilho novo é
 /// aceito), cancela a geração ativa e os timers, apaga contexto/turnos/utterances/segmentos
-/// e só então abre a fronteira da próxima sessão. Os eventos de finalização são emitidos
-/// ao frontend, mas **não** passam por `process_conversation_events` — reprocessá-los era
-/// justamente o que fazia a última fala da sessão encerrada gerar uma sugestão que
-/// aparecia na sessão seguinte. Idempotente: encerrar duas vezes só troca a fronteira de
-/// novo, sobre um estado já vazio.
+/// e só então abre a fronteira da próxima sessão. Os eventos de finalização atravessam o
+/// canal interno canônico, mas carregam `SessionEnded`: o engine os observa e os rejeita
+/// explicitamente como gatilho, sem criar trabalho para a sessão encerrada. Idempotente:
+/// encerrar duas vezes só troca a fronteira de novo, sobre um estado já vazio.
 #[tauri::command]
 pub async fn conversation_end_session_command(
     app: AppHandle,
@@ -1720,7 +1881,10 @@ pub async fn conversation_set_utterance_gap_ms_command(
     Ok(())
 }
 
-pub fn emit_conversation_events(app: &AppHandle, events: Vec<ConversationTimelineEvent>) {
+pub fn emit_conversation_events<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    events: Vec<ConversationTimelineEvent>,
+) {
     for event in events {
         record_utterance_telemetry(&event);
         if let Err(e) = app.emit(CONVERSATION_TIMELINE_EVENT, &event) {
@@ -2255,9 +2419,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
 
         timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
             AudioSource::SystemOutput,
@@ -2298,9 +2464,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
 
         timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
             AudioSource::SystemOutput,
@@ -2333,9 +2501,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
         let gap_ms = ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms;
 
         timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
@@ -2400,9 +2570,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
 
         // Dois segmentos próximos no tempo agendam dois timers para a mesma utterance
         // (revisão 1 e revisão 2); só o timer da revisão mais recente deve produzir uma
@@ -2442,9 +2614,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
         let gap_ms = ConversationAssemblerConfig::default().same_speaker_utterance_gap_ms;
 
         timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
@@ -2484,9 +2658,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
 
         timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
             AudioSource::SystemOutput,
@@ -2517,9 +2693,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
 
         timeline.set_utterance_gap_ms(500);
         assert_eq!(timeline.utterance_gap_ms(), 500);
@@ -2673,9 +2851,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
 
         timeline.ingest_transcript_event(TranscriptEvent::Ready(transcript(
             AudioSource::SystemOutput,
@@ -2707,9 +2887,11 @@ mod tests {
         let sink_events: Arc<Mutex<Vec<ConversationTimelineEvent>>> =
             Arc::new(Mutex::new(Vec::new()));
         let sink_events_cb = sink_events.clone();
-        timeline.set_event_sink(Arc::new(move |events| {
-            sink_events_cb.lock().unwrap().extend(events);
-        }));
+        timeline
+            .set_frontend_event_sink(Arc::new(move |events| {
+                sink_events_cb.lock().unwrap().extend(events);
+            }))
+            .unwrap();
 
         timeline.end_session();
         sink_events.lock().unwrap().clear();

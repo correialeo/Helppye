@@ -43,18 +43,26 @@ mantem um gate da sessao ativa, inclusive para `started` e `diagnostics` atrasad
 
 ## Visão geral do fluxo
 
+Há duas saídas independentes da mesma finalização canônica:
+
+- **Timeline frontend event:** `conversation://timeline-event`, emitido para atualizar a UI.
+- **Internal response-engine event:** lote publicado em `tokio::sync::broadcast`, consumido
+  apenas pelo event loop backend; não depende da UI, polling ou snapshot.
+
 ```
 Conversation Timeline (turns/utterances) — dona do session_id
         │  silêncio ≥ same_speaker_utterance_gap_ms → timer dedicado finaliza a
         │  utterance sozinho (sem esperar novo segmento/flush/stop/turno fechar)
         │  UtteranceFinalized (turno elegível, com session_id)
         ▼
+tokio::sync::broadcast interno → event loop único e supervisionado do ResponseEngine
+        ▼
 process_conversation_events → GenerationTrigger (session_id, utterance_id,
         │  utterance_revision, finalization_reason, gap_ms_used, silence_detected_ms,
         │  utterance_finalized_at)
         ▼
 ResponseEngine::trigger_generation
-        │  rejeita gatilho de sessão não-ativa/encerrando (generation_rejected_wrong_session)
+        │  rejeita gatilho de sessão não-ativa/encerrando (response_engine_trigger_rejected)
         │  cancela geração anterior do mesmo turno, se houver (token filho do token raiz)
         ▼
 snapshot_generation_request (utterances finalizadas anteriores + fala atual isolada)
@@ -203,12 +211,12 @@ Todos esses campos aparecem nos logs estruturados e em todos os eventos público
 
 ### Os quatro pontos de validação
 
-O `session_id` é comparado com a sessão ativa em quatro lugares distintos, e falhar em
-qualquer um deles é sempre um descarte silencioso com log `debug` — nunca um erro exibido
-ao usuário:
+O `session_id` é comparado com a sessão ativa em quatro lugares distintos. Falhas de
+gatilho ficam em `last_rejection` e nos logs estruturados; eventos stale em voo são
+descartados no backend e nunca exibidos ao usuário:
 
 1. **No gatilho** (`trigger_generation`): sessão diferente ou `ending = true` ⇒
-   `generation_rejected_wrong_session`, nada é iniciado.
+   `response_engine_trigger_rejected`, nada é iniciado.
 2. **No snapshot** (`push_history` / `snapshot_at_trigger`): uma utterance finalizada que
    chegue atrasada, de uma sessão encerrada, não entra no histórico. Identidade e contexto
    são copiados sob o lock da sessão no trigger; a task não consulta estado conversacional
@@ -250,11 +258,11 @@ existente.
 Como os passos 3–6 acontecem sob o mesmo `Mutex`, não existe janela em que uma geração
 consiga ler um estado meio-encerrado.
 
-`conversation_end_session_command` **não** realimenta suas próprias finalizações em
-`process_conversation_events`: ele emite os eventos de timeline para o frontend e chama
-`ResponseEngine::end_session`. Antes, o comando passava suas finalizações pelo mesmo
-caminho de um `UtteranceFinalized` normal, o que fazia o encerramento gerar trabalho novo
-em vez de encerrar o existente.
+`conversation_end_session_command` chama `ResponseEngine::end_session` antes de finalizar
+a Timeline. As finalizações de teardown também atravessam o canal interno canônico, mas
+`process_conversation_events` rejeita explicitamente `SessionEnded`/`CaptureStopped` como
+motivos que não disparam geração. Assim o backend observa e diagnostica a fronteira sem
+criar trabalho novo para uma sessão que está terminando.
 
 ### Estado terminal único
 
@@ -399,11 +407,18 @@ registra API key, prompt completo ou credencial):
 | `session_ending`                    | `end_session` (engine + timeline) | início do teardown (nº de gerações e turnos)    |
 | `session_state_cleared`             | `end_session` (engine) + `reset_for_new_session` (assembler) | histórico/coleções apagados, com quantidades |
 | `session_ended`                     | `ConversationTimeline::end_session` | fronteira fechada na timeline                 |
-| `generation_trigger_received`       | `process_conversation_events`   | `UtteranceFinalized` elegível chegou              |
-| `generation_rejected_wrong_session` | `trigger_generation`            | gatilho de sessão não-ativa/encerrando            |
+| `utterance_finalization_committed`  | `ConversationAssembler`         | estado finalizado foi gravado no snapshot         |
+| `utterance_finalized_event_sent`    | `ConversationTimeline`          | lote entregue ao canal interno, com nº de receivers |
+| `response_engine_event_loop_started` | `run_response_engine_event_loop` | único receiver interno iniciou                    |
+| `response_engine_event_loop_stopped` / `response_engine_event_loop_error` | supervisor do event loop | canal fechou ou a task falhou |
+| `response_engine_conversation_event_received` | event loop do engine | evento recebido antes de qualquer filtro          |
+| `response_engine_trigger_considered` | `process_conversation_events`  | `UtteranceFinalized` entrou na avaliação          |
+| `response_engine_trigger_accepted`  | `process_conversation_events`   | gatilho elegível seguirá para criação da geração  |
+| `response_engine_trigger_rejected`  | `process_conversation_events` / `record_rejection` | rejeição antes ou depois da criação de id          |
 | `generation_cancelled_session_end`  | `end_session`                   | geração em voo cancelada pelo encerramento        |
 | `generation_event_discarded_stale`  | `publish_*` / `run_generation`  | evento suprimido por sessão/geração obsoleta      |
-| `context_built`                     | `run_generation`                | com `context_turn_count`/`context_character_count` |
+| `response generation request built` | `run_generation`               | request pronta, com contexto e identidade          |
+| `starting response generation`      | `run_generation`               | provider fake/real será chamado                    |
 | `skip_detected`                     | `run_generation`                | `SkipDetector` decidiu `Skip`                     |
 | `terminal_state`                    | `publish_terminal_event`        | estado terminal único daquela geração             |
 

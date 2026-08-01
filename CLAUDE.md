@@ -295,12 +295,14 @@ Os timestamps dos segmentos são convertidos pelo `CaptureEngine` para um relóg
 monotônico comum do processo antes de entrar na fila de transcrição, para que falas de
 microfone e saída do sistema sejam comparáveis na mesma linha do tempo. O
 `ResponseEngine` (`response_provider::engine::process_conversation_events`) consome
-`ConversationTurn`, não `AudioFrame`, `AudioSegment` ou eventos brutos de transcrição —
-disparado tanto pela finalização reativa quanto pela finalização via timer, pelo mesmo
-caminho (`emit_conversation_events` + `process_conversation_events`, registrado como
-`ConversationEventSink` em `ConversationTimeline::set_event_sink` para o caso do timer,
-que não tem um chamador síncrono externo para fazer isso manualmente como os comandos
-Tauri fazem).
+`ConversationTurn`, não `AudioFrame`, `AudioSegment` ou eventos brutos de transcrição.
+Toda transição da Timeline publica o lote em um `tokio::sync::broadcast` interno; um único
+event loop do ResponseEngine assina esse canal no `setup()` e permanece vivo entre sessões.
+Esse transporte é independente de `conversation://timeline-event`: o evento Tauri é apenas
+visual e, no caso assíncrono do timer, é emitido por `TimelineFrontendEventSink`. Assim,
+ver uma utterance finalizada no frontend não é usado como prova de que o engine a recebeu;
+os logs `utterance_finalized_event_sent` e
+`response_engine_conversation_event_received` confirmam a entrega interna.
 
 ## Sugestão de resposta (`src-tauri/src/response_provider/`)
 

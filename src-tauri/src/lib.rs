@@ -23,7 +23,7 @@ use tracing_subscriber::EnvFilter;
 
 use audio::segment::SegmentId;
 use conversation::{emit_conversation_events, ConversationTimeline, ConversationTimelineState};
-use response_provider::engine::process_conversation_events;
+use response_provider::engine::start_response_engine_event_loop;
 use transcription::events::TranscriptionEvent;
 use transcription::provider::TranscriptionProvider;
 use transcription::queue::TranscriptionQueue;
@@ -89,29 +89,30 @@ pub fn run() {
             response_engine.begin_session(timeline.session_id());
             let app_handle = app.handle().clone();
 
+            // O receiver interno nasce uma vez por aplicação e permanece vivo entre
+            // sessões. A Timeline é o único publisher; o ResponseEngine é o consumer.
+            let response_event_receiver = timeline.subscribe_internal_events();
+            start_response_engine_event_loop(
+                app_handle.clone(),
+                response_engine.clone(),
+                response_event_receiver,
+            );
+
             // O timer dedicado da utterance (`ConversationTimeline::reschedule_utterance_timer`)
             // finaliza uma utterance por silêncio sem que nenhum código externo chame de
             // volta o timeline — precisa de um jeito de emitir esses eventos por conta
-            // própria. Registra aqui a mesma sequência emit+process usada manualmente logo
-            // abaixo para o caminho síncrono (novo segmento chegando), para que os dois
-            // caminhos cheguem ao frontend e ao `ResponseEngine` de forma idêntica.
+            // própria. Esta callback é exclusivamente o evento visual Tauri; o evento
+            // interno do ResponseEngine é publicado pela própria Timeline no broadcast.
             let app_handle_for_sink = app_handle.clone();
-            let response_engine_for_sink = response_engine.clone();
-            timeline.set_event_sink(Arc::new(move |events| {
-                emit_conversation_events(&app_handle_for_sink, events.clone());
-                process_conversation_events(
-                    &app_handle_for_sink,
-                    response_engine_for_sink.clone(),
-                    &events,
-                );
-            }));
+            timeline.set_frontend_event_sink(Arc::new(move |events| {
+                emit_conversation_events(&app_handle_for_sink, events);
+            }))?;
 
             // Todo resultado que chega aqui já foi validado pelo `TranscriptionRuntime`:
             // pertence à sessão de conversa ativa, à sessão de transcrição viva daquela
             // fonte, e não é reentrega. O descarte acontece lá, antes da timeline — ver
             // `transcription/runtime.rs`.
             let timeline_for_queue = timeline.clone();
-            let response_engine_for_queue = response_engine.clone();
             let sink: TranscriptionOutputSink = Arc::new(move |output| match output {
                 TranscriptionRuntimeOutput::Final(normalized) => {
                     let segment_id = normalized
@@ -140,12 +141,7 @@ pub fn run() {
                         &normalized.normalization,
                         normalized.speech_ended_at,
                     );
-                    emit_conversation_events(&app_handle, conversation_events.clone());
-                    process_conversation_events(
-                        &app_handle,
-                        response_engine_for_queue.clone(),
-                        &conversation_events,
-                    );
+                    emit_conversation_events(&app_handle, conversation_events);
                 }
                 TranscriptionRuntimeOutput::Event(TranscriptionEvent::Error(error)) => {
                     // Uma transcrição que falha não pode sumir sem deixar rastro: sem este
@@ -196,7 +192,6 @@ pub fn run() {
                 app.handle(),
                 queue.clone(),
                 timeline.clone(),
-                response_engine.clone(),
             )?;
             app.manage(audio_state);
             app.manage(ConversationTimelineState(timeline));
