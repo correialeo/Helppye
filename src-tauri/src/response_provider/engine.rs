@@ -2094,6 +2094,7 @@ mod tests {
         text: &str,
     ) -> ConversationTurn {
         ConversationTurn {
+            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
             id: TurnId::from_raw(id),
             speaker,
             source,
@@ -2117,6 +2118,7 @@ mod tests {
 
     fn remote_utterance(id: u64, text: &str) -> ConversationUtterance {
         ConversationUtterance {
+            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
             id: UtteranceId::from_raw(id),
             speaker: ConversationSpeaker::OtherPerson,
             source: AudioSource::SystemOutput,
@@ -2154,6 +2156,7 @@ mod tests {
         reason: UtteranceFinalizationReason,
     ) -> Vec<ConversationTimelineEvent> {
         let utterance = ConversationUtterance {
+            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
             id: UtteranceId::from_raw(turn.id.value()),
             speaker: turn.speaker,
             source: turn.source,

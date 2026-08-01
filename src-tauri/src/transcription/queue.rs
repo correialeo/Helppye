@@ -19,16 +19,13 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::audio::segment::AudioSegment;
+use crate::integrity::{IntegrityStage, SourceIntegrityError};
+use crate::transcription::envelope::{MonotonicTimestamp, TranscriptionWorkItem};
 use crate::transcription::runtime::TranscriptionRuntime;
 
 /// Small on purpose: segments already represent multiple seconds of speech each, so a deep
 /// backlog here means transcription has fallen far behind real time, not a transient blip.
 pub const QUEUE_CAPACITY: usize = 16;
-
-struct QueuedSegment {
-    segment: AudioSegment,
-    enqueued_at: Instant,
-}
 
 #[derive(Default)]
 struct QueueState {
@@ -48,14 +45,14 @@ pub struct TranscriptionQueueMetrics {
 /// time. Never panics on a failed segment; never lets a slow segment stop the next one from
 /// being queued.
 pub struct TranscriptionQueue {
-    sender: mpsc::Sender<QueuedSegment>,
+    sender: mpsc::Sender<TranscriptionWorkItem>,
     state: Arc<QueueState>,
     runtime: Arc<TranscriptionRuntime>,
 }
 
 impl TranscriptionQueue {
     pub fn spawn(runtime: Arc<TranscriptionRuntime>) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<QueuedSegment>(QUEUE_CAPACITY);
+        let (sender, mut receiver) = mpsc::channel::<TranscriptionWorkItem>(QUEUE_CAPACITY);
         let worker_runtime = Arc::clone(&runtime);
         let state = Arc::new(QueueState::default());
         let worker_state = Arc::clone(&state);
@@ -65,8 +62,8 @@ impl TranscriptionQueue {
         // uses Tauri's own managed runtime instead (same reason `audio::start_capture`
         // uses it for its forwarding task).
         tauri::async_runtime::spawn(async move {
-            while let Some(queued) = receiver.recv().await {
-                let queued_age_ms = queued.enqueued_at.elapsed().as_millis() as u64;
+            while let Some(item) = receiver.recv().await {
+                let queued_age_ms = item.enqueued_at.elapsed_ms();
                 worker_state
                     .enqueued_at
                     .lock()
@@ -75,12 +72,8 @@ impl TranscriptionQueue {
                 if queued_age_ms >= 1_000 {
                     debug!(queued_age_ms, "transcription queue is processing old audio");
                 }
-                let segment = queued.segment;
-                let source = segment.source;
-                if let Err(e) = worker_runtime
-                    .push_segment_at(segment, queued.enqueued_at)
-                    .await
-                {
+                let source = item.source;
+                if let Err(e) = worker_runtime.push_work_item(item).await {
                     // Falha de um segmento não derruba o worker: o próximo segmento pode
                     // transcrever normalmente, e o runtime já publicou o evento de erro
                     // correspondente para quem observa.
@@ -105,21 +98,48 @@ impl TranscriptionQueue {
 
     /// Never blocks. A full queue drops `segment` and counts it, logging every 50th drop
     /// rather than every one.
+    ///
+    /// É aqui que o segmento vira `TranscriptionWorkItem`: a identidade causal
+    /// (`session_id`, `capture_stream_id`, `sequence_number`) é fixada **uma vez**, no ponto
+    /// de entrada da camada de transcrição, e todo o resto do pipeline lê dela em vez de
+    /// redeclarar a origem. Sem sessão ativa o segmento é descartado aqui mesmo — entrar na
+    /// fila para ser recusado adiante só adiaria a mesma decisão gastando uma vaga.
     pub fn try_enqueue(&self, segment: AudioSegment) {
-        let enqueued_at = Instant::now();
+        let enqueued_at = MonotonicTimestamp::now();
+        let Some(session_id) = self.runtime.active_session_id() else {
+            debug!(
+                source = ?segment.source,
+                "segmento descartado: nenhuma sessão de conversa ativa"
+            );
+            return;
+        };
+        // Comparação, não atribuição: se o segmento chegou aqui já com uma fonte diferente da
+        // que o próprio segmento declara ter capturado, o dado é rejeitado em vez de entrar
+        // "corrigido". Na prática é sempre `Ok` — o valor está em que deixaria de ser.
+        if let Err(error) = SourceIntegrityError::check(
+            segment.id,
+            segment.source,
+            segment.source,
+            IntegrityStage::Enqueue,
+        ) {
+            crate::integrity::origin_log().record_violation(error);
+            return;
+        }
+        let item = TranscriptionWorkItem::from_segment(
+            session_id,
+            segment,
+            // O segmento fica pronto quando a fala termina; entrar na fila é o instante
+            // seguinte. Nesta borda os dois coincidem, e separá-los é o que permite medir
+            // backlog adiante sem confundi-lo com latência de captura.
+            enqueued_at,
+            enqueued_at,
+        );
         let mut timestamps = self
             .state
             .enqueued_at
             .lock()
             .expect("transcription queue metrics mutex poisoned");
-        if self
-            .sender
-            .try_send(QueuedSegment {
-                segment,
-                enqueued_at,
-            })
-            .is_err()
-        {
+        if self.sender.try_send(item).is_err() {
             let n = self.state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 50 == 1 {
                 warn!(
@@ -128,7 +148,7 @@ impl TranscriptionQueue {
                 );
             }
         } else {
-            timestamps.push_back(enqueued_at);
+            timestamps.push_back(enqueued_at.as_instant());
         }
     }
 

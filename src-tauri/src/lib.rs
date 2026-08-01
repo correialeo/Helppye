@@ -10,6 +10,7 @@ mod response_provider;
 pub mod audio;
 pub mod benchmark;
 pub mod conversation;
+pub mod integrity;
 pub mod normalization;
 pub mod telemetry;
 pub mod transcription;
@@ -133,11 +134,12 @@ pub fn run() {
                         tracing::warn!(%e, "failed to emit transcription event to frontend");
                     }
 
-                let conversation_events = timeline_for_queue.ingest_normalized_transcript(
-                    &normalized.transcript,
-                    &normalized.normalization,
-                    normalized.speech_ended_at,
-                );
+                    let conversation_events = timeline_for_queue.ingest_normalized_transcript(
+                        &normalized.envelope,
+                        &normalized.transcript,
+                        &normalized.normalization,
+                        normalized.speech_ended_at,
+                    );
                     emit_conversation_events(&app_handle, conversation_events.clone());
                     process_conversation_events(
                         &app_handle,
@@ -248,6 +250,7 @@ pub fn run() {
             conversation::conversation_get_utterance_gap_ms_command,
             conversation::conversation_set_utterance_gap_ms_command,
             conversation::conversation_regenerate_suggestion_command,
+            integrity::origin_integrity_snapshot_command,
             response_provider::response_provider_status_command,
             response_provider::response_providers_command,
             response_provider::response_settings_command,

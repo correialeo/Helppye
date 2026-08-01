@@ -62,6 +62,7 @@ impl ResponseProvider for SequenceProvider {
 
 fn current(id: u64, revision: u64, text: &str) -> ConversationUtterance {
     ConversationUtterance {
+        capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
         id: UtteranceId::from_raw(id),
         speaker: ConversationSpeaker::OtherPerson,
         source: AudioSource::SystemOutput,
@@ -80,6 +81,7 @@ fn current(id: u64, revision: u64, text: &str) -> ConversationUtterance {
 
 fn turn(utterance: &ConversationUtterance) -> ConversationTurn {
     ConversationTurn {
+        capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
         id: TurnId::from_raw(utterance.id.value()),
         speaker: utterance.speaker,
         source: utterance.source,
@@ -231,6 +233,7 @@ async fn noisy_prior_user_speech_cannot_become_the_high_availability_answer() {
     engine.push_history(
         session,
         ConversationUtterance {
+            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
             id: UtteranceId::from_raw(1),
             speaker: ConversationSpeaker::User,
             source: AudioSource::Microphone,

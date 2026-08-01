@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 
 use crate::audio::segment::{AudioSegment, AudioTimestamp};
-use crate::audio::types::AudioSource;
+use crate::audio::types::{AudioSource, CaptureStreamId};
 use crate::audio::vad::{EnergyVad, VadConfig, VadDecision};
 
 /// Initial, non-final tuning — see `docs/speech-segmentation.md`.
@@ -82,6 +82,8 @@ enum State {
 /// mixes samples across sources — one instance per `AudioSource`.
 pub struct Segmenter {
     source: AudioSource,
+    capture_stream_id: CaptureStreamId,
+    next_sequence: u64,
     sample_rate: u32,
     config: SegmentationConfig,
     vad: EnergyVad,
@@ -96,11 +98,25 @@ pub struct Segmenter {
 
 impl Segmenter {
     pub fn new(source: AudioSource, sample_rate: u32, config: SegmentationConfig) -> Self {
+        Segmenter::for_stream(source, CaptureStreamId::UNASSIGNED, sample_rate, config)
+    }
+
+    /// Segmentador ligado a um fluxo físico de captura concreto. Todo segmento que sair
+    /// daqui nasce carimbado com `capture_stream_id` e um `sequence_number` monotônico —
+    /// a origem é decidida **uma vez**, aqui, e nunca reinferida adiante no pipeline.
+    pub fn for_stream(
+        source: AudioSource,
+        capture_stream_id: CaptureStreamId,
+        sample_rate: u32,
+        config: SegmentationConfig,
+    ) -> Self {
         let vad = EnergyVad::new(config.vad);
         let window_len = vad.window_len_samples(sample_rate);
         let pre_roll_cap = ((sample_rate as u64 * config.pre_roll_ms as u64) / 1000) as usize;
         Segmenter {
             source,
+            capture_stream_id,
+            next_sequence: 0,
             sample_rate,
             config,
             vad,
@@ -111,6 +127,17 @@ impl Segmenter {
             samples_seen: 0,
             state: State::Idle,
         }
+    }
+
+    fn mint_segment(
+        &mut self,
+        buffer: Vec<f32>,
+        started_at: AudioTimestamp,
+        ended_at: AudioTimestamp,
+    ) -> AudioSegment {
+        self.next_sequence += 1;
+        AudioSegment::new(self.source, buffer, self.sample_rate, started_at, ended_at)
+            .in_stream(self.capture_stream_id, self.next_sequence)
     }
 
     /// Feeds mono samples at `sample_rate`, processing every full VAD window they complete.
@@ -214,13 +241,7 @@ impl Segmenter {
                     let duration_ms = (buffer.len() as u64 * 1000) / self.sample_rate as u64;
                     if duration_ms >= self.config.maximum_segment_ms as u64 {
                         let ended_at = self.timestamp_for(window_end_samples);
-                        let segment = AudioSegment::new(
-                            self.source,
-                            buffer,
-                            self.sample_rate,
-                            started_at,
-                            ended_at,
-                        );
+                        let segment = self.mint_segment(buffer, started_at, ended_at);
                         events.push(SpeechEvent::SegmentReady(segment));
                         events.push(SpeechEvent::Ended {
                             source: self.source,
@@ -256,13 +277,7 @@ impl Segmenter {
                         buffer.truncate(new_len);
                         let ended_at =
                             self.timestamp_for(window_end_samples.saturating_sub(trim_samples));
-                        let segment = AudioSegment::new(
-                            self.source,
-                            buffer,
-                            self.sample_rate,
-                            started_at,
-                            ended_at,
-                        );
+                        let segment = self.mint_segment(buffer, started_at, ended_at);
                         events.push(SpeechEvent::SegmentReady(segment));
                         events.push(SpeechEvent::Ended {
                             source: self.source,

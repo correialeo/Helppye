@@ -22,13 +22,15 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::audio::segment::AudioTimestamp;
+use crate::audio::segment::{AudioTimestamp, SegmentId};
+use crate::audio::types::CaptureStreamId;
 use crate::benchmark::fixtures::BenchmarkFixture;
 use crate::benchmark::wav::{self, WavError};
 use crate::conversation::{ConversationAssemblerConfig, ConversationTimeline};
 use crate::normalization::{
     TranscriptNormalizationInput, TranscriptNormalizationResult, TranscriptNormalizer,
 };
+use crate::transcription::envelope::TranscriptionResultEnvelope;
 use crate::transcription::events::TranscriptionEvent;
 use crate::transcription::provider::TranscriptionProvider;
 use crate::transcription::session::{
@@ -201,7 +203,7 @@ pub async fn run_fixture(
     let mut raw_parts = Vec::new();
     let mut normalized_parts = Vec::new();
     let mut normalization_change_count = 0usize;
-    for transcript in &finals {
+    for (index, transcript) in finals.iter().enumerate() {
         let normalization: TranscriptNormalizationResult =
             normalizer.normalize(TranscriptNormalizationInput {
                 raw_text: transcript.text.clone(),
@@ -212,7 +214,25 @@ pub async fn run_fixture(
         normalization_change_count += normalization.change_count();
         raw_parts.push(normalization.raw_text.clone());
         normalized_parts.push(normalization.normalized_text.clone());
-        timeline.ingest_normalized_transcript(transcript, &normalization, Instant::now());
+        // O harness não passa pela fila de captura, então não existe uma
+        // `PendingSegmentIdentity` guardada para casar aqui: o envelope é montado a partir do
+        // próprio `FinalTranscript`, com a fonte da fixture. `CaptureStreamId::UNASSIGNED`
+        // declara isso honestamente em vez de inventar um fluxo de captura que não houve.
+        let envelope = TranscriptionResultEnvelope {
+            session_id: timeline.session_id(),
+            segment_id: transcript.segment_id.unwrap_or_else(SegmentId::next),
+            source: transcript.source,
+            capture_stream_id: CaptureStreamId::UNASSIGNED,
+            sequence_number: index as u64,
+            raw_text: normalization.raw_text.clone(),
+            normalized_text: normalization.normalized_text.clone(),
+        };
+        timeline.ingest_normalized_transcript(
+            &envelope,
+            transcript,
+            &normalization,
+            Instant::now(),
+        );
     }
     timeline.flush();
 

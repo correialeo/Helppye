@@ -371,6 +371,7 @@ mod tests {
         sequence: u64,
     ) -> ConversationUtterance {
         ConversationUtterance {
+            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
             id: UtteranceId::from_raw(id),
             speaker,
             source: match speaker {

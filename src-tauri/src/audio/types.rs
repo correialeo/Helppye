@@ -1,6 +1,38 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use crate::audio::error::AudioCaptureError;
+
+static NEXT_CAPTURE_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Identifica **um fluxo físico contínuo de captura**: um `start_capture` de uma fonte até
+/// o `stop_capture`/desconexão correspondente. Trocar de microfone no meio da sessão encerra
+/// um fluxo e abre outro, ainda que a `AudioSource` e a `SessionId` sejam as mesmas.
+///
+/// Existe porque `AudioSource` sozinha não distingue dois fluxos da mesma categoria: o
+/// relógio de `AudioTimestamp` é reiniciado a cada fluxo, e a fila de identidades pendentes
+/// da transcrição (`TranscriptionStreamKey`) precisa saber que o resultado que chegou
+/// pertence ao fluxo que o produziu e não ao anterior, cujos segmentos ainda podem estar em
+/// voo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CaptureStreamId(u64);
+
+impl CaptureStreamId {
+    /// Fluxo desconhecido — só para segmentos construídos fora de uma sessão real de
+    /// captura (testes, harness de benchmark, fixtures). Nunca é emitido por
+    /// `CaptureEngine::start_capture`, que sempre cunha um id real.
+    pub const UNASSIGNED: CaptureStreamId = CaptureStreamId(0);
+
+    pub fn next() -> Self {
+        CaptureStreamId(NEXT_CAPTURE_STREAM_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
 
 /// `Deserialize` além de `Serialize` porque a fonte também **entra** no processo, não só
 /// sai: o manifesto de fixtures do harness de benchmark declara de que lado da conversa cada

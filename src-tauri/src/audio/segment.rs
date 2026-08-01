@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 
-use crate::audio::types::AudioSource;
+use crate::audio::types::{AudioSource, CaptureStreamId};
 
 /// Monotonic milliseconds since the owning capture session started — the same clock as
 /// `AudioFrame::timestamp_ms`, never wall-clock time. Only comparable within one capture
@@ -52,6 +52,13 @@ impl SegmentId {
 pub struct AudioSegment {
     pub id: SegmentId,
     pub source: AudioSource,
+    /// Fluxo físico de captura que produziu este segmento. Junto de `sequence_number`,
+    /// é a parte da identidade causal que sobrevive até a Conversation Timeline — ver
+    /// `transcription::envelope::TranscriptionWorkItem`.
+    pub capture_stream_id: CaptureStreamId,
+    /// Posição deste segmento dentro do seu `capture_stream_id`, começando em 1. Monotônico
+    /// por fluxo e nunca comparável entre fluxos.
+    pub sequence_number: u64,
     pub samples: Vec<f32>,
     pub sample_rate: u32,
     pub started_at: AudioTimestamp,
@@ -70,12 +77,22 @@ impl AudioSegment {
         AudioSegment {
             id: SegmentId::next(),
             source,
+            capture_stream_id: CaptureStreamId::UNASSIGNED,
+            sequence_number: 0,
             samples,
             sample_rate,
             started_at,
             ended_at,
             duration_ms: ended_at.saturating_sub(started_at),
         }
+    }
+
+    /// Carimba o segmento com a identidade do fluxo que o produziu. Usado pelo `Segmenter`,
+    /// que é a única coisa que sabe de qual `start_capture` este áudio saiu.
+    pub fn in_stream(mut self, capture_stream_id: CaptureStreamId, sequence_number: u64) -> Self {
+        self.capture_stream_id = capture_stream_id;
+        self.sequence_number = sequence_number;
+        self
     }
 
     /// Shifts segment-local timestamps onto a broader monotonic timeline. Used by the

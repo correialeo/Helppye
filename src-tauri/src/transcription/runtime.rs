@@ -38,12 +38,20 @@ use tracing::{debug, warn};
 use crate::audio::segment::{AudioSegment, SegmentId};
 use crate::audio::types::AudioSource;
 use crate::conversation::SessionId;
+use crate::integrity::{
+    text_hash, IntegrityStage, IntegrityStatus, OriginIntegrityLog, OriginObservation,
+    SourceIntegrityError,
+};
 use crate::normalization::{
     ContextualCorrectionInput, ContextualCorrector, DeterministicNormalizer,
     TranscriptCorrectionMode, TranscriptNormalizationInput, TranscriptNormalizationResult,
     TranscriptNormalizer,
 };
 use crate::telemetry::{Milestone, TelemetryRecorder, TraceAttributes};
+use crate::transcription::envelope::{
+    MonotonicTimestamp, PendingSegmentIdentity, TranscriptionResultEnvelope,
+    TranscriptionStreamKey, TranscriptionWorkItem,
+};
 use crate::transcription::error::TranscriptionError;
 use crate::transcription::events::{FinalTranscript, ProviderEventId, TranscriptionEvent};
 use crate::transcription::provider::TranscriptionProvider;
@@ -80,6 +88,11 @@ pub enum DiscardReason {
 /// bruto, prompt usa o normalizado, e nenhum dos dois some.
 #[derive(Debug, Clone)]
 pub struct NormalizedTranscript {
+    /// Identidade causal do segmento que originou este texto, copiada da fila de pendentes
+    /// do próprio fluxo de captura. **É esta a autoridade sobre a origem**, não
+    /// `transcript.source`: o provider devolve texto para um envelope, não decide de onde o
+    /// áudio veio. Ver `transcription::envelope`.
+    pub envelope: TranscriptionResultEnvelope,
     pub transcript: FinalTranscript,
     pub normalization: TranscriptNormalizationResult,
     /// Instante monotônico em que o segmento deixou a captura e entrou na fila.
@@ -172,7 +185,75 @@ struct ActiveSession {
     session: Box<dyn TranscriptionSession>,
 }
 
-type PendingSegmentTimings = HashMap<AudioSource, VecDeque<(SegmentId, Instant)>>;
+/// Uma fila de identidades pendentes **por fluxo de captura**, nunca uma fila global.
+///
+/// A chave carrega `session_id + source + capture_stream_id` justamente para que o fallback
+/// por ordem de chegada — necessário para providers que não devolvem `segment_id` — nunca
+/// possa casar um resultado do microfone com um segmento da saída de sistema. Com uma fila
+/// única, bastaria a inferência do microfone terminar primeiro para a fala da outra pessoa
+/// herdar a identidade errada, e a partir daí toda a cadeia (speaker, elegibilidade,
+/// geração) estaria coerentemente errada.
+type PendingSegmentTimings = HashMap<TranscriptionStreamKey, VecDeque<PendingSegmentIdentity>>;
+
+/// Como a identidade de um resultado foi encontrada. O fallback é registrado explicitamente
+/// porque atribuição por ordem é mais fraca que atribuição por id, e essa diferença precisa
+/// aparecer em diagnóstico em vez de ficar implícita.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityResolution {
+    BySegmentId,
+    ByStreamFifo,
+}
+
+/// Localiza a identidade de um resultado dentro do **seu próprio** fluxo.
+///
+/// Só filas cuja chave bate em `session_id` e `source` são consideradas; `capture_stream_id`
+/// não vem no evento do provider, então quando há mais de um fluxo vivo para a mesma fonte
+/// (janela curta de troca de dispositivo) o desempate é pelo segmento capturado há mais
+/// tempo — o mais antigo é o que está esperando resultado há mais tempo.
+fn resolve_pending_identity(
+    pending: &mut PendingSegmentTimings,
+    session_id: SessionId,
+    source: AudioSource,
+    segment_id: Option<SegmentId>,
+) -> Option<(PendingSegmentIdentity, IdentityResolution)> {
+    let keys: Vec<TranscriptionStreamKey> = pending
+        .keys()
+        .filter(|key| key.session_id == session_id && key.source == source)
+        .copied()
+        .collect();
+
+    if let Some(segment_id) = segment_id {
+        for key in &keys {
+            let Some(queue) = pending.get_mut(key) else {
+                continue;
+            };
+            if let Some(position) = queue
+                .iter()
+                .position(|identity| identity.segment_id == segment_id)
+            {
+                if let Some(identity) = queue.remove(position) {
+                    return Some((identity, IdentityResolution::BySegmentId));
+                }
+            }
+        }
+    }
+
+    let oldest = keys
+        .iter()
+        .filter_map(|key| {
+            pending
+                .get(key)
+                .and_then(|queue| queue.front())
+                .map(|identity| (*key, identity.captured_at))
+        })
+        .min_by_key(|(_, captured_at)| *captured_at)
+        .map(|(key, _)| key)?;
+
+    pending
+        .get_mut(&oldest)
+        .and_then(VecDeque::pop_front)
+        .map(|identity| (identity, IdentityResolution::ByStreamFifo))
+}
 
 pub struct TranscriptionRuntime {
     provider: StdMutex<Arc<dyn TranscriptionProvider>>,
@@ -189,6 +270,7 @@ pub struct TranscriptionRuntime {
     sink: TranscriptionOutputSink,
     counters: Arc<RuntimeCounters>,
     telemetry: Arc<TelemetryRecorder>,
+    origin_log: Arc<OriginIntegrityLog>,
 }
 
 impl TranscriptionRuntime {
@@ -213,6 +295,25 @@ impl TranscriptionRuntime {
         sink: TranscriptionOutputSink,
         telemetry: Arc<TelemetryRecorder>,
     ) -> Self {
+        Self::with_telemetry_and_origin_log(
+            provider,
+            settings,
+            sink,
+            telemetry,
+            Arc::clone(crate::integrity::origin_log()),
+        )
+    }
+
+    /// Mesma razão de `with_telemetry`: um teste que queira observar o rastro de origem
+    /// precisa de um log próprio, não do singleton de processo que outros testes rodando em
+    /// paralelo também tocariam.
+    pub fn with_telemetry_and_origin_log(
+        provider: Arc<dyn TranscriptionProvider>,
+        settings: TranscriptionSettings,
+        sink: TranscriptionOutputSink,
+        telemetry: Arc<TelemetryRecorder>,
+        origin_log: Arc<OriginIntegrityLog>,
+    ) -> Self {
         TranscriptionRuntime {
             provider: StdMutex::new(provider),
             settings: StdMutex::new(settings),
@@ -226,11 +327,16 @@ impl TranscriptionRuntime {
             sink,
             counters: Arc::new(RuntimeCounters::default()),
             telemetry,
+            origin_log,
         }
     }
 
     pub fn telemetry(&self) -> &Arc<TelemetryRecorder> {
         &self.telemetry
+    }
+
+    pub fn origin_log(&self) -> &Arc<OriginIntegrityLog> {
+        &self.origin_log
     }
 
     pub fn settings(&self) -> TranscriptionSettings {
@@ -381,29 +487,53 @@ impl TranscriptionRuntime {
         self.push_segment_at(segment, Instant::now()).await
     }
 
-    /// Igual a `push_segment`, mas conserva o instante real de entrada na fila.
+    /// Igual a `push_segment`, mas conserva o instante real de entrada na fila. Envolve o
+    /// segmento no envelope usando a sessão ativa; sem sessão ativa o áudio é descartado
+    /// como já era (não é falha de captura, é o intervalo entre sessões).
     pub async fn push_segment_at(
         &self,
         segment: AudioSegment,
         speech_ended_at: Instant,
     ) -> Result<(), TranscriptionError> {
-        let segment_id = segment.id;
-        let source = segment.source;
+        let Some(session_id) = self.active_session_id() else {
+            debug!(
+                source = ?segment.source,
+                "áudio recebido sem sessão de conversa ativa; descartado"
+            );
+            return Ok(());
+        };
+        let at = MonotonicTimestamp::from_instant(speech_ended_at);
+        self.push_work_item(TranscriptionWorkItem::from_segment(
+            session_id, segment, at, at,
+        ))
+        .await
+    }
+
+    /// Ponto de entrada do envelope causal. A identidade é registrada na fila do **seu**
+    /// fluxo antes de o áudio ir para o provider, para que o resultado — que volta por outro
+    /// caminho, de forma assíncrona — tenha onde se ancorar.
+    pub async fn push_work_item(
+        &self,
+        item: TranscriptionWorkItem,
+    ) -> Result<(), TranscriptionError> {
+        let identity = item.identity();
+        let key = item.stream_key();
         self.pending_segment_timings
             .lock()
             .expect("segment timing mutex")
-            .entry(source)
+            .entry(key)
             .or_default()
-            .push_back((segment_id, speech_ended_at));
-        let result = self.push_chunk(AudioChunk::from_segment(segment)).await;
+            .push_back(identity);
+
+        let result = self.push_chunk(AudioChunk::from_segment(item.audio)).await;
         if result.is_err() {
             if let Some(pending) = self
                 .pending_segment_timings
                 .lock()
                 .expect("segment timing mutex")
-                .get_mut(&source)
+                .get_mut(&key)
             {
-                pending.retain(|(id, _)| *id != segment_id);
+                pending.retain(|pending| pending.segment_id != identity.segment_id);
             }
         }
         result
@@ -506,6 +636,7 @@ impl TranscriptionRuntime {
         let corrector = self.corrector.lock().expect("corrector mutex").clone();
         let recent_texts = Arc::clone(&self.recent_texts);
         let pending_segment_timings = Arc::clone(&self.pending_segment_timings);
+        let origin_log = Arc::clone(&self.origin_log);
 
         Arc::new(move |event: TranscriptionEvent| {
             let decision = gate.lock().expect("gate mutex").accept(&event);
@@ -553,22 +684,64 @@ impl TranscriptionRuntime {
             downstream(TranscriptionRuntimeOutput::Event(event.clone()));
 
             if let TranscriptionEvent::Final(transcript) = event {
-                let speech_ended_at = {
+                // A identidade é procurada **na fila do fluxo que produziu este áudio**, e a
+                // busca é filtrada por sessão e fonte antes de qualquer coisa: um resultado
+                // do microfone não tem como consumir a identidade de um segmento da saída de
+                // sistema nem quando o provider não devolve `segment_id`.
+                let resolved = {
                     let mut timings = pending_segment_timings
                         .lock()
                         .expect("segment timing mutex");
-                    let pending = timings.get_mut(&transcript.source);
-                    match (pending, transcript.segment_id) {
-                        (Some(pending), Some(segment_id)) => pending
-                            .iter()
-                            .position(|(id, _)| *id == segment_id)
-                            .and_then(|position| pending.remove(position))
-                            .map(|(_, at)| at),
-                        (Some(pending), None) => pending.pop_front().map(|(_, at)| at),
-                        (None, _) => None,
-                    }
-                    .unwrap_or_else(Instant::now)
+                    resolve_pending_identity(
+                        &mut timings,
+                        transcript.session_id,
+                        transcript.source,
+                        transcript.segment_id,
+                    )
                 };
+
+                let (identity, resolution) = match resolved {
+                    Some(resolved) => resolved,
+                    None => {
+                        // Sem identidade registrada não há de onde tirar a origem com
+                        // autoridade. Reconstruí-la a partir do que o provider afirmou seria
+                        // exatamente a inferência que este pipeline deixou de fazer — mas
+                        // descartar a fala também não é aceitável, então a identidade é
+                        // sintetizada a partir do próprio evento e marcada como fallback.
+                        let synthetic = PendingSegmentIdentity {
+                            session_id: transcript.session_id,
+                            segment_id: transcript.segment_id.unwrap_or_else(SegmentId::next),
+                            source: transcript.source,
+                            capture_stream_id: crate::audio::types::CaptureStreamId::UNASSIGNED,
+                            sequence_number: 0,
+                            captured_at: MonotonicTimestamp::now(),
+                            enqueued_at: MonotonicTimestamp::now(),
+                        };
+                        debug!(
+                            session_id = transcript.session_id.value(),
+                            source = ?transcript.source,
+                            "resultado final sem identidade pendente registrada; \
+                             origem mantida como a do evento"
+                        );
+                        (synthetic, IdentityResolution::ByStreamFifo)
+                    }
+                };
+
+                // Comparação explícita: o provider *reportou* uma fonte, a captura
+                // *registrou* outra. Isso nunca é reconciliado — o resultado é rejeitado e
+                // a violação vira erro estruturado. Corrigir aqui significaria deixar entrar
+                // um dado cuja origem real já é desconhecida.
+                if let Err(error) = SourceIntegrityError::check(
+                    identity.segment_id,
+                    identity.source,
+                    transcript.source,
+                    IntegrityStage::TranscriptionResult,
+                ) {
+                    origin_log.record_violation(error);
+                    return;
+                }
+
+                let speech_ended_at = identity.captured_at.as_instant();
                 let deterministic = if correction_mode.applies_deterministic() {
                     normalizer.normalize(TranscriptNormalizationInput {
                         raw_text: transcript.text.clone(),
@@ -590,6 +763,7 @@ impl TranscriptionRuntime {
                         let telemetry = Arc::clone(&telemetry);
                         let recent_texts = Arc::clone(&recent_texts);
                         let counters = Arc::clone(&counters);
+                        let origin_log = Arc::clone(&origin_log);
                         let transcript = transcript.clone();
                         let recent_context: Vec<String> = recent_texts
                             .lock()
@@ -607,8 +781,21 @@ impl TranscriptionRuntime {
                             telemetry.mark(trace, Milestone::NormalizationCompleted);
                             remember(&recent_texts, &corrected.normalized_text);
                             counters.accepted_finals.fetch_add(1, Ordering::Relaxed);
+                            let envelope = TranscriptionResultEnvelope::from_identity(
+                                identity,
+                                corrected.raw_text.clone(),
+                                corrected.normalized_text.clone(),
+                            );
+                            record_origin_observation(
+                                &origin_log,
+                                &identity,
+                                &transcript,
+                                &envelope,
+                                resolution,
+                            );
                             downstream(TranscriptionRuntimeOutput::Final(Box::new(
                                 NormalizedTranscript {
+                                    envelope,
                                     transcript,
                                     normalization: corrected,
                                     speech_ended_at,
@@ -641,8 +828,21 @@ impl TranscriptionRuntime {
                 );
                 telemetry.record_text(trace, &normalization.normalized_text);
                 counters.accepted_finals.fetch_add(1, Ordering::Relaxed);
+                let envelope = TranscriptionResultEnvelope::from_identity(
+                    identity,
+                    normalization.raw_text.clone(),
+                    normalization.normalized_text.clone(),
+                );
+                record_origin_observation(
+                    &origin_log,
+                    &identity,
+                    &transcript,
+                    &envelope,
+                    resolution,
+                );
                 downstream(TranscriptionRuntimeOutput::Final(Box::new(
                     NormalizedTranscript {
+                        envelope,
                         transcript,
                         normalization,
                         speech_ended_at,
@@ -670,6 +870,41 @@ impl ActiveSession {
     }
 }
 
+/// Grava o rastro de origem deste resultado. `source_at_timeline`/`derived_speaker` ficam
+/// `None` aqui de propósito: quem os conhece é a timeline, e preenchê-los com uma suposição
+/// tiraria da observação justamente o poder de mostrar uma divergência entre estágios.
+///
+/// Nenhum texto entra no registro — só hashes (ver `integrity::text_hash`).
+fn record_origin_observation(
+    origin_log: &OriginIntegrityLog,
+    identity: &PendingSegmentIdentity,
+    transcript: &FinalTranscript,
+    envelope: &TranscriptionResultEnvelope,
+    resolution: IdentityResolution,
+) {
+    origin_log.record(OriginObservation {
+        session_id: identity.session_id.value(),
+        capture_stream_id: identity.capture_stream_id.value(),
+        segment_id: identity.segment_id,
+        sequence_number: identity.sequence_number,
+        source_at_capture: identity.source,
+        source_at_queue: identity.source,
+        source_at_transcription_result: transcript.source,
+        source_at_timeline: None,
+        derived_speaker: None,
+        audio_started_at_ms: transcript.started_at.0,
+        audio_ended_at_ms: transcript.ended_at.0,
+        transcription_completed_at_ms: identity.enqueued_at.elapsed_ms(),
+        raw_text_hash: text_hash(&envelope.raw_text),
+        normalized_text_hash: text_hash(&envelope.normalized_text),
+        cross_source_similarity: None,
+        integrity_status: match resolution {
+            IdentityResolution::BySegmentId => IntegrityStatus::Ok,
+            IdentityResolution::ByStreamFifo => IntegrityStatus::ResolvedByFifoFallback,
+        },
+    });
+}
+
 fn remember(recent: &StdMutex<VecDeque<String>>, text: &str) {
     if text.trim().is_empty() {
         return;
@@ -685,6 +920,7 @@ fn remember(recent: &StdMutex<VecDeque<String>>, text: &str) {
 mod tests {
     use super::*;
     use crate::audio::segment::AudioTimestamp;
+    use crate::audio::types::CaptureStreamId;
     use crate::transcription::fake_provider::{FakeBehavior, FakeTranscriptionProvider};
     use crate::transcription::provider::TranscriptionProviderId;
     use std::time::Duration;
@@ -1166,5 +1402,252 @@ mod tests {
         let late = runtime.push_chunk(chunk(AudioSource::SystemOutput)).await;
         assert!(late.is_ok(), "chunk tardio é descartado, não é erro");
         assert_eq!(runtime.active_transcription_sessions().len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Identidade por fluxo: o que impede um resultado de herdar a origem de outro.
+    // -----------------------------------------------------------------------
+
+    fn identity(
+        session_id: SessionId,
+        source: AudioSource,
+        stream: CaptureStreamId,
+        sequence: u64,
+        captured_at: MonotonicTimestamp,
+    ) -> PendingSegmentIdentity {
+        PendingSegmentIdentity {
+            session_id,
+            segment_id: SegmentId::next(),
+            source,
+            capture_stream_id: stream,
+            sequence_number: sequence,
+            captured_at,
+            enqueued_at: captured_at,
+        }
+    }
+
+    fn register(pending: &mut PendingSegmentTimings, identity: PendingSegmentIdentity) {
+        pending
+            .entry(identity.stream_key())
+            .or_default()
+            .push_back(identity);
+    }
+
+    /// O cenário que uma fila global quebraria: as duas fontes esperando resultado ao mesmo
+    /// tempo, e o resultado do microfone chegando primeiro.
+    #[test]
+    fn a_microphone_result_never_consumes_the_system_output_identity() {
+        let session = SessionId::from_value(1);
+        let mut pending = PendingSegmentTimings::new();
+        let mic_stream = CaptureStreamId::next();
+        let system_stream = CaptureStreamId::next();
+
+        // A saída de sistema entrou na fila **antes** — é a mais antiga, e seria a escolhida
+        // por qualquer desempate por ordem de chegada global.
+        let remote = identity(
+            session,
+            AudioSource::SystemOutput,
+            system_stream,
+            1,
+            MonotonicTimestamp::now(),
+        );
+        let mine = identity(
+            session,
+            AudioSource::Microphone,
+            mic_stream,
+            1,
+            MonotonicTimestamp::now(),
+        );
+        register(&mut pending, remote);
+        register(&mut pending, mine);
+
+        let (resolved, _) =
+            resolve_pending_identity(&mut pending, session, AudioSource::Microphone, None)
+                .expect("o microfone encontra a própria identidade");
+        assert_eq!(resolved.segment_id, mine.segment_id);
+        assert_eq!(resolved.source, AudioSource::Microphone);
+        assert_eq!(resolved.capture_stream_id, mic_stream);
+
+        // E a identidade da outra fonte continua intacta, esperando o resultado dela.
+        let (still_there, _) =
+            resolve_pending_identity(&mut pending, session, AudioSource::SystemOutput, None)
+                .expect("a saída de sistema não foi consumida por outra fonte");
+        assert_eq!(still_there.segment_id, remote.segment_id);
+    }
+
+    #[test]
+    fn a_system_output_result_never_consumes_the_microphone_identity() {
+        let session = SessionId::from_value(1);
+        let mut pending = PendingSegmentTimings::new();
+        let mine = identity(
+            session,
+            AudioSource::Microphone,
+            CaptureStreamId::next(),
+            1,
+            MonotonicTimestamp::now(),
+        );
+        register(&mut pending, mine);
+
+        assert!(
+            resolve_pending_identity(&mut pending, session, AudioSource::SystemOutput, None)
+                .is_none(),
+            "sem segmento pendente da própria fonte, não se toma emprestado o da outra"
+        );
+    }
+
+    /// Callbacks assíncronos podem chegar fora de ordem; a identidade é casada por
+    /// `segment_id`, então a ordem não muda a origem de nada.
+    #[test]
+    fn out_of_order_callbacks_keep_each_result_with_its_own_origin() {
+        let session = SessionId::from_value(1);
+        let mut pending = PendingSegmentTimings::new();
+        let stream = CaptureStreamId::next();
+        let first = identity(
+            session,
+            AudioSource::SystemOutput,
+            stream,
+            1,
+            MonotonicTimestamp::now(),
+        );
+        let second = identity(
+            session,
+            AudioSource::SystemOutput,
+            stream,
+            2,
+            MonotonicTimestamp::now(),
+        );
+        register(&mut pending, first);
+        register(&mut pending, second);
+
+        // O segundo segmento termina primeiro.
+        let (resolved, resolution) = resolve_pending_identity(
+            &mut pending,
+            session,
+            AudioSource::SystemOutput,
+            Some(second.segment_id),
+        )
+        .expect("casou pelo id");
+        assert_eq!(resolution, IdentityResolution::BySegmentId);
+        assert_eq!(resolved.sequence_number, 2);
+        assert_eq!(resolved.source, AudioSource::SystemOutput);
+
+        let (resolved, _) = resolve_pending_identity(
+            &mut pending,
+            session,
+            AudioSource::SystemOutput,
+            Some(first.segment_id),
+        )
+        .expect("casou pelo id");
+        assert_eq!(resolved.sequence_number, 1);
+    }
+
+    /// Duas transcrições simultâneas, uma por fonte: cada resultado sai com o próprio
+    /// `segment_id`, `capture_stream_id` e `sequence_number`.
+    #[test]
+    fn two_simultaneous_transcriptions_preserve_their_own_identifiers() {
+        let session = SessionId::from_value(1);
+        let mut pending = PendingSegmentTimings::new();
+        let mic_stream = CaptureStreamId::next();
+        let system_stream = CaptureStreamId::next();
+        let mine = identity(
+            session,
+            AudioSource::Microphone,
+            mic_stream,
+            10,
+            MonotonicTimestamp::now(),
+        );
+        let remote = identity(
+            session,
+            AudioSource::SystemOutput,
+            system_stream,
+            20,
+            MonotonicTimestamp::now(),
+        );
+        register(&mut pending, mine);
+        register(&mut pending, remote);
+
+        let (a, _) = resolve_pending_identity(
+            &mut pending,
+            session,
+            AudioSource::SystemOutput,
+            Some(remote.segment_id),
+        )
+        .unwrap();
+        let (b, _) = resolve_pending_identity(
+            &mut pending,
+            session,
+            AudioSource::Microphone,
+            Some(mine.segment_id),
+        )
+        .unwrap();
+
+        assert_eq!(a.sequence_number, 20);
+        assert_eq!(a.capture_stream_id, system_stream);
+        assert_eq!(b.sequence_number, 10);
+        assert_eq!(b.capture_stream_id, mic_stream);
+        assert_ne!(a.segment_id, b.segment_id);
+    }
+
+    /// Dois fluxos da **mesma** fonte (troca de dispositivo) não se misturam por ordem.
+    #[test]
+    fn two_capture_streams_of_the_same_source_do_not_share_a_queue() {
+        let session = SessionId::from_value(1);
+        let mut pending = PendingSegmentTimings::new();
+        let old_stream = CaptureStreamId::next();
+        let new_stream = CaptureStreamId::next();
+        let old = identity(
+            session,
+            AudioSource::Microphone,
+            old_stream,
+            1,
+            MonotonicTimestamp::now(),
+        );
+        let new = identity(
+            session,
+            AudioSource::Microphone,
+            new_stream,
+            1,
+            MonotonicTimestamp::now(),
+        );
+        register(&mut pending, old);
+        register(&mut pending, new);
+
+        assert_eq!(
+            pending.len(),
+            2,
+            "uma fila por fluxo, não uma fila por fonte"
+        );
+        let (resolved, _) = resolve_pending_identity(
+            &mut pending,
+            session,
+            AudioSource::Microphone,
+            Some(new.segment_id),
+        )
+        .unwrap();
+        assert_eq!(resolved.capture_stream_id, new_stream);
+    }
+
+    /// Sessão nova nunca casa com envelope de sessão anterior — nem pelo fallback por ordem,
+    /// que é o caminho mais permissivo que existe aqui.
+    #[test]
+    fn a_new_session_never_matches_a_pending_identity_of_the_previous_one() {
+        let previous = SessionId::from_value(1);
+        let current = SessionId::from_value(2);
+        let mut pending = PendingSegmentTimings::new();
+        register(
+            &mut pending,
+            identity(
+                previous,
+                AudioSource::SystemOutput,
+                CaptureStreamId::next(),
+                1,
+                MonotonicTimestamp::now(),
+            ),
+        );
+
+        assert!(
+            resolve_pending_identity(&mut pending, current, AudioSource::SystemOutput, None)
+                .is_none()
+        );
     }
 }

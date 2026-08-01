@@ -20,7 +20,7 @@ use crate::audio::error::AudioCaptureError;
 use crate::audio::provider::AudioCaptureProvider;
 use crate::audio::segmentation::{SegmentationConfig, Segmenter, SpeechEvent};
 use crate::audio::selection::{self, DeviceSelectionConfig, ResolvedDevice};
-use crate::audio::types::{AudioCaptureEvent, AudioDevice, AudioSource};
+use crate::audio::types::{AudioCaptureEvent, AudioDevice, AudioSource, CaptureStreamId};
 use crate::transcription::queue::TranscriptionQueue;
 
 pub type CaptureEventSink = Arc<dyn Fn(AudioCaptureEvent) + Send + Sync>;
@@ -207,13 +207,23 @@ impl CaptureEngine {
             .await?;
 
         let session_id = category.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
+        // Um `CaptureStreamId` por `start_capture`: é este id que acompanha cada segmento
+        // até a Conversation Timeline e que permite à transcrição casar um resultado com o
+        // fluxo que o produziu, mesmo que o usuário troque de dispositivo no meio da sessão
+        // e dois fluxos da mesma fonte se sobreponham por um instante.
+        let capture_stream_id = CaptureStreamId::next();
         let session_timeline_offset_ms = self.timeline_origin.elapsed().as_millis() as u64;
         let engine = self.clone();
         let emit = self.emit.clone();
         let transcription_queue = self.transcription_queue.clone();
 
         let forward_task = tauri::async_runtime::spawn(async move {
-            let mut segmenter = Segmenter::new(source, sample_rate, SegmentationConfig::default());
+            let mut segmenter = Segmenter::for_stream(
+                source,
+                capture_stream_id,
+                sample_rate,
+                SegmentationConfig::default(),
+            );
             let mut disconnected = false;
 
             while let Some(event) = rx.recv().await {

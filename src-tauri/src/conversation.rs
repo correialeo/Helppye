@@ -16,17 +16,55 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::audio::segment::{AudioTimestamp, SegmentId};
-use crate::audio::types::{AudioCaptureEvent, AudioSource};
+use crate::audio::types::{AudioCaptureEvent, AudioSource, CaptureStreamId};
+use crate::integrity::{
+    diagnose_cross_source, origin_log, CrossSourceCandidate, CrossSourceConfig,
+    CrossSourceDiagnosis, IntegrityStage, SourceIntegrityError, TranscriptSegmentOrigin,
+};
 use crate::normalization::{NormalizationChange, TranscriptNormalizationResult};
 use crate::response_provider::engine::{
     is_eligible_turn, process_conversation_events, GenerationTrigger,
 };
 use crate::response_provider::ResponseEngineState;
+use crate::transcription::envelope::TranscriptionResultEnvelope;
 use crate::transcription::events::FinalTranscript;
 #[cfg(test)]
 use crate::transcription::types::{Transcript, TranscriptEvent};
 
 pub const CONVERSATION_TIMELINE_EVENT: &str = "conversation://timeline-event";
+
+/// Quantos segmentos anteriores entram na comparação cruzada de origem. Eco acústico e
+/// captura duplicada aparecem em segundos, não em minutos; comparar a fala nova contra a
+/// sessão inteira cresceria com a duração da reunião dentro do caminho crítico da latência,
+/// justamente onde a métrica de UX é medida.
+const CROSS_SOURCE_COMPARISON_WINDOW: usize = 6;
+
+/// Fecha o rastro de origem daquele resultado com o que só a timeline conhece: a fonte com
+/// que o segmento de fato entrou e o speaker derivado dela. `cross_source_similarity` vem do
+/// diagnóstico, que é **só** diagnóstico — nenhum speaker ou fonte muda por causa dele.
+fn record_timeline_origin_observation(
+    envelope: &TranscriptionResultEnvelope,
+    segment: &TranscriptSegment,
+    diagnosis: Option<(CrossSourceDiagnosis, f32)>,
+) {
+    if let Some((diagnosis, similarity)) = diagnosis {
+        // `warn` e não `error`: nenhum destes é falha do processo. `InternalSourceMismatch`
+        // seria, mas nesse ponto o segmento já foi rejeitado por `SourceIntegrityError`.
+        warn!(
+            segment_id = ?segment.segment_id,
+            source = ?segment.source,
+            diagnosis = diagnosis.as_str(),
+            similarity,
+            "cross_source_diagnosis"
+        );
+    }
+    origin_log().complete_at_timeline(
+        envelope.segment_id,
+        segment.source,
+        segment.speaker.as_str(),
+        diagnosis.map(|(_, similarity)| similarity),
+    );
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,11 +73,31 @@ pub enum ConversationSpeaker {
     OtherPerson,
 }
 
+/// **A única** derivação de speaker a partir de fonte no processo inteiro.
+///
+/// Existe como função nomeada, e não só como `From`, para que a regra tenha um lugar
+/// citável: qualquer outro módulo que precise do speaker chama isto ou o `From` que delega
+/// aqui. Um `match source { ... }` espalhado por módulo é o começo de duas classificações
+/// divergentes — e duas classificações divergentes é exatamente o defeito que esta camada
+/// existe para tornar impossível.
+pub fn speaker_for_source(source: AudioSource) -> ConversationSpeaker {
+    match source {
+        AudioSource::Microphone => ConversationSpeaker::User,
+        AudioSource::SystemOutput => ConversationSpeaker::OtherPerson,
+    }
+}
+
 impl From<AudioSource> for ConversationSpeaker {
     fn from(source: AudioSource) -> Self {
-        match source {
-            AudioSource::Microphone => ConversationSpeaker::User,
-            AudioSource::SystemOutput => ConversationSpeaker::OtherPerson,
+        speaker_for_source(source)
+    }
+}
+
+impl ConversationSpeaker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConversationSpeaker::User => "user",
+            ConversationSpeaker::OtherPerson => "other_person",
         }
     }
 }
@@ -111,6 +169,14 @@ pub struct TranscriptSegment {
     pub segment_id: SegmentId,
     pub speaker: ConversationSpeaker,
     pub source: AudioSource,
+    /// Fluxo físico de captura que produziu este segmento, copiado do envelope. Faz parte da
+    /// identidade que o `ConversationAssembler` compara antes de anexar a um turno aberto.
+    pub capture_stream_id: CaptureStreamId,
+    /// Posição no fluxo de captura. Diagnóstico apenas; a ordenação da timeline continua
+    /// sendo por `received_sequence`/`started_at`, que são comparáveis entre fontes.
+    pub sequence_number: u64,
+    /// Como este segmento entrou. `Live` é fala real; ver `TranscriptSegmentOrigin`.
+    pub origin: TranscriptSegmentOrigin,
     /// Texto **normalizado** — o que a timeline junta, o que vai para o prompt, o que o
     /// usuário vê. `raw_text` guarda o que o transcritor entregou de fato; os dois nunca
     /// aparecem juntos no contexto enviado ao modelo (ver `ResponseContextBuilder`).
@@ -146,8 +212,11 @@ impl TranscriptSegment {
 
         Some(TranscriptSegment {
             segment_id: transcript.segment_id,
-            speaker: ConversationSpeaker::from(transcript.source),
+            speaker: speaker_for_source(transcript.source),
             source: transcript.source,
+            capture_stream_id: CaptureStreamId::UNASSIGNED,
+            sequence_number: 0,
+            origin: TranscriptSegmentOrigin::Live,
             raw_text: transcript.text,
             text,
             normalization_changes: Vec::new(),
@@ -165,21 +234,43 @@ impl TranscriptSegment {
     /// `TranscriptionRuntime` — o caminho de produção. `normalize_segment_text` ainda roda
     /// por cima como rede de segurança para espaços residuais; ela é idempotente sobre
     /// texto já normalizado.
+    ///
+    /// A origem vem do **envelope**, não de `transcript.source`. O `transcript` continua
+    /// sendo a fonte do texto, do idioma e dos timestamps; a fonte de áudio é a única coisa
+    /// que ele deixou de ter autoridade para declarar. Uma divergência entre os dois é
+    /// devolvida como `SourceIntegrityError` — o segmento não é criado "corrigido".
     fn from_normalized(
+        envelope: &TranscriptionResultEnvelope,
         transcript: &FinalTranscript,
         normalization: &TranscriptNormalizationResult,
         received_sequence: u64,
         speech_ended_at: Instant,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>, SourceIntegrityError> {
+        SourceIntegrityError::check(
+            envelope.segment_id,
+            envelope.source,
+            transcript.source,
+            IntegrityStage::Timeline,
+        )?;
+
         let text = normalize_segment_text(&normalization.normalized_text);
         if text.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        Some(TranscriptSegment {
-            segment_id: transcript.segment_id.unwrap_or_else(SegmentId::next),
-            speaker: ConversationSpeaker::from(transcript.source),
-            source: transcript.source,
+        let speaker = speaker_for_source(envelope.source);
+        // Rede de segurança em build de debug: se algum dia alguém trouxer o speaker de
+        // outro lugar, o teste que rodar esse caminho falha aqui, no ponto da criação, e não
+        // três camadas adiante como "o turno ficou com o speaker errado".
+        debug_assert_eq!(speaker, ConversationSpeaker::from(envelope.source));
+
+        Ok(Some(TranscriptSegment {
+            segment_id: envelope.segment_id,
+            speaker,
+            source: envelope.source,
+            capture_stream_id: envelope.capture_stream_id,
+            sequence_number: envelope.sequence_number,
+            origin: TranscriptSegmentOrigin::Live,
             raw_text: normalization.raw_text.clone(),
             text,
             normalization_changes: normalization.normalization_changes.clone(),
@@ -190,7 +281,19 @@ impl TranscriptSegment {
             received_sequence,
             transcription_completed_at: Instant::now(),
             speech_ended_at,
-        })
+        }))
+    }
+
+    /// Candidato para o diagnóstico cruzado entre fontes. Só identidade, janela e texto —
+    /// ver `integrity::diagnose_cross_source`.
+    fn cross_source_candidate(&self) -> CrossSourceCandidate {
+        CrossSourceCandidate {
+            segment_id: self.segment_id,
+            source: self.source,
+            started_at_ms: self.started_at.0,
+            ended_at_ms: self.ended_at.0,
+            text: self.text.clone(),
+        }
     }
 }
 
@@ -199,6 +302,9 @@ pub struct ConversationUtterance {
     pub id: UtteranceId,
     pub speaker: ConversationSpeaker,
     pub source: AudioSource,
+    /// Fluxo de captura desta utterance. Todos os segmentos dela vêm do mesmo fluxo — é uma
+    /// das condições que o assembler exige para anexar (ver `segment_decision`).
+    pub capture_stream_id: CaptureStreamId,
     pub text: String,
     /// Texto bruto agregado dos segmentos desta utterance. Fica disponível apenas no
     /// backend para diagnóstico e proteção contra vazamento; o prompt usa somente
@@ -223,10 +329,12 @@ pub struct ConversationUtterance {
 
 impl ConversationUtterance {
     fn start(id: UtteranceId, segment: &TranscriptSegment) -> Self {
+        debug_assert_eq!(segment.speaker, ConversationSpeaker::from(segment.source));
         ConversationUtterance {
             id,
             speaker: segment.speaker,
             source: segment.source,
+            capture_stream_id: segment.capture_stream_id,
             text: segment.text.clone(),
             raw_text: segment.raw_text.clone(),
             segments: vec![segment.segment_id],
@@ -263,6 +371,9 @@ pub struct ConversationTurn {
     pub id: TurnId,
     pub speaker: ConversationSpeaker,
     pub source: AudioSource,
+    /// Fluxo de captura que abriu este turno. Um turno nunca agrega utterances de fluxos
+    /// diferentes — ver `ConversationAssembler::turn_accepts`.
+    pub capture_stream_id: CaptureStreamId,
     pub text: String,
     #[serde(skip_serializing)]
     pub raw_text: String,
@@ -274,10 +385,15 @@ pub struct ConversationTurn {
 
 impl ConversationTurn {
     fn start(id: TurnId, utterance: &ConversationUtterance) -> Self {
+        debug_assert_eq!(
+            utterance.speaker,
+            ConversationSpeaker::from(utterance.source)
+        );
         ConversationTurn {
             id,
             speaker: utterance.speaker,
             source: utterance.source,
+            capture_stream_id: utterance.capture_stream_id,
             text: utterance.text.clone(),
             raw_text: utterance.raw_text.clone(),
             utterances: vec![utterance.id],
@@ -305,6 +421,7 @@ impl ConversationTurn {
 enum FinalizationReason {
     SpeakerChanged,
     SourceChanged,
+    CaptureStreamChanged,
     UtteranceGapExceeded,
     TurnInactivityTimeout,
     Paused,
@@ -319,6 +436,7 @@ impl FinalizationReason {
         match self {
             FinalizationReason::SpeakerChanged => "speaker_changed",
             FinalizationReason::SourceChanged => "source_changed",
+            FinalizationReason::CaptureStreamChanged => "capture_stream_changed",
             FinalizationReason::UtteranceGapExceeded => "utterance_gap_exceeded",
             FinalizationReason::TurnInactivityTimeout => "turn_inactivity_timeout",
             FinalizationReason::Paused => "paused",
@@ -338,7 +456,11 @@ impl FinalizationReason {
     fn to_utterance_reason(self) -> UtteranceFinalizationReason {
         match self {
             FinalizationReason::SpeakerChanged => UtteranceFinalizationReason::SpeakerChanged,
-            FinalizationReason::SourceChanged => UtteranceFinalizationReason::SourceChanged,
+            // Trocar de dispositivo no meio da sessão é, do ponto de vista da utterance, a
+            // fonte mudando: a fala anterior terminou porque o áudio dela deixou de existir.
+            FinalizationReason::SourceChanged | FinalizationReason::CaptureStreamChanged => {
+                UtteranceFinalizationReason::SourceChanged
+            }
             FinalizationReason::UtteranceGapExceeded
             | FinalizationReason::TurnInactivityTimeout => {
                 UtteranceFinalizationReason::InactivityTimeout
@@ -508,6 +630,13 @@ impl ConversationAssembler {
 
         let mut events = Vec::new();
         if self.open_utterance.is_none() {
+            // Caminho crítico e não óbvio: sem utterance aberta, `segment_decision` — a única
+            // checagem de speaker/source que existia — não roda. Esse estado não é raro: é
+            // exatamente o que o timer dedicado da utterance produz, porque ele finaliza a
+            // utterance por silêncio e **deixa o turno aberto** de propósito. A partir daí,
+            // qualquer segmento da outra fonte era anexado ao turno da fonte anterior sem
+            // nenhuma comparação. Ver `turn_accepts`.
+            self.close_stale_turn(&segment, &mut events);
             self.start_utterance_and_maybe_turn(segment, &mut events);
             return events;
         }
@@ -581,6 +710,59 @@ impl ConversationAssembler {
         events
     }
 
+    /// Um turno aberto aceita esta utterance? Quatro condições, e nenhuma delas é sobre
+    /// tempo: um turno é "o que **um** interlocutor falou enquanto tinha a palavra", e
+    /// proximidade temporal não torna duas pessoas a mesma pessoa. Timestamps próximos são,
+    /// aliás, o caso normal quando o áudio de uma fonte vaza para a outra.
+    fn turn_accepts(turn: &ConversationTurn, segment: &TranscriptSegment) -> Option<TurnRejection> {
+        if turn.speaker != segment.speaker {
+            return Some(TurnRejection::Speaker);
+        }
+        if turn.source != segment.source {
+            return Some(TurnRejection::Source);
+        }
+        // `UNASSIGNED` aparece em segmentos que não nasceram de uma sessão real de captura
+        // (fixtures, benchmark, testes de montagem). Compará-lo com um fluxo real rejeitaria
+        // esses casos por um motivo que não é sobre origem, então ele é neutro aqui: quem
+        // garante a origem nesse caminho continua sendo speaker/source.
+        if turn.capture_stream_id != CaptureStreamId::UNASSIGNED
+            && segment.capture_stream_id != CaptureStreamId::UNASSIGNED
+            && turn.capture_stream_id != segment.capture_stream_id
+        {
+            return Some(TurnRejection::CaptureStream);
+        }
+        None
+    }
+
+    /// Fecha o turno aberto quando ele já ficou velho demais para receber `segment`, mesmo
+    /// sendo compatível em origem. Só o caminho sem utterance aberta precisa disto — no
+    /// outro, `segment_decision` já avalia gap e duração.
+    ///
+    /// Sem esta checagem um turno atravessaria silêncios arbitrariamente longos, porque
+    /// nenhum segmento novo chegava para provocar a avaliação enquanto ele esperava.
+    fn close_stale_turn(
+        &mut self,
+        segment: &TranscriptSegment,
+        events: &mut Vec<ConversationTimelineEvent>,
+    ) {
+        let Some(turn) = self.open_turn.as_ref() else {
+            return;
+        };
+        if Self::turn_accepts(turn, segment).is_some() {
+            return;
+        }
+        let stale = segment.started_at.saturating_sub(turn.ended_at)
+            > self.config.turn_inactivity_timeout_ms;
+        let too_long = std::cmp::max(turn.ended_at, segment.ended_at)
+            .saturating_sub(turn.started_at)
+            > self.config.maximum_turn_duration_ms;
+        if stale {
+            events.extend(self.finalize_open_turn(FinalizationReason::TurnInactivityTimeout));
+        } else if too_long {
+            events.extend(self.finalize_open_turn(FinalizationReason::MaximumTurnDuration));
+        }
+    }
+
     fn segment_decision(
         &self,
         utterance: &ConversationUtterance,
@@ -591,6 +773,12 @@ impl ConversationAssembler {
         }
         if utterance.source != segment.source {
             return SegmentDecision::NewTurn(FinalizationReason::SourceChanged);
+        }
+        if utterance.capture_stream_id != CaptureStreamId::UNASSIGNED
+            && segment.capture_stream_id != CaptureStreamId::UNASSIGNED
+            && utterance.capture_stream_id != segment.capture_stream_id
+        {
+            return SegmentDecision::NewTurn(FinalizationReason::CaptureStreamChanged);
         }
         if segment.started_at < utterance.ended_at {
             let skew = utterance.ended_at.saturating_sub(segment.started_at);
@@ -633,6 +821,29 @@ impl ConversationAssembler {
         segment: TranscriptSegment,
         events: &mut Vec<ConversationTimelineEvent>,
     ) {
+        // Guarda única de admissão de turno: **todos** os caminhos que abrem uma utterance
+        // passam por aqui, então é aqui que a regra "um turno nunca troca de fonte ou de
+        // speaker" precisa estar. Deixá-la só em `segment_decision` foi o defeito original:
+        // aquele ponto não é atravessado quando não há utterance aberta.
+        if let Some(rejection) = self
+            .open_turn
+            .as_ref()
+            .and_then(|turn| Self::turn_accepts(turn, &segment))
+        {
+            let turn = self.open_turn.as_ref().expect("checked above");
+            warn!(
+                turn_id = turn.id.0,
+                turn_speaker = ?turn.speaker,
+                turn_source = ?turn.source,
+                segment_id = ?segment.segment_id,
+                segment_speaker = ?segment.speaker,
+                segment_source = ?segment.source,
+                rejection = rejection.as_str(),
+                "turno aberto recusou o segmento; abrindo turno novo"
+            );
+            events.extend(self.finalize_open_turn(rejection.finalization_reason()));
+        }
+
         self.next_utterance_id += 1;
         let utterance = ConversationUtterance::start(UtteranceId(self.next_utterance_id), &segment);
 
@@ -920,6 +1131,34 @@ enum SegmentDecision {
     NewTurn(FinalizationReason),
 }
 
+/// Por que um turno aberto recusou um segmento. Tipado (e não um `bool`) porque o motivo vai
+/// para o log de integridade e para o `finalization_reason` do evento — "o turno fechou" sem
+/// dizer o porquê é o que tornaria o defeito original invisível de novo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnRejection {
+    Speaker,
+    Source,
+    CaptureStream,
+}
+
+impl TurnRejection {
+    fn as_str(self) -> &'static str {
+        match self {
+            TurnRejection::Speaker => "speaker_mismatch",
+            TurnRejection::Source => "source_mismatch",
+            TurnRejection::CaptureStream => "capture_stream_mismatch",
+        }
+    }
+
+    fn finalization_reason(self) -> FinalizationReason {
+        match self {
+            TurnRejection::Speaker => FinalizationReason::SpeakerChanged,
+            TurnRejection::Source => FinalizationReason::SourceChanged,
+            TurnRejection::CaptureStream => FinalizationReason::CaptureStreamChanged,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConversationTimelineSnapshot {
     pub turns: Vec<ConversationTurn>,
@@ -1064,20 +1303,69 @@ impl ConversationTimeline {
     /// à sessão de transcrição viva daquela fonte e não é reentrega.
     pub fn ingest_normalized_transcript(
         &self,
+        envelope: &TranscriptionResultEnvelope,
         transcript: &FinalTranscript,
         normalization: &TranscriptNormalizationResult,
         speech_ended_at: Instant,
     ) -> Vec<ConversationTimelineEvent> {
         let sequence = self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let Some(segment) = TranscriptSegment::from_normalized(
+        let segment = match TranscriptSegment::from_normalized(
+            envelope,
             transcript,
             normalization,
             sequence,
             speech_ended_at,
-        ) else {
-            return Vec::new();
+        ) {
+            Ok(Some(segment)) => segment,
+            Ok(None) => return Vec::new(),
+            Err(error) => {
+                // Rejeitado, não corrigido: o evento não entra na timeline e nenhuma geração
+                // é disparada a partir dele. Um segmento cuja origem já divergiu não tem
+                // origem verdadeira recuperável, e "consertá-lo" só produziria fala atribuída
+                // a quem talvez não a tenha dito.
+                origin_log().record_violation(error);
+                return Vec::new();
+            }
         };
+
+        // Diagnóstico cruzado: acontece **depois** de o segmento existir com a fonte real
+        // dele, e não altera nada nele. O objetivo é distinguir eco acústico de troca de
+        // origem interna, para que um dos dois não seja confundido com o outro no relatório.
+        let diagnosis = self.diagnose_against_recent(&segment);
+        record_timeline_origin_observation(envelope, &segment, diagnosis);
+
         self.ingest_segment(segment)
+    }
+
+    /// Compara o segmento com os mais recentes já vistos na sessão. Devolve o diagnóstico e a
+    /// similaridade encontrada; nunca modifica o segmento.
+    fn diagnose_against_recent(
+        &self,
+        segment: &TranscriptSegment,
+    ) -> Option<(CrossSourceDiagnosis, f32)> {
+        let config = CrossSourceConfig::default();
+        let candidate = segment.cross_source_candidate();
+        let assembler = self
+            .assembler
+            .lock()
+            .expect("conversation timeline mutex poisoned");
+        // Janela curta: eco é um fenômeno de segundos, e comparar contra a sessão inteira
+        // custaria proporcionalmente ao tamanho da reunião no caminho crítico da latência.
+        assembler
+            .raw_segments
+            .iter()
+            .rev()
+            .take(CROSS_SOURCE_COMPARISON_WINDOW)
+            .filter(|previous| previous.segment_id != segment.segment_id)
+            .map(|previous| {
+                let other = previous.cross_source_candidate();
+                let similarity = crate::integrity::text_similarity(&other.text, &candidate.text);
+                (
+                    diagnose_cross_source(&other, &candidate, config),
+                    similarity,
+                )
+            })
+            .find(|(diagnosis, _)| *diagnosis != CrossSourceDiagnosis::IndependentSpeech)
     }
 
     /// Entrada **de teste**, sem normalização: exercita a montagem de utterances/turnos a
@@ -2488,3 +2776,8 @@ mod tests {
         );
     }
 }
+
+/// Testes de integridade de origem — ver o cabeçalho do arquivo incluído.
+#[cfg(test)]
+#[path = "conversation_origin_tests.rs"]
+mod origin_tests;

@@ -18,6 +18,7 @@
 //! entre a segmentação e esta camada — ele só passou a alimentar o runtime em vez de chamar
 //! o transcritor direto.
 
+pub mod envelope;
 pub mod error;
 pub mod events;
 pub mod provider;
