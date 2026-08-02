@@ -154,8 +154,8 @@ async fn wait_for_setup_complete(socket: &mut GeminiSocket) -> Result<(), Transc
     tokio::time::timeout(SETUP_TIMEOUT, async {
         while let Some(message) = socket.next().await {
             match message.map_err(connection_error)? {
-                Message::Text(text) => {
-                    let payload: Value = serde_json::from_str(text.as_ref()).map_err(|error| {
+                message @ (Message::Text(_) | Message::Binary(_)) => {
+                    let payload = parse_json_message(&message).map_err(|error| {
                         TranscriptionError::ProviderUnavailable(format!(
                             "invalid Gemini Live setup response: {error}"
                         ))
@@ -168,6 +168,9 @@ async fn wait_for_setup_complete(socket: &mut GeminiSocket) -> Result<(), Transc
                             "Gemini Live setup failed: {error}"
                         )));
                     }
+                    return Err(TranscriptionError::ProviderUnavailable(format!(
+                        "unexpected Gemini Live setup response: {payload}"
+                    )));
                 }
                 Message::Close(frame) => {
                     return Err(TranscriptionError::ProviderUnavailable(format!(
@@ -187,6 +190,14 @@ async fn wait_for_setup_complete(socket: &mut GeminiSocket) -> Result<(), Transc
 
 fn connection_error(error: impl std::fmt::Display) -> TranscriptionError {
     TranscriptionError::ProviderUnavailable(format!("Gemini Live connection failed: {error}"))
+}
+
+fn parse_json_message(message: &Message) -> Result<Value, serde_json::Error> {
+    match message {
+        Message::Text(text) => serde_json::from_str(text.as_ref()),
+        Message::Binary(bytes) => serde_json::from_slice(bytes.as_ref()),
+        _ => unreachable!("only text and binary messages contain JSON"),
+    }
 }
 
 #[derive(Default)]
@@ -394,17 +405,25 @@ async fn receive_messages(task: ReceiverTask) {
                     break;
                 };
                 match message {
-                    Ok(Message::Text(text)) => {
-                        if let Err(error) = handle_server_message(
-                            &context,
-                            text.as_ref(),
-                            &mut transcript,
-                            &mut speech_started,
-                            &timing,
-                            &sequence,
-                            &final_notification,
-                        ) {
-                            emit_error(&context, error);
+                    Ok(message @ (Message::Text(_) | Message::Binary(_))) => {
+                        match parse_json_message(&message) {
+                            Ok(payload) => {
+                                if let Err(error) = handle_server_payload(
+                                    &context,
+                                    &payload,
+                                    &mut transcript,
+                                    &mut speech_started,
+                                    &timing,
+                                    &sequence,
+                                    &final_notification,
+                                ) {
+                                    emit_error(&context, error);
+                                }
+                            }
+                            Err(error) => emit_error(
+                                &context,
+                                format!("invalid Gemini Live response: {error}"),
+                            ),
                         }
                     }
                     Ok(Message::Close(_)) => {
@@ -426,6 +445,7 @@ async fn receive_messages(task: ReceiverTask) {
     }
 }
 
+#[cfg(test)]
 fn handle_server_message(
     context: &TranscriptionSessionContext,
     text: &str,
@@ -437,6 +457,26 @@ fn handle_server_message(
 ) -> Result<(), String> {
     let payload: Value = serde_json::from_str(text)
         .map_err(|error| format!("invalid Gemini Live response: {error}"))?;
+    handle_server_payload(
+        context,
+        &payload,
+        transcript,
+        speech_started,
+        timing,
+        sequence,
+        final_notification,
+    )
+}
+
+fn handle_server_payload(
+    context: &TranscriptionSessionContext,
+    payload: &Value,
+    transcript: &mut String,
+    speech_started: &mut bool,
+    timing: &Arc<Mutex<AudioTiming>>,
+    sequence: &AtomicU64,
+    final_notification: &tokio::sync::Notify,
+) -> Result<(), String> {
     if let Some(error) = payload.get("error") {
         return Err(format!("Gemini Live returned an error: {error}"));
     }
@@ -595,6 +635,15 @@ mod tests {
     #[test]
     fn pcm_conversion_is_little_endian_and_clamped() {
         assert_eq!(pcm_i16_le(&[-2.0, 0.0, 2.0]), vec![1, 128, 0, 0, 255, 127]);
+    }
+
+    #[test]
+    fn server_json_is_accepted_from_text_and_binary_frames() {
+        let expected = json!({ "setupComplete": {} });
+        let text = Message::Text(expected.to_string().into());
+        let binary = Message::Binary(expected.to_string().into_bytes().into());
+        assert_eq!(parse_json_message(&text).unwrap(), expected);
+        assert_eq!(parse_json_message(&binary).unwrap(), expected);
     }
 
     #[tokio::test]
