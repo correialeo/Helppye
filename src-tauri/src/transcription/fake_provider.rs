@@ -73,6 +73,7 @@ impl FakeProviderLog {
 }
 
 pub struct FakeTranscriptionProvider {
+    provider_id: TranscriptionProviderId,
     behavior: FakeBehavior,
     capabilities: TranscriptionCapabilities,
     pub log: Arc<FakeProviderLog>,
@@ -83,6 +84,7 @@ pub struct FakeTranscriptionProvider {
 impl FakeTranscriptionProvider {
     pub fn new(behavior: FakeBehavior) -> Self {
         FakeTranscriptionProvider {
+            provider_id: TranscriptionProviderId::Fake,
             behavior,
             capabilities: TranscriptionCapabilities {
                 local: true,
@@ -101,6 +103,11 @@ impl FakeTranscriptionProvider {
 
     pub fn with_capabilities(mut self, capabilities: TranscriptionCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_provider_id(mut self, provider_id: TranscriptionProviderId) -> Self {
+        self.provider_id = provider_id;
         self
     }
 
@@ -128,7 +135,7 @@ impl FakeTranscriptionProvider {
 #[async_trait]
 impl TranscriptionProvider for FakeTranscriptionProvider {
     fn id(&self) -> TranscriptionProviderId {
-        TranscriptionProviderId::Fake
+        self.provider_id
     }
 
     fn capabilities(&self) -> TranscriptionCapabilities {
@@ -156,6 +163,7 @@ impl TranscriptionProvider for FakeTranscriptionProvider {
             _ => self.behavior.clone(),
         };
         Ok(Box::new(FakeSession {
+            provider_id: self.provider_id,
             behavior,
             context,
             log: Arc::clone(&self.log),
@@ -166,6 +174,7 @@ impl TranscriptionProvider for FakeTranscriptionProvider {
 }
 
 struct FakeSession {
+    provider_id: TranscriptionProviderId,
     behavior: FakeBehavior,
     context: TranscriptionSessionContext,
     log: Arc<FakeProviderLog>,
@@ -184,7 +193,7 @@ impl FakeSession {
             session_id: self.context.session_id,
             transcription_session_id: self.context.transcription_session_id,
             source: self.context.source,
-            provider: TranscriptionProviderId::Fake,
+            provider: self.provider_id,
             language: Some("pt".into()),
             text,
             started_at: crate::audio::segment::AudioTimestamp(0),
@@ -225,7 +234,7 @@ impl TranscriptionSession for FakeSession {
                 session_id: self.context.session_id,
                 transcription_session_id: self.context.transcription_session_id,
                 source: self.context.source,
-                provider: TranscriptionProviderId::Fake,
+                provider: self.provider_id,
                 at: chunk.started_at,
                 provider_event_id: self.event_id("speech-started"),
             }));
@@ -264,7 +273,7 @@ impl TranscriptionSession for FakeSession {
                         session_id: self.context.session_id,
                         transcription_session_id: self.context.transcription_session_id,
                         source: self.context.source,
-                        provider: TranscriptionProviderId::Fake,
+                        provider: self.provider_id,
                         message: message.clone(),
                         recoverable: true,
                     }));
@@ -278,7 +287,7 @@ impl TranscriptionSession for FakeSession {
                 session_id: self.context.session_id,
                 transcription_session_id: self.context.transcription_session_id,
                 source: self.context.source,
-                provider: TranscriptionProviderId::Fake,
+                provider: self.provider_id,
                 at: chunk.ended_at,
                 provider_event_id: self.event_id("speech-ended"),
             }));

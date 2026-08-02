@@ -8,21 +8,24 @@ interface ProviderOptionProps {
   badge?: string;
   status?: ReactNode;
   selected?: boolean;
+  disabled?: boolean;
   onSelect: () => void;
 }
 
 /** A provider card — name, one-line description, a small badge ("Recomendado"), nothing
  * about endpoints/streaming/models. Selecting a provider is a decision about *character*
  * (local vs. cloud, fast vs. natural), not infrastructure — see docs/onboarding.md. */
-export function ProviderOption({ name, description, badge, status, selected, onSelect }: ProviderOptionProps) {
+export function ProviderOption({ name, description, badge, status, selected, disabled, onSelect }: ProviderOptionProps) {
   return (
     <button
       type="button"
       onClick={onSelect}
+      disabled={disabled}
       aria-pressed={selected}
       className={cx(
         "flex w-full items-start justify-between gap-3 rounded-[8px] border px-4 py-3 text-left transition-colors duration-150",
         selected ? "border-brand-400/70 bg-brand-500/10" : "border-white/10 bg-[#111112] hover:border-white/20",
+        disabled && "cursor-not-allowed opacity-55 hover:border-white/10",
       )}
     >
       <div className="flex flex-col gap-0.5">

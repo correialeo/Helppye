@@ -1,16 +1,15 @@
-//! Configuração da camada de transcrição, **separada** da configuração de geração de
-//! resposta (`response_provider::settings::ResponseSettings`).
+//! Persisted, non-sensitive transcription configuration.
 //!
-//! São dois campos independentes de propósito: transcrever localmente e gerar na nuvem é
-//! uma combinação legítima e é o default do produto. Um único campo "provedor de IA" ligaria
-//! as duas escolhas e tornaria impossível expressá-la.
+//! Provider-specific settings live under `providers`. Credentials deliberately do not:
+//! they are stored only by `transcription::secrets` in the operating-system keychain.
 
 use serde::{Deserialize, Serialize};
 
 use crate::transcription::provider::{TranscriptionCapabilities, TranscriptionProviderId};
 
-/// Código de idioma no formato que os backends aceitam (`"pt"`, `"en"`, ...), ou
-/// `Automatic` para detecção pelo próprio provider.
+pub const GEMINI_LIVE_ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+pub const DEFAULT_GEMINI_LIVE_MODEL: &str = "gemini-3.1-flash-live-preview";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode", content = "tag")]
 pub enum LanguageCode {
@@ -20,19 +19,15 @@ pub enum LanguageCode {
 
 impl Default for LanguageCode {
     fn default() -> Self {
-        LanguageCode::Fixed("pt".into())
+        Self::Fixed("pt".into())
     }
 }
 
 impl From<LanguageCode> for crate::transcription::types::TranscriptionLanguage {
     fn from(value: LanguageCode) -> Self {
         match value {
-            LanguageCode::Automatic => {
-                crate::transcription::types::TranscriptionLanguage::Automatic
-            }
-            LanguageCode::Fixed(tag) => {
-                crate::transcription::types::TranscriptionLanguage::Fixed(tag)
-            }
+            LanguageCode::Automatic => Self::Automatic,
+            LanguageCode::Fixed(tag) => Self::Fixed(tag),
         }
     }
 }
@@ -40,14 +35,59 @@ impl From<LanguageCode> for crate::transcription::types::TranscriptionLanguage {
 impl From<crate::transcription::types::TranscriptionLanguage> for LanguageCode {
     fn from(value: crate::transcription::types::TranscriptionLanguage) -> Self {
         match value {
-            crate::transcription::types::TranscriptionLanguage::Automatic => {
-                LanguageCode::Automatic
-            }
-            crate::transcription::types::TranscriptionLanguage::Fixed(tag) => {
-                LanguageCode::Fixed(tag)
-            }
+            crate::transcription::types::TranscriptionLanguage::Automatic => Self::Automatic,
+            crate::transcription::types::TranscriptionLanguage::Fixed(tag) => Self::Fixed(tag),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WhisperLocalSettings {
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeminiLiveSettings {
+    #[serde(default = "default_gemini_model")]
+    pub model: String,
+    #[serde(default = "default_gemini_endpoint")]
+    pub endpoint: String,
+}
+
+impl Default for GeminiLiveSettings {
+    fn default() -> Self {
+        Self {
+            model: default_gemini_model(),
+            endpoint: default_gemini_endpoint(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OpenAiRealtimeSettings {
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct OpenAiCompatibleSettings {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TranscriptionProviderSettings {
+    #[serde(default)]
+    pub whisper_local: WhisperLocalSettings,
+    #[serde(default)]
+    pub google_gemini: GeminiLiveSettings,
+    #[serde(default)]
+    pub openai_realtime: OpenAiRealtimeSettings,
+    #[serde(default)]
+    pub openai_compatible: OpenAiCompatibleSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -56,15 +96,30 @@ pub struct TranscriptionSettings {
     pub provider: TranscriptionProviderId,
     #[serde(default)]
     pub language: LanguageCode,
-    /// Nome/caminho do modelo, quando o provider aceita escolha. `None` = o provider decide
-    /// (para o Whisper local, o modelo já carregado).
-    #[serde(default)]
+    /// Backward-compatible read path for configuration written before provider-specific
+    /// settings existed. New writes leave it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default)]
+    pub providers: TranscriptionProviderSettings,
 }
 
 impl TranscriptionSettings {
-    /// Rejects combinations the selected provider cannot honor before they
-    /// become persisted state. Pure logic keeps this testable without Tauri.
+    pub fn active_model(&self) -> Option<String> {
+        let provider_model = match self.provider {
+            TranscriptionProviderId::WhisperLocal => self.providers.whisper_local.model.clone(),
+            TranscriptionProviderId::GoogleGemini => {
+                Some(self.providers.google_gemini.model.clone())
+            }
+            TranscriptionProviderId::OpenAiRealtime => self.providers.openai_realtime.model.clone(),
+            TranscriptionProviderId::OpenAiCompatible => {
+                self.providers.openai_compatible.model.clone()
+            }
+            TranscriptionProviderId::Fake => None,
+        };
+        self.model.clone().or(provider_model)
+    }
+
     pub fn validate_for(&self, capabilities: TranscriptionCapabilities) -> Result<(), String> {
         if !capabilities.speaker_source_preserved {
             return Err("the transcription provider does not preserve audio source".into());
@@ -80,9 +135,32 @@ impl TranscriptionSettings {
             LanguageCode::Fixed(_) if !capabilities.language_selection => {
                 Err("the transcription provider does not support language selection".into())
             }
-            _ => Ok(()),
+            _ => self.validate_provider_configuration(),
         }
     }
+
+    fn validate_provider_configuration(&self) -> Result<(), String> {
+        if self.provider != TranscriptionProviderId::GoogleGemini {
+            return Ok(());
+        }
+
+        let gemini = &self.providers.google_gemini;
+        if gemini.model.trim().is_empty() {
+            return Err("Gemini Live model cannot be empty".into());
+        }
+        if gemini.endpoint != GEMINI_LIVE_ENDPOINT {
+            return Err("Gemini Live endpoint must be the official Live API endpoint".into());
+        }
+        Ok(())
+    }
+}
+
+fn default_gemini_model() -> String {
+    DEFAULT_GEMINI_LIVE_MODEL.into()
+}
+
+fn default_gemini_endpoint() -> String {
+    GEMINI_LIVE_ENDPOINT.into()
 }
 
 #[cfg(test)]
@@ -94,11 +172,11 @@ mod tests {
         let settings = TranscriptionSettings::default();
         assert_eq!(settings.provider, TranscriptionProviderId::WhisperLocal);
         assert_eq!(settings.language, LanguageCode::Fixed("pt".into()));
-        assert_eq!(settings.model, None);
+        assert_eq!(settings.active_model(), None);
     }
 
     #[test]
-    fn language_round_trips_through_the_provider_type() {
+    fn language_round_trips_through_provider_type() {
         for code in [LanguageCode::Automatic, LanguageCode::Fixed("en".into())] {
             let provider_language: crate::transcription::types::TranscriptionLanguage =
                 code.clone().into();
@@ -107,12 +185,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_language_modes_the_provider_cannot_honor() {
+    fn capability_validation_rejects_unsupported_language_mode() {
         let settings = TranscriptionSettings::default();
         let mut capabilities = TranscriptionCapabilities::none();
-
         assert!(settings.validate_for(capabilities).is_err());
-
         capabilities.language_selection = true;
         assert!(settings.validate_for(capabilities).is_ok());
 
@@ -121,5 +197,32 @@ mod tests {
             ..settings
         };
         assert!(automatic.validate_for(capabilities).is_err());
+    }
+
+    #[test]
+    fn gemini_configuration_is_typed_and_uses_only_the_official_endpoint() {
+        let mut settings = TranscriptionSettings {
+            provider: TranscriptionProviderId::GoogleGemini,
+            language: LanguageCode::Automatic,
+            ..TranscriptionSettings::default()
+        };
+        let mut capabilities = TranscriptionCapabilities::none();
+        capabilities.streaming = true;
+        capabilities.partial_results = true;
+        capabilities.automatic_language_detection = true;
+        capabilities.requires_credentials = true;
+        assert!(settings.validate_for(capabilities).is_ok());
+
+        settings.providers.google_gemini.endpoint = "wss://example.invalid".into();
+        assert!(settings.validate_for(capabilities).is_err());
+    }
+
+    #[test]
+    fn legacy_model_remains_readable() {
+        let settings: TranscriptionSettings = serde_json::from_str(
+            r#"{"provider":"whisper_local","language":{"mode":"fixed","tag":"pt"},"model":"legacy.bin"}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.active_model().as_deref(), Some("legacy.bin"));
     }
 }

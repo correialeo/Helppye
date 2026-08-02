@@ -57,6 +57,7 @@ mod tests {
             provider: TranscriptionProviderId::OpenAiRealtime,
             language: LanguageCode::Automatic,
             model: Some("realtime-model".into()),
+            providers: Default::default(),
         };
         save(&target, &settings).unwrap();
         assert_eq!(load(&target), settings);

@@ -6,6 +6,7 @@ import { startCapture, stopCapture } from "../services/audioService";
 import { endConversationSession, startConversationSession } from "../services/conversationService";
 import { closeSessionWindows, openSessionWindows, openSettingsWindow, restoreSessionWindows } from "../services/sessionWindowService";
 import { onGlobalSessionToggle } from "../services/globalShortcutService";
+import { validateActiveTranscriptionProvider } from "../services/transcriptionProviderService";
 import { WelcomeScreen } from "../features/welcome/WelcomeScreen";
 import { CloudLoginScreen } from "../features/welcome/CloudLoginScreen";
 import { ReadyScreen } from "../features/ready/ReadyScreen";
@@ -40,6 +41,15 @@ export function AppRouter() {
   const openDeveloperTools = () => setDeveloperToolsOpen(true);
 
   const startSession = async () => {
+    try {
+      await validateActiveTranscriptionProvider();
+    } catch (error) {
+      console.error("provider de transcrição indisponível", error);
+      setSettingsReturnTo("ready");
+      const opened = await openSettingsWindow();
+      if (!opened) setScreen("settings");
+      return;
+    }
     await startConversationSession().catch((e) => {
       console.error("falha ao abrir fronteira de sessao", e);
     });

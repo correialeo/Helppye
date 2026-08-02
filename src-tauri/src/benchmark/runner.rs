@@ -135,7 +135,7 @@ pub async fn run_fixture(
         transcription_session_id: TranscriptionSessionId::next(),
         source: fixture.source,
         language: settings.language.clone().into(),
-        model: settings.model.clone(),
+        model: settings.active_model(),
         sink: Arc::new(move |event| {
             sink_events
                 .lock()
@@ -274,7 +274,7 @@ pub async fn run_fixture(
     Ok(BenchmarkCaseResult {
         fixture_id: fixture.id.clone(),
         provider: provider.id().as_str().to_string(),
-        model: settings.model.clone(),
+        model: settings.active_model(),
         language: language_label(&settings.language),
         source: fixture.source,
         latencies: BenchmarkLatencies {

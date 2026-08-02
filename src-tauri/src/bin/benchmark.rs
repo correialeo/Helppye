@@ -8,8 +8,8 @@
 //!   --out ../benchmarks/results
 //! ```
 //!
-//! `--model` é obrigatório: o único provider implementado hoje é o Whisper local, e ele
-//! precisa de um `.bin` do whisper.cpp. O provider fake existe só dentro dos testes
+//! `--model` é obrigatório para o Whisper local e opcional para providers remotos. O
+//! provider fake existe só dentro dos testes
 //! (`#[cfg(test)]`) — ele devolve o texto que lhe mandaram, então rodar o harness contra ele
 //! produziria um relatório com WER perfeito que não diz nada sobre transcritor nenhum.
 //!
@@ -25,16 +25,16 @@ use helppye_lib::benchmark::{
     run_fixture, write_csv, write_json, BenchmarkCaseResult, CostModel, FixtureManifest,
 };
 use helppye_lib::normalization::{DeterministicNormalizer, TranscriptionVocabulary};
-use helppye_lib::transcription::provider::TranscriptionProvider;
+use helppye_lib::transcription::provider::{TranscriptionProvider, TranscriptionProviderId};
 use helppye_lib::transcription::segment_transcriber::SegmentTranscriber;
 use helppye_lib::transcription::settings::{LanguageCode, TranscriptionSettings};
 use helppye_lib::transcription::types::{InferenceDevice, ModelConfig};
-use helppye_lib::transcription::whisper_local::WhisperLocalTranscriptionProvider;
 use helppye_lib::transcription::whisper_provider::WhisperCppProvider;
 
 struct Args {
     manifest: PathBuf,
     out_dir: PathBuf,
+    provider: TranscriptionProviderId,
     model: Option<PathBuf>,
     cost: CostModel,
 }
@@ -76,11 +76,13 @@ fn main() -> ExitCode {
 }
 
 const USAGE: &str = "uso: benchmark --manifest <fixtures.json> [--out <dir>] \
-[--model <ggml.bin>] [--usd-per-audio-minute <preço>]";
+[--provider <provider-id>] [--model <modelo-ou-ggml.bin>] \
+[--usd-per-audio-minute <preço>]";
 
 fn parse_args() -> Result<Args, String> {
     let mut manifest = None;
     let mut out_dir = PathBuf::from("benchmarks/results");
+    let mut provider = TranscriptionProviderId::WhisperLocal;
     let mut model = None;
     let mut cost = CostModel::default();
 
@@ -90,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
         match flag.as_str() {
             "--manifest" => manifest = Some(PathBuf::from(value()?)),
             "--out" => out_dir = PathBuf::from(value()?),
+            "--provider" => provider = value()?.parse()?,
             "--model" => model = Some(PathBuf::from(value()?)),
             "--usd-per-audio-minute" => {
                 let raw = value()?;
@@ -104,6 +107,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         manifest: manifest.ok_or("--manifest é obrigatório")?,
         out_dir,
+        provider,
         model,
         cost,
     })
@@ -122,7 +126,11 @@ async fn run(args: &Args) -> Result<ExitCode, String> {
     for fixture in &manifest.fixtures {
         let audio = FixtureManifest::audio_path(&args.manifest, fixture);
         let settings = TranscriptionSettings {
-            language: fixture.language.clone(),
+            language: if provider.capabilities().language_selection {
+                fixture.language.clone()
+            } else {
+                settings.language.clone()
+            },
             ..settings.clone()
         };
         match run_fixture(
@@ -174,36 +182,55 @@ async fn build_provider(
     ),
     String,
 > {
-    let model_path = args
-        .model
-        .clone()
-        .ok_or("--model é obrigatório: o Whisper local precisa de um .bin do whisper.cpp")?;
+    let model_path =
+        if args.provider == TranscriptionProviderId::WhisperLocal {
+            Some(args.model.clone().ok_or(
+                "--model é obrigatório: o Whisper local precisa de um .bin do whisper.cpp",
+            )?)
+        } else {
+            args.model.clone()
+        };
 
     let whisper = Arc::new(WhisperCppProvider::new());
-    whisper
-        .load(ModelConfig {
-            model_path: model_path.clone(),
-            model_name: file_name(&model_path),
-            language: LanguageCode::default().into(),
-            device: InferenceDevice::Cpu,
-        })
+    if args.provider == TranscriptionProviderId::WhisperLocal {
+        let model_path = model_path.as_ref().expect("validated above");
+        whisper
+            .load(ModelConfig {
+                model_path: model_path.clone(),
+                model_name: file_name(model_path),
+                language: LanguageCode::default().into(),
+                device: InferenceDevice::Cpu,
+            })
+            .await
+            .map_err(|e| format!("não foi possível carregar o modelo: {e}"))?;
+    }
+
+    let registry = helppye_lib::transcription::build_provider_registry(whisper);
+    let provider = registry
+        .get(args.provider)
+        .map_err(|error| error.to_string())?;
+    provider
+        .readiness()
         .await
-        .map_err(|e| format!("não foi possível carregar o modelo: {e}"))?;
+        .map_err(|error| error.to_string())?;
+    let capabilities = provider.capabilities();
 
     let settings = TranscriptionSettings {
-        model: Some(model_path.display().to_string()),
+        provider: args.provider,
+        language: if capabilities.automatic_language_detection {
+            LanguageCode::Automatic
+        } else {
+            LanguageCode::default()
+        },
+        model: model_path.map(|model| model.display().to_string()),
         ..TranscriptionSettings::default()
     };
-    let cost = if args.cost.usd_per_audio_minute.is_some() {
+    let cost = if args.cost.usd_per_audio_minute.is_some() || !capabilities.local {
         args.cost
     } else {
         CostModel::FREE_LOCAL
     };
-    Ok((
-        Arc::new(WhisperLocalTranscriptionProvider::new(whisper)),
-        settings,
-        cost,
-    ))
+    Ok((provider, settings, cost))
 }
 
 fn print_summary(result: &BenchmarkCaseResult) {

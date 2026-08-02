@@ -25,15 +25,12 @@ use audio::segment::SegmentId;
 use conversation::{emit_conversation_events, ConversationTimeline, ConversationTimelineState};
 use response_provider::engine::start_response_engine_event_loop;
 use transcription::events::TranscriptionEvent;
-use transcription::provider::TranscriptionProvider;
 use transcription::queue::TranscriptionQueue;
-use transcription::registry::TranscriptionProviderRegistry;
 use transcription::runtime::{
     TranscriptionOutputSink, TranscriptionRuntime, TranscriptionRuntimeOutput,
 };
 use transcription::segment_transcriber::SegmentTranscriber;
 use transcription::types::{Transcript, TranscriptEvent};
-use transcription::whisper_local::WhisperLocalTranscriptionProvider;
 use transcription::whisper_provider::WhisperCppProvider;
 use transcription::{TranscriptionState, TRANSCRIPTION_EVENT};
 
@@ -167,10 +164,7 @@ pub fn run() {
                 TranscriptionRuntimeOutput::Discarded { .. } => {}
             });
 
-            let whisper_local: Arc<dyn TranscriptionProvider> =
-                Arc::new(WhisperLocalTranscriptionProvider::new(transcriber.clone()));
-            let mut registry = TranscriptionProviderRegistry::new();
-            registry.register(whisper_local.clone());
+            let registry = transcription::build_provider_registry(transcriber.clone());
 
             let transcription_settings_path = app
                 .path()
@@ -194,7 +188,9 @@ pub fn run() {
                     );
                     transcription_settings.provider =
                         transcription::provider::TranscriptionProviderId::WhisperLocal;
-                    whisper_local.clone()
+                    registry
+                        .get(transcription::provider::TranscriptionProviderId::WhisperLocal)
+                        .expect("Whisper local is always registered")
                 }
             };
 
@@ -285,6 +281,11 @@ pub fn run() {
             transcription::transcription_providers_command,
             transcription::transcription_settings_command,
             transcription::transcription_set_settings_command,
+            transcription::transcription_test_connection_command,
+            transcription::transcription_validate_active_provider_command,
+            transcription::transcription_store_api_key_command,
+            transcription::transcription_delete_api_key_command,
+            transcription::transcription_has_api_key_command,
             transcription::transcription_correction_mode_command,
             transcription::transcription_set_correction_mode_command,
             transcription::transcription_vocabulary_command,

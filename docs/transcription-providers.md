@@ -130,11 +130,11 @@ Estado atual:
 | --- | --- | --- |
 | Whisper local (whisper.cpp) | `whisper_local` | implementado, padrão |
 | OpenAI Realtime Transcription | `openai_realtime` | contrato preparado, **não implementado** |
-| Google Gemini | `google_gemini` | contrato preparado, **não implementado** |
+| Gemini Live | `google_gemini` | implementado, streaming remoto |
 | Compatível com a API da OpenAI | `openai_compatible` | contrato preparado, **não implementado** |
 | Fake | `fake` | só em `#[cfg(test)]` |
 
-Os três não implementados continuam assim deliberadamente: implementá-los exigiria fixar
+Os dois não implementados continuam assim deliberadamente: implementá-los exigiria fixar
 protocolo de streaming, formato de áudio aceito e forma de autenticação a partir de
 documentação oficial. Enquanto isso não for feito com a documentação na mão, o contrato
 fica preparado e o registry diz a verdade — nenhum endpoint é inventado.
@@ -215,9 +215,31 @@ As configurações são persistidas por substituição atômica em
 no runtime; uma troca cancela as duas sessões de fonte e invalida suas identidades antes
 de aceitar áudio novo. Cada item enfileirado leva a revisão monotônica da configuração;
 áudio da revisão anterior é descartado e contabilizado em
-`discarded_stale_configuration`, nunca entregue ao provider novo. Credenciais e parâmetros de transporte de providers remotos ainda
-não pertencem a esse arquivo e devem usar keychain e configuração tipada quando esses
-providers forem implementados.
+`discarded_stale_configuration`, nunca entregue ao provider novo. Credenciais de providers
+remotos ficam exclusivamente no keychain do sistema. Configuração não sensível é tipada por
+provider em `TranscriptionProviderSettings` e persiste no arquivo de configuração; nenhuma
+API key passa por JSON, SQLite ou arquivo local.
+
+## Gemini Live
+
+`gemini_live.rs` implementa o mesmo contrato por sessão usado pelo Whisper local. Cada
+fonte abre seu próprio WebSocket oficial, envia primeiro `setup`, aguarda `setupComplete` e
+só então envia PCM mono signed 16-bit little-endian a 16 kHz por `realtimeInput.audio`.
+`inputAudioTranscription` é habilitado no setup. Fragmentos recebidos em
+`serverContent.inputTranscription.text` viram parciais; `serverContent.turnComplete` fecha
+o turno e produz o final acumulado. Como o protocolo não fornece id de evento, confiança,
+idioma detectado nem flag de final na transcrição de entrada, o adaptador sintetiza ids
+monotônicos e não inventa os demais valores.
+
+O endpoint persistido é validado contra o endpoint WebSocket oficial, sem a API key. A key
+é acrescentada apenas em memória durante a conexão e nunca aparece em logs. O modelo padrão
+é `gemini-3.1-flash-live-preview`; o idioma é automático porque os modelos de áudio nativo
+não aceitam seleção explícita de language code.
+
+Referências de protocolo: [Live API](https://ai.google.dev/gemini-api/docs/live-api),
+[WebSockets](https://ai.google.dev/gemini-api/docs/live-api/get-started-websocket),
+[capacidades](https://ai.google.dev/gemini-api/docs/live-api/capabilities) e
+[schema BidiGenerateContent](https://ai.google.dev/api/live).
 
 ## Como adicionar um backend
 

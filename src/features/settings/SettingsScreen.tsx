@@ -8,6 +8,7 @@ import { SecondaryButton } from "../../components/ui/SecondaryButton";
 import { DeviceTestBlock } from "../audio-setup/DeviceTestBlock";
 import { OllamaPanel } from "../ai-provider/OllamaPanel";
 import { CloudProviderPanel, isCloudProvider } from "../ai-provider/CloudProviderPanel";
+import { TranscriptionProviderSection } from "./TranscriptionProviderSection";
 import { useOnboardingStore } from "../../stores/useOnboardingStore";
 import { useResponseProvider } from "../../hooks/useResponseProvider";
 import type { ResponseProviderKind } from "../../types/responseProvider";
@@ -71,6 +72,10 @@ export function SettingsScreen({ onBack, onOpenDeveloperTools }: SettingsScreenP
         <Section title="Áudio">
           <DeviceTestBlock icon={<Mic className="h-4 w-4" />} title="Microfone" source="microphone" />
           <DeviceTestBlock icon={<MonitorSpeaker className="h-4 w-4" />} title="Áudio do computador" source="system_output" />
+        </Section>
+
+        <Section title="Transcription Provider">
+          <TranscriptionProviderSection />
         </Section>
 
         <Section title="Sugestão de resposta">

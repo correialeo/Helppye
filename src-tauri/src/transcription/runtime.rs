@@ -822,7 +822,7 @@ impl TranscriptionRuntime {
             transcription_session_id,
             source,
             language: settings.language.clone().into(),
-            model: settings.model.clone(),
+            model: settings.active_model(),
             sink: self.build_sink(),
         };
 
@@ -859,7 +859,7 @@ impl TranscriptionRuntime {
                 .expect("transcription configuration mutex");
             (
                 configuration.provider.id(),
-                configuration.settings.model.clone(),
+                configuration.settings.active_model(),
             )
         };
         let corrector = self.corrector.lock().expect("corrector mutex").clone();
@@ -1655,13 +1655,17 @@ mod tests {
             .unwrap();
         let old_revision = runtime.configuration_revision();
 
-        let second = Arc::new(FakeTranscriptionProvider::new(FakeBehavior::EmitsFinal {
-            text: "provider novo".into(),
-            partials: false,
-        }));
+        let second = Arc::new(
+            FakeTranscriptionProvider::new(FakeBehavior::EmitsFinal {
+                text: "provider novo".into(),
+                partials: false,
+            })
+            .with_provider_id(TranscriptionProviderId::GoogleGemini),
+        );
         let second_log = second.log();
         let settings = TranscriptionSettings {
-            provider: TranscriptionProviderId::Fake,
+            provider: TranscriptionProviderId::GoogleGemini,
+            language: crate::transcription::settings::LanguageCode::Automatic,
             ..TranscriptionSettings::default()
         };
         runtime.reconfigure(second, settings.clone()).await;
@@ -1681,6 +1685,10 @@ mod tests {
         assert_eq!(runtime.settings(), settings);
         assert_eq!(finals(&out).len(), 1);
         assert_eq!(finals(&out)[0].transcript.text, "provider novo");
+        assert_eq!(
+            finals(&out)[0].transcript.provider,
+            TranscriptionProviderId::GoogleGemini
+        );
     }
 
     /// Encerrar duas vezes acontece de verdade: o usuário clica em "encerrar" e o mesmo

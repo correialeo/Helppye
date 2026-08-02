@@ -22,10 +22,12 @@ pub mod config_store;
 pub mod envelope;
 pub mod error;
 pub mod events;
+pub mod gemini_live;
 pub mod provider;
 pub mod queue;
 pub mod registry;
 pub mod runtime;
+pub mod secrets;
 pub mod segment_transcriber;
 pub mod session;
 pub mod settings;
@@ -52,6 +54,20 @@ use runtime::{TranscriptionRuntime, TranscriptionRuntimeStats};
 use segment_transcriber::SegmentTranscriber;
 use settings::TranscriptionSettings;
 use types::{InferenceDevice, ModelConfig, TranscriptionLanguage};
+use whisper_local::WhisperLocalTranscriptionProvider;
+
+/// Builds the production registry used by the application and generic consumers such as
+/// the benchmark. A provider is registered in one place for both paths.
+pub fn build_provider_registry(
+    transcriber: Arc<dyn SegmentTranscriber>,
+) -> TranscriptionProviderRegistry {
+    let mut registry = TranscriptionProviderRegistry::new();
+    registry.register(Arc::new(WhisperLocalTranscriptionProvider::new(
+        transcriber,
+    )));
+    registry.register(Arc::new(gemini_live::GeminiLiveTranscriptionProvider::new()));
+    registry
+}
 
 /// Tauri event name for `types::TranscriptEvent`, mirroring `audio::CAPTURE_EVENT`.
 pub const TRANSCRIPTION_EVENT: &str = "transcription://event";
@@ -133,7 +149,8 @@ pub async fn configure_transcription_command(
     // o idioma/modelo que o usuário acabou de escolher sem depender de outra chamada.
     let mut settings = state.runtime.settings();
     settings.language = language.into();
-    settings.model = Some(model_name.clone());
+    settings.providers.whisper_local.model = Some(model_name.clone());
+    settings.model = None;
     config_store::save(&state.settings_path, &settings)?;
     state.runtime.set_settings(settings);
 
@@ -274,18 +291,93 @@ pub async fn transcription_set_settings_command(
     state: State<'_, TranscriptionState>,
     settings: TranscriptionSettings,
 ) -> Result<(), String> {
+    validate_settings_and_connection(&state.registry, &settings, true).await?;
     let provider = state
         .registry
         .get(settings.provider)
         .map_err(|e| e.to_string())?;
-    settings
-        .validate_for(provider.capabilities())
-        .map_err(|error| format!("invalid transcription settings: {error}"))?;
-    // Um provider registrado ainda pode estar impedido de rodar (modelo não carregado,
-    // credencial ausente). Perguntar antes de trocar transforma "toda transcrição falha em
-    // silêncio a partir de agora" numa mensagem de erro na hora da escolha.
-    provider.readiness().await.map_err(|e| e.to_string())?;
     config_store::save(&state.settings_path, &settings)?;
     state.runtime.reconfigure(provider, settings).await;
     Ok(())
+}
+
+async fn validate_settings_and_connection(
+    registry: &TranscriptionProviderRegistry,
+    settings: &TranscriptionSettings,
+    test_remote_connection: bool,
+) -> Result<(), String> {
+    let provider = registry
+        .get(settings.provider)
+        .map_err(|error| error.to_string())?;
+    let capabilities = provider.capabilities();
+    settings
+        .validate_for(capabilities)
+        .map_err(|error| format!("invalid transcription settings: {error}"))?;
+    provider
+        .readiness()
+        .await
+        .map_err(|error| error.to_string())?;
+
+    if test_remote_connection && !capabilities.local {
+        let context = session::TranscriptionSessionContext {
+            session_id: crate::conversation::SessionId::new(),
+            transcription_session_id: session::TranscriptionSessionId::next(),
+            source: crate::audio::types::AudioSource::SystemOutput,
+            language: settings.language.clone().into(),
+            model: settings.active_model(),
+            sink: Arc::new(|_| {}),
+        };
+        let mut session = provider
+            .start_session(context)
+            .await
+            .map_err(|error| error.to_string())?;
+        session.cancel().await.map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn transcription_test_connection_command(
+    state: State<'_, TranscriptionState>,
+    settings: TranscriptionSettings,
+) -> Result<(), String> {
+    validate_settings_and_connection(&state.registry, &settings, true).await
+}
+
+#[tauri::command]
+pub async fn transcription_validate_active_provider_command(
+    state: State<'_, TranscriptionState>,
+) -> Result<(), String> {
+    let settings = state.runtime.settings();
+    validate_settings_and_connection(&state.registry, &settings, true).await
+}
+
+#[tauri::command]
+pub async fn transcription_store_api_key_command(
+    state: State<'_, TranscriptionState>,
+    provider: provider::TranscriptionProviderId,
+    api_key: String,
+) -> Result<(), String> {
+    let descriptor = state
+        .registry
+        .get(provider)
+        .map_err(|error| error.to_string())?;
+    if !descriptor.capabilities().requires_credentials {
+        return Err("this transcription provider does not use credentials".into());
+    }
+    secrets::store_api_key(provider, &api_key).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn transcription_delete_api_key_command(
+    provider: provider::TranscriptionProviderId,
+) -> Result<(), String> {
+    secrets::delete_api_key(provider).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn transcription_has_api_key_command(
+    provider: provider::TranscriptionProviderId,
+) -> Result<bool, String> {
+    secrets::has_api_key(provider).map_err(|error| error.to_string())
 }

@@ -55,7 +55,7 @@ impl TranscriptionProviderId {
         match self {
             TranscriptionProviderId::WhisperLocal => "Whisper local",
             TranscriptionProviderId::OpenAiRealtime => "OpenAI Realtime",
-            TranscriptionProviderId::GoogleGemini => "Google Gemini",
+            TranscriptionProviderId::GoogleGemini => "Gemini Live",
             TranscriptionProviderId::OpenAiCompatible => "Endpoint compatível com OpenAI",
             TranscriptionProviderId::Fake => "Provider de teste",
         }
@@ -65,6 +65,21 @@ impl TranscriptionProviderId {
 impl std::fmt::Display for TranscriptionProviderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TranscriptionProviderId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "whisper_local" => Ok(Self::WhisperLocal),
+            "openai_realtime" => Ok(Self::OpenAiRealtime),
+            "google_gemini" => Ok(Self::GoogleGemini),
+            "openai_compatible" => Ok(Self::OpenAiCompatible),
+            "fake" => Ok(Self::Fake),
+            _ => Err(format!("unknown transcription provider: {value}")),
+        }
     }
 }
 

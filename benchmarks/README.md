@@ -51,11 +51,22 @@ cd src-tauri
 # Whisper local, com um modelo já baixado
 cargo run --bin benchmark -- \
   --manifest ../benchmarks/fixtures.json \
+  --provider whisper_local \
   --model ~/.local/share/helppye/models/ggml-base.bin \
   --out ../benchmarks/results
 ```
 
-`--model` é obrigatório. O provider fake vive dentro dos testes (`#[cfg(test)]`) e devolve o
+Para Gemini Live, basta usar o mesmo harness e o id registrado (a API key precisa já estar
+no keychain do sistema):
+
+```bash
+cargo run --bin benchmark -- \
+  --manifest ../benchmarks/fixtures.json \
+  --provider google_gemini \
+  --out ../benchmarks/results
+```
+
+`--model` é obrigatório apenas para Whisper local. O provider fake vive dentro dos testes (`#[cfg(test)]`) e devolve o
 texto que lhe mandaram: rodar o harness contra ele daria WER perfeito e não diria nada sobre
 transcritor nenhum.
 
@@ -92,5 +103,5 @@ As colunas que decidem alguma coisa:
   depende do provedor de LLM e do prompt, e misturar as duas num número só esconderia qual
   das duas regrediu.
 - Não simula rede nem variação de carga.
-- Um provider de nuvem só aparece aqui quando existir implementação real — a arquitetura está
-  pronta (`docs/transcription-providers.md`), mas o harness não inventa backend.
+- Providers entram no benchmark pelo mesmo registry usado pelo app. O harness não contém
+  caminho especial para Gemini Live nem inventa backends indisponíveis.

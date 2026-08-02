@@ -14,9 +14,9 @@ Audio capture and local transcription foundations implemented:
 - Local Whisper transcription through `whisper-rs`.
 - Pluggable transcription: `TranscriptionProvider`/`TranscriptionSession` contracts, a
   registry that reports declared capabilities, and per-source session lifecycle with
-  stale/duplicate events dropped in the backend. Whisper local runs through this
-  interface; streaming backends are contractually represented but not implemented — the
-  registry says so instead of pretending. See `docs/transcription-providers.md`.
+  stale/duplicate events dropped in the backend. Whisper local and Gemini Live run through
+  this interface; other planned streaming backends remain explicitly unavailable. See
+  `docs/transcription-providers.md`.
 - Deterministic transcript normalization (whitespace, repeated punctuation, sentence
   capitalization, configurable technical vocabulary) between the provider and the
   timeline. The raw text is never discarded. See `docs/transcript-normalization.md`.

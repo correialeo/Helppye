@@ -39,10 +39,6 @@ const PLANNED_PROVIDERS: &[(TranscriptionProviderId, &str)] = &[
         "contrato preparado; integração ainda não implementada (ver docs/transcription-providers.md)",
     ),
     (
-        TranscriptionProviderId::GoogleGemini,
-        "contrato preparado; integração ainda não implementada (ver docs/transcription-providers.md)",
-    ),
-    (
         TranscriptionProviderId::OpenAiCompatible,
         "contrato preparado; integração ainda não implementada (ver docs/transcription-providers.md)",
     ),
@@ -183,5 +179,24 @@ mod tests {
             !realtime.capabilities.streaming,
             "não afirmar capacidade de um backend não implementado"
         );
+    }
+
+    #[test]
+    fn implemented_gemini_descriptor_is_available_and_not_duplicated_as_planned() {
+        let mut registry = TranscriptionProviderRegistry::new();
+        registry.register(Arc::new(
+            FakeTranscriptionProvider::new(FakeBehavior::Silent)
+                .with_provider_id(TranscriptionProviderId::GoogleGemini),
+        ));
+
+        let descriptors = registry.descriptors();
+        let gemini: Vec<_> = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.id == TranscriptionProviderId::GoogleGemini)
+            .collect();
+        assert_eq!(gemini.len(), 1);
+        assert!(gemini[0].available);
+        assert!(gemini[0].capabilities.streaming);
+        assert!(gemini[0].capabilities.partial_results);
     }
 }

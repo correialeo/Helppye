@@ -36,6 +36,9 @@ sha2 = "0.10"
 futures-util = "0.3"
 bytes = "1"
 keyring = "4"
+base64 = "0.22"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "test-util", "net"] }
