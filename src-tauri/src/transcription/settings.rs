@@ -9,6 +9,10 @@ use crate::transcription::provider::{TranscriptionCapabilities, TranscriptionPro
 
 pub const GEMINI_LIVE_ENDPOINT: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 pub const DEFAULT_GEMINI_LIVE_MODEL: &str = "gemini-3.1-flash-live-preview";
+pub const DEFAULT_GEMINI_AUDIO_CHUNK_MS: u32 = 40;
+pub const DEFAULT_MANUAL_ACTIVITY_END_SILENCE_MS: u32 = 600;
+pub const DEFAULT_GEMINI_TRANSCRIPT_DRAIN_MS: u32 = 300;
+pub const DEFAULT_GEMINI_FINALIZATION_TIMEOUT_MS: u32 = 1_500;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "mode", content = "tag")]
@@ -53,6 +57,14 @@ pub struct GeminiLiveSettings {
     pub model: String,
     #[serde(default = "default_gemini_endpoint")]
     pub endpoint: String,
+    #[serde(default = "default_gemini_audio_chunk_ms")]
+    pub audio_chunk_ms: u32,
+    #[serde(default = "default_manual_activity_end_silence_ms")]
+    pub manual_activity_end_silence_ms: u32,
+    #[serde(default = "default_gemini_transcript_drain_ms")]
+    pub transcript_drain_ms: u32,
+    #[serde(default = "default_gemini_finalization_timeout_ms")]
+    pub finalization_timeout_ms: u32,
 }
 
 impl Default for GeminiLiveSettings {
@@ -60,6 +72,10 @@ impl Default for GeminiLiveSettings {
         Self {
             model: default_gemini_model(),
             endpoint: default_gemini_endpoint(),
+            audio_chunk_ms: default_gemini_audio_chunk_ms(),
+            manual_activity_end_silence_ms: default_manual_activity_end_silence_ms(),
+            transcript_drain_ms: default_gemini_transcript_drain_ms(),
+            finalization_timeout_ms: default_gemini_finalization_timeout_ms(),
         }
     }
 }
@@ -151,6 +167,19 @@ impl TranscriptionSettings {
         if gemini.endpoint != GEMINI_LIVE_ENDPOINT {
             return Err("Gemini Live endpoint must be the official Live API endpoint".into());
         }
+        if !matches!(gemini.audio_chunk_ms, 20 | 40) {
+            return Err("Gemini Live audio chunk must be 20ms or 40ms".into());
+        }
+        if !matches!(gemini.manual_activity_end_silence_ms, 500 | 600 | 700 | 800) {
+            return Err(
+                "Gemini Live manual activity silence must be 500, 600, 700 or 800ms".into(),
+            );
+        }
+        if gemini.transcript_drain_ms == 0
+            || gemini.finalization_timeout_ms < gemini.transcript_drain_ms
+        {
+            return Err("Gemini Live finalization timings are invalid".into());
+        }
         Ok(())
     }
 }
@@ -161,6 +190,22 @@ fn default_gemini_model() -> String {
 
 fn default_gemini_endpoint() -> String {
     GEMINI_LIVE_ENDPOINT.into()
+}
+
+const fn default_gemini_audio_chunk_ms() -> u32 {
+    DEFAULT_GEMINI_AUDIO_CHUNK_MS
+}
+
+const fn default_manual_activity_end_silence_ms() -> u32 {
+    DEFAULT_MANUAL_ACTIVITY_END_SILENCE_MS
+}
+
+const fn default_gemini_transcript_drain_ms() -> u32 {
+    DEFAULT_GEMINI_TRANSCRIPT_DRAIN_MS
+}
+
+const fn default_gemini_finalization_timeout_ms() -> u32 {
+    DEFAULT_GEMINI_FINALIZATION_TIMEOUT_MS
 }
 
 #[cfg(test)]
@@ -214,6 +259,39 @@ mod tests {
         assert!(settings.validate_for(capabilities).is_ok());
 
         settings.providers.google_gemini.endpoint = "wss://example.invalid".into();
+        assert!(settings.validate_for(capabilities).is_err());
+    }
+
+    #[test]
+    fn gemini_low_latency_tuning_accepts_only_supported_safe_values() {
+        let mut settings = TranscriptionSettings {
+            provider: TranscriptionProviderId::GoogleGemini,
+            language: LanguageCode::Automatic,
+            ..TranscriptionSettings::default()
+        };
+        let mut capabilities = TranscriptionCapabilities::none();
+        capabilities.streaming = true;
+        capabilities.partial_results = true;
+        capabilities.automatic_language_detection = true;
+        capabilities.requires_credentials = true;
+
+        for chunk_ms in [20, 40] {
+            for silence_ms in [500, 600, 700, 800] {
+                settings.providers.google_gemini.audio_chunk_ms = chunk_ms;
+                settings
+                    .providers
+                    .google_gemini
+                    .manual_activity_end_silence_ms = silence_ms;
+                assert!(settings.validate_for(capabilities).is_ok());
+            }
+        }
+        settings.providers.google_gemini.audio_chunk_ms = 100;
+        assert!(settings.validate_for(capabilities).is_err());
+        settings.providers.google_gemini.audio_chunk_ms = 40;
+        settings
+            .providers
+            .google_gemini
+            .manual_activity_end_silence_ms = 400;
         assert!(settings.validate_for(capabilities).is_err());
     }
 

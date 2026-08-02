@@ -29,11 +29,13 @@ use crate::conversation::{ConversationAssemblerConfig, ConversationTimeline};
 use crate::normalization::{
     TranscriptNormalizationInput, TranscriptNormalizationResult, TranscriptNormalizer,
 };
+use crate::telemetry::ProviderTelemetryEvent;
 use crate::transcription::envelope::TranscriptionResultEnvelope;
 use crate::transcription::events::TranscriptionEvent;
 use crate::transcription::provider::TranscriptionProvider;
 use crate::transcription::session::{
-    AudioChunk, TranscriptionSessionContext, TranscriptionSessionId,
+    AudioActivity, AudioChunk, TranscriptionSession, TranscriptionSessionContext,
+    TranscriptionSessionId,
 };
 use crate::transcription::settings::TranscriptionSettings;
 
@@ -42,6 +44,63 @@ use crate::transcription::settings::TranscriptionSettings;
 /// que acompanhar `audio::config::CaptureConfig::default()`.
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const CHUNK_DURATION_MS: u64 = 100;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkPacing {
+    #[default]
+    Instant,
+    Realtime,
+}
+
+async fn push_manual_stream_events(
+    session: &mut dyn TranscriptionSession,
+    source: crate::audio::types::AudioSource,
+    sequence: &mut u64,
+    events: Vec<SpeechEvent>,
+    errors: &mut Vec<String>,
+) {
+    for event in events {
+        let (samples, started_at, ended_at, activity) = match event {
+            SpeechEvent::Started { timestamp, .. } => {
+                (Vec::new(), timestamp, timestamp, AudioActivity::Start)
+            }
+            SpeechEvent::Audio {
+                samples,
+                started_at,
+                ended_at,
+                ..
+            } => (samples, started_at, ended_at, AudioActivity::None),
+            SpeechEvent::Ended { timestamp, .. } => {
+                (Vec::new(), timestamp, timestamp, AudioActivity::End)
+            }
+            SpeechEvent::SegmentReady(_) => continue,
+        };
+        *sequence += 1;
+        if let Err(error) = session
+            .push_audio(AudioChunk {
+                source,
+                capture_stream_id: CaptureStreamId::UNASSIGNED,
+                sequence_number: *sequence,
+                samples,
+                sample_rate: TARGET_SAMPLE_RATE,
+                started_at,
+                ended_at,
+                segment_id: None,
+                activity,
+                activity_observed_at: None,
+            })
+            .await
+        {
+            errors.push(error.to_string());
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BenchmarkRunOptions {
+    pub pacing: BenchmarkPacing,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
@@ -79,6 +138,11 @@ pub struct BenchmarkLatencies {
     pub first_final_ms: Option<u64>,
     pub total_ms: u64,
     pub real_time_factor: f64,
+    pub time_to_first_partial_ms: Option<u64>,
+    pub time_to_final_transcript_ms: Option<u64>,
+    pub speech_end_to_final_ms: Option<u64>,
+    pub provider_queue_wait_ms: Option<u64>,
+    pub websocket_send_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -89,6 +153,7 @@ pub struct BenchmarkCaseResult {
     pub language: String,
     pub source: crate::audio::types::AudioSource,
     pub latencies: BenchmarkLatencies,
+    pub pacing: BenchmarkPacing,
     pub expected_transcript: String,
     pub raw_transcript: String,
     pub normalized_transcript: String,
@@ -103,6 +168,7 @@ pub struct BenchmarkCaseResult {
     pub mean_confidence: Option<f32>,
     pub final_transcript_count: usize,
     pub partial_transcript_count: usize,
+    pub partial_revision_count: usize,
     pub normalization_change_count: usize,
     pub utterance_count: usize,
     pub errors: Vec<String>,
@@ -119,6 +185,27 @@ pub async fn run_fixture(
     audio_path: &std::path::Path,
     cost: CostModel,
 ) -> Result<BenchmarkCaseResult, RunnerError> {
+    run_fixture_with_options(
+        provider,
+        settings,
+        normalizer,
+        fixture,
+        audio_path,
+        cost,
+        BenchmarkRunOptions::default(),
+    )
+    .await
+}
+
+pub async fn run_fixture_with_options(
+    provider: &dyn TranscriptionProvider,
+    settings: &TranscriptionSettings,
+    normalizer: &dyn TranscriptNormalizer,
+    fixture: &BenchmarkFixture,
+    audio_path: &std::path::Path,
+    cost: CostModel,
+    options: BenchmarkRunOptions,
+) -> Result<BenchmarkCaseResult, RunnerError> {
     let decoded = wav::read_wav(audio_path)?;
     let samples = wav::to_target_rate(&decoded, TARGET_SAMPLE_RATE);
     let audio_duration_ms = duration_ms(samples.len(), TARGET_SAMPLE_RATE);
@@ -126,6 +213,8 @@ pub async fn run_fixture(
     let collected: Arc<Mutex<Vec<(TranscriptionEvent, Instant)>>> =
         Arc::new(Mutex::new(Vec::new()));
     let sink_events = Arc::clone(&collected);
+    let websocket_send_latency_ms = Arc::new(Mutex::new(None));
+    let observed_send_latency = Arc::clone(&websocket_send_latency_ms);
 
     let timeline = ConversationTimeline::new(ConversationAssemblerConfig::default());
     let session_id = timeline.session_id();
@@ -136,22 +225,69 @@ pub async fn run_fixture(
         source: fixture.source,
         language: settings.language.clone().into(),
         model: settings.active_model(),
+        streaming_audio_config: provider.streaming_audio_config(settings),
         sink: Arc::new(move |event| {
             sink_events
                 .lock()
                 .expect("benchmark sink mutex poisoned")
                 .push((event, Instant::now()));
         }),
+        provider_telemetry: Arc::new(move |event| {
+            if let ProviderTelemetryEvent::AudioChunkSent {
+                send_duration_ms, ..
+            } = event
+            {
+                *observed_send_latency.lock().unwrap() = Some(send_duration_ms);
+            }
+        }),
     };
 
-    let started_at = Instant::now();
     let mut session = provider
         .start_session(context)
         .await
         .map_err(|e| RunnerError::SessionStart(e.to_string()))?;
+    let started_at = Instant::now();
 
     let mut errors = Vec::new();
-    if provider.capabilities().streaming {
+    if let Some(streaming) = provider
+        .streaming_audio_config(settings)
+        .filter(|config| config.manual_activity_detection)
+    {
+        let frame_samples = crate::audio::config::CaptureConfig::default().frame_len_samples();
+        let segmentation = SegmentationConfig {
+            end_silence_ms: streaming.activity_end_silence_ms,
+            ..SegmentationConfig::default()
+        };
+        let mut segmenter = Segmenter::new(fixture.source, TARGET_SAMPLE_RATE, segmentation)
+            .with_streaming_audio_events();
+        let mut sequence = 0u64;
+        for frame in samples.chunks(frame_samples.max(1)) {
+            let events = segmenter.push_samples(frame);
+            push_manual_stream_events(
+                session.as_mut(),
+                fixture.source,
+                &mut sequence,
+                events,
+                &mut errors,
+            )
+            .await;
+            if options.pacing == BenchmarkPacing::Realtime {
+                tokio::time::sleep(Duration::from_millis(duration_ms(
+                    frame.len(),
+                    TARGET_SAMPLE_RATE,
+                )))
+                .await;
+            }
+        }
+        push_manual_stream_events(
+            session.as_mut(),
+            fixture.source,
+            &mut sequence,
+            segmenter.finish(),
+            &mut errors,
+        )
+        .await;
+    } else if provider.capabilities().streaming {
         let samples_per_chunk = (TARGET_SAMPLE_RATE as u64 * CHUNK_DURATION_MS / 1000) as usize;
         let mut offset_ms = 0u64;
         for (sequence, chunk) in samples.chunks(samples_per_chunk.max(1)).enumerate() {
@@ -165,11 +301,16 @@ pub async fn run_fixture(
                 started_at: AudioTimestamp(offset_ms),
                 ended_at: AudioTimestamp(offset_ms + chunk_ms),
                 segment_id: None,
+                activity: crate::transcription::session::AudioActivity::None,
+                activity_observed_at: None,
             };
             if let Err(error) = session.push_audio(audio).await {
                 errors.push(error.to_string());
             }
             offset_ms += chunk_ms;
+            if options.pacing == BenchmarkPacing::Realtime {
+                tokio::time::sleep(Duration::from_millis(chunk_ms)).await;
+            }
         }
     } else {
         let frame_samples = crate::audio::config::CaptureConfig::default().frame_len_samples();
@@ -211,6 +352,8 @@ pub async fn run_fixture(
     let events = std::mem::take(&mut *collected.lock().expect("benchmark sink mutex poisoned"));
     let mut first_partial_ms = None;
     let mut first_final_ms = None;
+    let mut first_final_at = None;
+    let mut speech_ended_at = None;
     let mut partial_transcript_count = 0usize;
     let mut finals = Vec::new();
     let mut confidences = Vec::new();
@@ -223,13 +366,17 @@ pub async fn run_fixture(
             }
             TranscriptionEvent::Final(final_transcript) => {
                 first_final_ms.get_or_insert_with(|| at.saturating_duration_since(started_at));
+                first_final_at.get_or_insert(at);
                 if let Some(confidence) = final_transcript.confidence {
                     confidences.push(confidence);
                 }
                 finals.push(final_transcript);
             }
             TranscriptionEvent::Error(e) => errors.push(e.message),
-            TranscriptionEvent::SpeechStarted(_) | TranscriptionEvent::SpeechEnded(_) => {}
+            TranscriptionEvent::SpeechEnded(_) => {
+                speech_ended_at = Some(at);
+            }
+            TranscriptionEvent::SpeechStarted(_) => {}
         }
     }
 
@@ -270,6 +417,7 @@ pub async fn run_fixture(
     let raw_transcript = join_speech(&raw_parts);
     let normalized_transcript = join_speech(&normalized_parts);
     let (hits, misses) = vocabulary_coverage(&fixture.technical_vocabulary, &normalized_transcript);
+    let websocket_send_latency_ms = *websocket_send_latency_ms.lock().unwrap();
 
     Ok(BenchmarkCaseResult {
         fixture_id: fixture.id.clone(),
@@ -287,7 +435,15 @@ pub async fn run_fixture(
             } else {
                 total_ms as f64 / audio_duration_ms as f64
             },
+            time_to_first_partial_ms: first_partial_ms.map(millis),
+            time_to_final_transcript_ms: first_final_ms.map(millis),
+            speech_end_to_final_ms: speech_ended_at.zip(first_final_at).map(
+                |(speech_end, final_at)| millis(final_at.saturating_duration_since(speech_end)),
+            ),
+            provider_queue_wait_ms: Some(0),
+            websocket_send_latency_ms,
         },
+        pacing: options.pacing,
         expected_transcript: fixture.expected_transcript.clone(),
         word_error_rate: word_error_rate(&fixture.expected_transcript, &normalized_transcript),
         raw_transcript,
@@ -301,6 +457,7 @@ pub async fn run_fixture(
         },
         final_transcript_count: finals.len(),
         partial_transcript_count,
+        partial_revision_count: partial_transcript_count,
         normalization_change_count,
         utterance_count: timeline.snapshot().utterances.len(),
         errors,

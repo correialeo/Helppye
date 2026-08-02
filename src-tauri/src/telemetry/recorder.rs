@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use serde::Serialize;
 
@@ -20,7 +21,8 @@ use crate::audio::segment::SegmentId;
 use crate::audio::types::AudioSource;
 use crate::conversation::{SessionId, UtteranceId};
 use crate::telemetry::{
-    ContentPolicy, Milestone, PipelineTrace, PipelineTraceSnapshot, TraceAttributes,
+    ContentPolicy, Milestone, PipelineTrace, PipelineTraceSnapshot, ProviderTelemetryEvent,
+    TraceAttributes,
 };
 
 /// Traces simultaneamente abertos. Na prática há no máximo um por fonte de áudio; a folga
@@ -108,6 +110,15 @@ impl TelemetryRecorder {
     /// comportamento correto: vários chunks de áudio da mesma fala precisam cair no mesmo
     /// trace, e quem os empurra não tem como saber se é o primeiro.
     pub fn begin_or_current(&self, session_id: SessionId, source: AudioSource) -> TraceId {
+        self.begin_or_current_at(session_id, source, Instant::now())
+    }
+
+    pub fn begin_or_current_at(
+        &self,
+        session_id: SessionId,
+        source: AudioSource,
+        origin: Instant,
+    ) -> TraceId {
         let mut state = self.state.lock().unwrap();
         if let Some(id) = state.by_source.get(&(session_id, source)) {
             return *id;
@@ -116,7 +127,7 @@ impl TelemetryRecorder {
         let id = TraceId(state.next_id);
         state
             .live
-            .insert(id, PipelineTrace::new(id, session_id, source));
+            .insert(id, PipelineTrace::new_at(id, session_id, source, origin));
         state.live_order.push_back(id);
         state.by_source.insert((session_id, source), id);
         state.evict_if_needed();
@@ -200,6 +211,48 @@ impl TelemetryRecorder {
             update.transcription_queue_wait_ms,
         );
         merge(
+            &mut attributes.provider_queue_wait_ms,
+            update.provider_queue_wait_ms,
+        );
+        merge(
+            &mut attributes.provider_queue_depth,
+            update.provider_queue_depth,
+        );
+        merge(
+            &mut attributes.provider_queue_oldest_age_ms,
+            update.provider_queue_oldest_age_ms,
+        );
+        merge(
+            &mut attributes.dropped_audio_chunks,
+            update.dropped_audio_chunks,
+        );
+        merge(
+            &mut attributes.audio_chunk_duration_ms,
+            update.audio_chunk_duration_ms,
+        );
+        merge(&mut attributes.audio_chunks_sent, update.audio_chunks_sent);
+        merge(&mut attributes.bytes_sent, update.bytes_sent);
+        merge(
+            &mut attributes.websocket_send_latency_ms,
+            update.websocket_send_latency_ms,
+        );
+        merge(
+            &mut attributes.automatic_vad_enabled,
+            update.automatic_vad_enabled,
+        );
+        merge(
+            &mut attributes.finalization_strategy,
+            update.finalization_strategy,
+        );
+        merge(
+            &mut attributes.finalization_reason,
+            update.finalization_reason,
+        );
+        merge(
+            &mut attributes.partial_revision_count,
+            update.partial_revision_count,
+        );
+        merge(
             &mut attributes.transcription_provider,
             update.transcription_provider,
         );
@@ -227,6 +280,57 @@ impl TelemetryRecorder {
             update.context_character_count,
         );
         merge(&mut attributes.sanitized_text, update.sanitized_text);
+    }
+
+    pub fn record_provider_event(&self, id: TraceId, event: ProviderTelemetryEvent) {
+        let mut state = self.state.lock().unwrap();
+        let Some(trace) = state.live.get_mut(&id) else {
+            return;
+        };
+        match event {
+            ProviderTelemetryEvent::Configuration {
+                automatic_vad_enabled,
+                finalization_strategy,
+            } => {
+                trace.attributes_mut().automatic_vad_enabled = Some(automatic_vad_enabled);
+                trace.attributes_mut().finalization_strategy = Some(finalization_strategy);
+            }
+            ProviderTelemetryEvent::AudioChunkSent {
+                duration_ms,
+                bytes,
+                send_duration_ms,
+            } => {
+                trace.mark(Milestone::FirstAudioChunkSent);
+                trace.mark(Milestone::LastAudioChunkSent);
+                let attributes = trace.attributes_mut();
+                attributes.audio_chunk_duration_ms = Some(duration_ms);
+                attributes.audio_chunks_sent = Some(attributes.audio_chunks_sent.unwrap_or(0) + 1);
+                attributes.bytes_sent = Some(attributes.bytes_sent.unwrap_or(0) + bytes);
+                attributes.websocket_send_latency_ms = Some(send_duration_ms);
+            }
+            ProviderTelemetryEvent::ActivityStartSent => {
+                trace.mark(Milestone::ActivityStartSent);
+            }
+            ProviderTelemetryEvent::ActivityEndSent => {
+                trace.mark(Milestone::ActivityEndSent);
+            }
+            ProviderTelemetryEvent::InputTranscriptionReceived => {
+                trace.mark(Milestone::FirstInputTranscriptionReceived);
+                trace.mark(Milestone::LastInputTranscriptionReceived);
+                let attributes = trace.attributes_mut();
+                attributes.partial_revision_count =
+                    Some(attributes.partial_revision_count.unwrap_or(0) + 1);
+            }
+            ProviderTelemetryEvent::ServerTurnCompleteReceived => {
+                trace.mark(Milestone::ServerTurnCompleteReceived);
+            }
+            ProviderTelemetryEvent::LocalFinalTranscriptEmitted {
+                finalization_reason,
+            } => {
+                trace.mark(Milestone::LocalFinalTranscriptEmitted);
+                trace.attributes_mut().finalization_reason = Some(finalization_reason);
+            }
+        }
     }
 
     /// Grava texto **apenas** se a política vigente permitir, já sanitizado. Chamar isto no

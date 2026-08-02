@@ -10,6 +10,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -20,6 +21,27 @@ use crate::conversation::SessionId;
 use crate::transcription::error::TranscriptionError;
 use crate::transcription::events::TranscriptionEvent;
 use crate::transcription::types::TranscriptionLanguage;
+
+/// Boundary metadata carried in the same ordered lane as streaming audio.
+/// Providers that do not opt into manual activity detection simply ignore it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AudioActivity {
+    #[default]
+    None,
+    Start,
+    End,
+}
+
+/// Generic ingress tuning for a streaming provider. This is deliberately part of the
+/// provider contract rather than an audio-engine provider-id check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingAudioConfig {
+    pub manual_activity_detection: bool,
+    pub activity_end_silence_ms: u32,
+    pub target_chunk_ms: u32,
+    pub transcript_drain_ms: u32,
+    pub finalization_timeout_ms: u32,
+}
 
 /// Identificador monotônico de uma sessão de transcrição. Único por processo: um contador
 /// global, e não um contador por fonte, para que um id nunca seja ambíguo entre microfone e
@@ -61,6 +83,11 @@ pub struct AudioChunk {
     /// Presente quando o chunk veio de um `AudioSegment` já recortado pelo VAD (caminho
     /// atual, batch). Um backend de streaming puro entrega chunks contínuos sem segment id.
     pub segment_id: Option<SegmentId>,
+    /// Manual speech boundary associated with this ordered item. Boundary items may carry
+    /// no samples; `Start` must precede pre-roll and `End` must follow the last samples.
+    pub activity: AudioActivity,
+    /// Monotonic local-VAD boundary time, distinct from the later provider send time.
+    pub activity_observed_at: Option<Instant>,
 }
 
 impl AudioChunk {
@@ -74,6 +101,8 @@ impl AudioChunk {
             started_at: segment.started_at,
             ended_at: segment.ended_at,
             segment_id: Some(segment.id),
+            activity: AudioActivity::None,
+            activity_observed_at: None,
         }
     }
 
@@ -88,6 +117,8 @@ impl AudioChunk {
 /// jusante — filtrar num consumidor separado reintroduziria a janela em que um evento
 /// obsoleto já está em trânsito.
 pub type TranscriptionEventSink = Arc<dyn Fn(TranscriptionEvent) + Send + Sync>;
+pub type ProviderTelemetrySink =
+    Arc<dyn Fn(crate::telemetry::ProviderTelemetryEvent) + Send + Sync>;
 
 /// Tudo que um provider precisa para abrir uma sessão. A identidade (`session_id` +
 /// `transcription_session_id` + `source`) é fornecida pelo runtime, nunca inventada pelo
@@ -100,7 +131,9 @@ pub struct TranscriptionSessionContext {
     pub language: TranscriptionLanguage,
     /// Modelo pedido pelo usuário, quando o provider aceita escolha de modelo.
     pub model: Option<String>,
+    pub streaming_audio_config: Option<StreamingAudioConfig>,
     pub sink: TranscriptionEventSink,
+    pub provider_telemetry: ProviderTelemetrySink,
 }
 
 impl std::fmt::Debug for TranscriptionSessionContext {
@@ -111,6 +144,7 @@ impl std::fmt::Debug for TranscriptionSessionContext {
             .field("source", &self.source)
             .field("language", &self.language)
             .field("model", &self.model)
+            .field("streaming_audio_config", &self.streaming_audio_config)
             .finish_non_exhaustive()
     }
 }
@@ -118,6 +152,10 @@ impl std::fmt::Debug for TranscriptionSessionContext {
 impl TranscriptionSessionContext {
     pub fn emit(&self, event: TranscriptionEvent) {
         (self.sink)(event);
+    }
+
+    pub fn observe_provider(&self, event: crate::telemetry::ProviderTelemetryEvent) {
+        (self.provider_telemetry)(event);
     }
 }
 

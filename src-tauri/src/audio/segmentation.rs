@@ -55,7 +55,19 @@ pub enum SpeechEvent {
     },
     Ended {
         source: AudioSource,
+        /// End of detected voice before retained post-roll.
+        speech_ended_at: AudioTimestamp,
+        /// End of audio retained for transcription (may include post-roll).
         timestamp: AudioTimestamp,
+    },
+    /// Audio that belongs to a confirmed local speech activity. Emitted only when
+    /// `with_streaming_audio_events` is enabled; batch providers keep the old zero-copy
+    /// behavior.
+    Audio {
+        source: AudioSource,
+        samples: Vec<f32>,
+        started_at: AudioTimestamp,
+        ended_at: AudioTimestamp,
     },
     SegmentReady(AudioSegment),
 }
@@ -94,6 +106,7 @@ pub struct Segmenter {
     pre_roll_cap: usize,
     samples_seen: u64,
     state: State,
+    emit_streaming_audio: bool,
 }
 
 impl Segmenter {
@@ -126,7 +139,30 @@ impl Segmenter {
             pre_roll_cap,
             samples_seen: 0,
             state: State::Idle,
+            emit_streaming_audio: false,
         }
+    }
+
+    pub fn with_streaming_audio_events(mut self) -> Self {
+        self.emit_streaming_audio = true;
+        self
+    }
+
+    fn emit_streaming_audio(
+        &self,
+        events: &mut Vec<SpeechEvent>,
+        samples: &[f32],
+        start_sample: u64,
+    ) {
+        if !self.emit_streaming_audio || samples.is_empty() {
+            return;
+        }
+        events.push(SpeechEvent::Audio {
+            source: self.source,
+            samples: samples.to_vec(),
+            started_at: self.timestamp_for(start_sample),
+            ended_at: self.timestamp_for(start_sample + samples.len() as u64),
+        });
     }
 
     fn mint_segment(
@@ -158,6 +194,7 @@ impl Segmenter {
     pub fn finish(&mut self) -> Vec<SpeechEvent> {
         let mut events = Vec::new();
         let pending = std::mem::take(&mut self.pending);
+        let pending_start_samples = self.samples_seen;
         self.samples_seen += pending.len() as u64;
         let ended_at = self.timestamp_for(self.samples_seen);
 
@@ -167,8 +204,9 @@ impl Segmenter {
                 mut buffer,
                 started_at,
             } => {
+                self.emit_streaming_audio(&mut events, &pending, pending_start_samples);
                 buffer.extend_from_slice(&pending);
-                Some((buffer, started_at, ended_at))
+                Some((buffer, started_at, ended_at, ended_at))
             }
             State::SilencePending {
                 mut buffer,
@@ -179,22 +217,38 @@ impl Segmenter {
                 let silence_samples = silence_windows as usize * self.window_len;
                 let keep_samples =
                     (self.config.post_roll_ms as usize * self.sample_rate as usize) / 1_000;
+                let keep_samples = keep_samples.min(silence_samples);
+                let streaming_silence_samples = silence_samples + pending.len();
+                let streaming_keep_samples =
+                    (keep_samples + pending.len()).min(streaming_silence_samples);
+                let silence_start = buffer.len().saturating_sub(streaming_silence_samples);
+                self.emit_streaming_audio(
+                    &mut events,
+                    &buffer[silence_start..silence_start + streaming_keep_samples],
+                    self.samples_seen
+                        .saturating_sub(streaming_silence_samples as u64),
+                );
                 let trim_samples = silence_samples.saturating_sub(keep_samples);
                 buffer.truncate(buffer.len().saturating_sub(trim_samples));
                 let trimmed_end =
                     self.timestamp_for(self.samples_seen.saturating_sub(trim_samples as u64));
-                Some((buffer, started_at, trimmed_end))
+                let speech_ended_at = self.timestamp_for(
+                    self.samples_seen
+                        .saturating_sub(streaming_silence_samples as u64),
+                );
+                Some((buffer, started_at, trimmed_end, speech_ended_at))
             }
             State::Idle | State::PossibleSpeech { .. } => None,
         };
 
         self.pre_roll.clear();
-        if let Some((buffer, started_at, ended_at)) = finalized {
+        if let Some((buffer, started_at, ended_at, speech_ended_at)) = finalized {
             if !buffer.is_empty() {
                 let segment = self.mint_segment(buffer, started_at, ended_at);
                 events.push(SpeechEvent::SegmentReady(segment));
                 events.push(SpeechEvent::Ended {
                     source: self.source,
+                    speech_ended_at,
                     timestamp: ended_at,
                 });
             }
@@ -254,6 +308,13 @@ impl Segmenter {
                             source: self.source,
                             timestamp: started_at,
                         });
+                        self.emit_streaming_audio(
+                            events,
+                            &full_buffer,
+                            candidate_start_samples.saturating_sub(
+                                full_buffer.len().saturating_sub(buffer.len()) as u64,
+                            ),
+                        );
                         State::Speaking {
                             buffer: full_buffer,
                             started_at,
@@ -288,15 +349,12 @@ impl Segmenter {
                         silence_windows: 1,
                     }
                 } else {
+                    self.emit_streaming_audio(events, window, window_start_samples);
                     let duration_ms = (buffer.len() as u64 * 1000) / self.sample_rate as u64;
                     if duration_ms >= self.config.maximum_segment_ms as u64 {
                         let ended_at = self.timestamp_for(window_end_samples);
                         let segment = self.mint_segment(buffer, started_at, ended_at);
                         events.push(SpeechEvent::SegmentReady(segment));
-                        events.push(SpeechEvent::Ended {
-                            source: self.source,
-                            timestamp: ended_at,
-                        });
                         State::Speaking {
                             buffer: Vec::new(),
                             started_at: ended_at,
@@ -314,6 +372,13 @@ impl Segmenter {
             } => {
                 buffer.extend_from_slice(window);
                 if decision == VadDecision::Speech {
+                    let resumed_samples = silence_windows as usize * self.window_len + window.len();
+                    let resumed_start = buffer.len().saturating_sub(resumed_samples);
+                    self.emit_streaming_audio(
+                        events,
+                        &buffer[resumed_start..],
+                        window_end_samples.saturating_sub(resumed_samples as u64),
+                    );
                     State::Speaking { buffer, started_at }
                 } else {
                     let silence_windows = silence_windows + 1;
@@ -322,15 +387,25 @@ impl Segmenter {
                         let silence_samples = silence_windows as u64 * self.window_len as u64;
                         let keep_samples =
                             (self.config.post_roll_ms as u64 * self.sample_rate as u64) / 1000;
+                        let keep_samples = keep_samples.min(silence_samples);
+                        let silence_start = buffer.len().saturating_sub(silence_samples as usize);
+                        self.emit_streaming_audio(
+                            events,
+                            &buffer[silence_start..silence_start + keep_samples as usize],
+                            window_end_samples.saturating_sub(silence_samples),
+                        );
                         let trim_samples = silence_samples.saturating_sub(keep_samples);
                         let new_len = buffer.len().saturating_sub(trim_samples as usize);
                         buffer.truncate(new_len);
                         let ended_at =
                             self.timestamp_for(window_end_samples.saturating_sub(trim_samples));
+                        let speech_ended_at =
+                            self.timestamp_for(window_end_samples.saturating_sub(silence_samples));
                         let segment = self.mint_segment(buffer, started_at, ended_at);
                         events.push(SpeechEvent::SegmentReady(segment));
                         events.push(SpeechEvent::Ended {
                             source: self.source,
+                            speech_ended_at,
                             timestamp: ended_at,
                         });
                         self.pre_roll.clear();
@@ -412,6 +487,14 @@ mod tests {
             .filter(|e| matches!(e, SpeechEvent::Ended { .. }))
             .collect();
         assert_eq!(ended.len(), 1);
+        assert!(matches!(
+            ended[0],
+            SpeechEvent::Ended {
+                speech_ended_at,
+                timestamp,
+                ..
+            } if speech_ended_at.0 == 500 && timestamp.0 == 600
+        ));
     }
 
     #[test]
@@ -498,5 +581,58 @@ mod tests {
         assert!(finished
             .iter()
             .any(|event| matches!(event, SpeechEvent::Ended { .. })));
+    }
+
+    #[test]
+    fn streaming_events_preserve_preroll_order_and_every_segment_sample_once() {
+        let mut segmenter = Segmenter::new(
+            AudioSource::SystemOutput,
+            16_000,
+            SegmentationConfig::default(),
+        )
+        .with_streaming_audio_events();
+        let silence = vec![0.0; 320];
+        let speech = tone(320, 0.9);
+        let mut events = Vec::new();
+        for _ in 0..10 {
+            events.extend(segmenter.push_samples(&silence));
+        }
+        for _ in 0..20 {
+            events.extend(segmenter.push_samples(&speech));
+        }
+        for _ in 0..30 {
+            events.extend(segmenter.push_samples(&silence));
+        }
+
+        let start = events
+            .iter()
+            .position(|event| matches!(event, SpeechEvent::Started { .. }))
+            .unwrap();
+        let first_audio = events
+            .iter()
+            .position(|event| matches!(event, SpeechEvent::Audio { .. }))
+            .unwrap();
+        let end = events
+            .iter()
+            .position(|event| matches!(event, SpeechEvent::Ended { .. }))
+            .unwrap();
+        let last_audio = events
+            .iter()
+            .rposition(|event| matches!(event, SpeechEvent::Audio { .. }))
+            .unwrap();
+        assert!(start < first_audio);
+        assert!(last_audio < end);
+
+        let streamed: Vec<f32> = events
+            .iter()
+            .filter_map(|event| match event {
+                SpeechEvent::Audio { samples, .. } => Some(samples.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        let segment = segment_ready_events(&events).into_iter().next().unwrap();
+        assert_eq!(streamed, segment.samples);
     }
 }

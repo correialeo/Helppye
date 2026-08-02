@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use helppye_lib::audio::types::AudioSource;
 use helppye_lib::benchmark::{
-    run_fixture, write_csv, write_json, BenchmarkCaseResult, CostModel, FixtureManifest,
+    run_fixture_with_options, write_csv, write_json, BenchmarkCaseResult, BenchmarkPacing,
+    BenchmarkRunOptions, CostModel, FixtureManifest,
 };
 use helppye_lib::normalization::{DeterministicNormalizer, TranscriptionVocabulary};
 use helppye_lib::transcription::provider::{TranscriptionProvider, TranscriptionProviderId};
@@ -37,6 +38,7 @@ struct Args {
     provider: TranscriptionProviderId,
     model: Option<PathBuf>,
     cost: CostModel,
+    realtime_pacing: bool,
 }
 
 fn main() -> ExitCode {
@@ -77,7 +79,7 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "uso: benchmark --manifest <fixtures.json> [--out <dir>] \
 [--provider <provider-id>] [--model <modelo-ou-ggml.bin>] \
-[--usd-per-audio-minute <preço>]";
+[--usd-per-audio-minute <preço>] [--realtime-pacing]";
 
 fn parse_args() -> Result<Args, String> {
     let mut manifest = None;
@@ -85,6 +87,7 @@ fn parse_args() -> Result<Args, String> {
     let mut provider = TranscriptionProviderId::WhisperLocal;
     let mut model = None;
     let mut cost = CostModel::default();
+    let mut realtime_pacing = false;
 
     let mut argv = std::env::args().skip(1);
     while let Some(flag) = argv.next() {
@@ -99,6 +102,7 @@ fn parse_args() -> Result<Args, String> {
                 cost.usd_per_audio_minute =
                     Some(raw.parse().map_err(|_| format!("preço inválido: {raw}"))?);
             }
+            "--realtime-pacing" => realtime_pacing = true,
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("argumento desconhecido: {other}")),
         }
@@ -110,6 +114,7 @@ fn parse_args() -> Result<Args, String> {
         provider,
         model,
         cost,
+        realtime_pacing,
     })
 }
 
@@ -133,13 +138,20 @@ async fn run(args: &Args) -> Result<ExitCode, String> {
             },
             ..settings.clone()
         };
-        match run_fixture(
+        match run_fixture_with_options(
             provider.as_ref(),
             &settings,
             &normalizer,
             fixture,
             &audio,
             cost,
+            BenchmarkRunOptions {
+                pacing: if args.realtime_pacing {
+                    BenchmarkPacing::Realtime
+                } else {
+                    BenchmarkPacing::Instant
+                },
+            },
         )
         .await
         {

@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
@@ -23,7 +23,7 @@ use crate::audio::segmentation::{SegmentationConfig, Segmenter, SpeechEvent};
 use crate::audio::selection::{self, DeviceSelectionConfig, ResolvedDevice};
 use crate::audio::types::{AudioCaptureEvent, AudioDevice, AudioSource, CaptureStreamId};
 use crate::transcription::queue::TranscriptionQueue;
-use crate::transcription::session::AudioChunk;
+use crate::transcription::session::{AudioActivity, AudioChunk, StreamingAudioConfig};
 
 pub type CaptureEventSink = Arc<dyn Fn(AudioCaptureEvent) + Send + Sync>;
 
@@ -42,6 +42,111 @@ struct CaptureHandle {
 struct CategoryState {
     active: AsyncMutex<Option<CaptureHandle>>,
     next_session_id: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptionIngressMode {
+    Batch,
+    Continuous,
+    ManualActivity(StreamingAudioConfig),
+}
+
+fn ingress_mode(queue: &TranscriptionQueue) -> TranscriptionIngressMode {
+    match queue.streaming_audio_config() {
+        Some(config) if config.manual_activity_detection => {
+            TranscriptionIngressMode::ManualActivity(config)
+        }
+        Some(_) => TranscriptionIngressMode::Continuous,
+        None if queue.accepts_continuous_audio() => TranscriptionIngressMode::Continuous,
+        None => TranscriptionIngressMode::Batch,
+    }
+}
+
+fn segmenter_for_mode(
+    source: AudioSource,
+    capture_stream_id: CaptureStreamId,
+    sample_rate: u32,
+    mode: TranscriptionIngressMode,
+) -> Segmenter {
+    let mut config = SegmentationConfig::default();
+    if let TranscriptionIngressMode::ManualActivity(streaming) = mode {
+        config.end_silence_ms = streaming.activity_end_silence_ms;
+        Segmenter::for_stream(source, capture_stream_id, sample_rate, config)
+            .with_streaming_audio_events()
+    } else {
+        Segmenter::for_stream(source, capture_stream_id, sample_rate, config)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ManualSpeechRouteContext {
+    source: AudioSource,
+    capture_stream_id: CaptureStreamId,
+    sample_rate: u32,
+    timeline_origin: Instant,
+    timeline_offset_ms: u64,
+}
+
+async fn route_manual_speech_events(
+    queue: &TranscriptionQueue,
+    events: Vec<SpeechEvent>,
+    route: ManualSpeechRouteContext,
+    sequence: &mut u64,
+) {
+    for event in events {
+        let (samples, started_at, ended_at, activity, observed_boundary_at) = match event {
+            SpeechEvent::Started { timestamp, .. } => (
+                Vec::new(),
+                timestamp,
+                timestamp,
+                AudioActivity::Start,
+                Some(timestamp),
+            ),
+            SpeechEvent::Audio {
+                samples,
+                started_at,
+                ended_at,
+                ..
+            } => (samples, started_at, ended_at, AudioActivity::None, None),
+            SpeechEvent::Ended {
+                timestamp,
+                speech_ended_at,
+                ..
+            } => (
+                Vec::new(),
+                timestamp,
+                timestamp,
+                AudioActivity::End,
+                Some(speech_ended_at),
+            ),
+            SpeechEvent::SegmentReady(_) => continue,
+        };
+        *sequence += 1;
+        let started_at = AudioTimestamp(route.timeline_offset_ms + started_at.0);
+        let ended_at = AudioTimestamp(route.timeline_offset_ms + ended_at.0);
+        let activity_observed_at = observed_boundary_at.and_then(|timestamp| {
+            route.timeline_origin.checked_add(Duration::from_millis(
+                route.timeline_offset_ms + timestamp.0,
+            ))
+        });
+        let chunk = AudioChunk {
+            source: route.source,
+            capture_stream_id: route.capture_stream_id,
+            sequence_number: *sequence,
+            samples,
+            sample_rate: route.sample_rate,
+            started_at,
+            ended_at,
+            segment_id: None,
+            activity,
+            activity_observed_at,
+        };
+        if activity == AudioActivity::None {
+            queue.try_enqueue_chunk(chunk);
+        } else {
+            queue.enqueue_ordered_chunk(chunk).await;
+        }
+    }
 }
 
 impl CategoryState {
@@ -200,48 +305,51 @@ impl CaptureEngine {
         let (tx, mut rx) = tokio::sync::mpsc::channel(config.channel_capacity);
         let cancel = CancellationToken::new();
 
-        self.provider(source)
-            .start(config, tx, cancel.clone())
-            .await?;
-
         let session_id = category.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
         // Um `CaptureStreamId` por `start_capture`: é este id que acompanha cada segmento
         // até a Conversation Timeline e que permite à transcrição casar um resultado com o
         // fluxo que o produziu, mesmo que o usuário troque de dispositivo no meio da sessão
         // e dois fluxos da mesma fonte se sobreponham por um instante.
         let capture_stream_id = CaptureStreamId::next();
+        self.transcription_queue
+            .prepare_source(source, capture_stream_id)
+            .await
+            .map_err(|error| AudioCaptureError::Internal(error.to_string()))?;
+        self.provider(source)
+            .start(config, tx, cancel.clone())
+            .await?;
         let session_timeline_offset_ms = self.timeline_origin.elapsed().as_millis() as u64;
         let engine = self.clone();
         let emit = self.emit.clone();
         let transcription_queue = self.transcription_queue.clone();
+        let timeline_origin = self.timeline_origin;
 
         let forward_task = tauri::async_runtime::spawn(async move {
-            let mut segmenter = Segmenter::for_stream(
-                source,
-                capture_stream_id,
-                sample_rate,
-                SegmentationConfig::default(),
-            );
-            let mut continuous_audio = transcription_queue.accepts_continuous_audio();
+            let mut mode = ingress_mode(&transcription_queue);
+            let mut segmenter = segmenter_for_mode(source, capture_stream_id, sample_rate, mode);
             let mut continuous_sequence = 0u64;
             let mut disconnected = false;
 
             while let Some(event) = rx.recv().await {
                 if let AudioCaptureEvent::Frame(ref frame) = event {
-                    let requested_mode = transcription_queue.accepts_continuous_audio();
-                    if requested_mode != continuous_audio {
+                    let requested_mode = ingress_mode(&transcription_queue);
+                    if requested_mode != mode {
                         // Provider swaps are hard boundaries. Audio accumulated for the
                         // old provider must not be replayed into the new protocol.
-                        segmenter = Segmenter::for_stream(
-                            source,
-                            capture_stream_id,
-                            sample_rate,
-                            SegmentationConfig::default(),
-                        );
-                        continuous_audio = requested_mode;
+                        if !matches!(requested_mode, TranscriptionIngressMode::Batch) {
+                            if let Err(error) = transcription_queue
+                                .prepare_source(source, capture_stream_id)
+                                .await
+                            {
+                                warn!(?source, %error, "failed to warm swapped transcription provider");
+                            }
+                        }
+                        mode = requested_mode;
+                        segmenter =
+                            segmenter_for_mode(source, capture_stream_id, sample_rate, mode);
                     }
 
-                    if continuous_audio {
+                    if mode == TranscriptionIngressMode::Continuous {
                         continuous_sequence += 1;
                         let started_at = session_timeline_offset_ms + frame.timestamp_ms;
                         let duration_ms = (frame.samples.len() as u64 * 1_000)
@@ -255,7 +363,24 @@ impl CaptureEngine {
                             started_at: AudioTimestamp(started_at),
                             ended_at: AudioTimestamp(started_at + duration_ms),
                             segment_id: None,
+                            activity: AudioActivity::None,
+                            activity_observed_at: None,
                         });
+                    } else if matches!(mode, TranscriptionIngressMode::ManualActivity(_)) {
+                        let speech_events = segmenter.push_samples(&frame.samples);
+                        route_manual_speech_events(
+                            &transcription_queue,
+                            speech_events,
+                            ManualSpeechRouteContext {
+                                source,
+                                capture_stream_id,
+                                sample_rate: frame.sample_rate,
+                                timeline_origin,
+                                timeline_offset_ms: session_timeline_offset_ms,
+                            },
+                            &mut continuous_sequence,
+                        )
+                        .await;
                     } else {
                         for speech_event in segmenter.push_samples(&frame.samples) {
                             if let SpeechEvent::SegmentReady(segment) = speech_event {
@@ -266,12 +391,29 @@ impl CaptureEngine {
                         }
                     }
                 }
-                if !continuous_audio && matches!(event, AudioCaptureEvent::Stopped { .. }) {
-                    for speech_event in segmenter.finish() {
-                        if let SpeechEvent::SegmentReady(segment) = speech_event {
-                            transcription_queue.try_enqueue(
-                                segment.with_timestamp_offset(session_timeline_offset_ms),
-                            );
+                if matches!(event, AudioCaptureEvent::Stopped { .. }) {
+                    let speech_events = segmenter.finish();
+                    if matches!(mode, TranscriptionIngressMode::ManualActivity(_)) {
+                        route_manual_speech_events(
+                            &transcription_queue,
+                            speech_events,
+                            ManualSpeechRouteContext {
+                                source,
+                                capture_stream_id,
+                                sample_rate,
+                                timeline_origin,
+                                timeline_offset_ms: session_timeline_offset_ms,
+                            },
+                            &mut continuous_sequence,
+                        )
+                        .await;
+                    } else if mode == TranscriptionIngressMode::Batch {
+                        for speech_event in speech_events {
+                            if let SpeechEvent::SegmentReady(segment) = speech_event {
+                                transcription_queue.try_enqueue(
+                                    segment.with_timestamp_offset(session_timeline_offset_ms),
+                                );
+                            }
                         }
                     }
                 }
@@ -286,8 +428,23 @@ impl CaptureEngine {
             // example after an unrecoverable backend failure). Preserve the
             // last confirmed batch utterance in that path as well. `finish` is
             // idempotent after the normal `Stopped` flush.
-            if !continuous_audio {
-                for speech_event in segmenter.finish() {
+            let speech_events = segmenter.finish();
+            if matches!(mode, TranscriptionIngressMode::ManualActivity(_)) {
+                route_manual_speech_events(
+                    &transcription_queue,
+                    speech_events,
+                    ManualSpeechRouteContext {
+                        source,
+                        capture_stream_id,
+                        sample_rate,
+                        timeline_origin,
+                        timeline_offset_ms: session_timeline_offset_ms,
+                    },
+                    &mut continuous_sequence,
+                )
+                .await;
+            } else if mode == TranscriptionIngressMode::Batch {
+                for speech_event in speech_events {
                     if let SpeechEvent::SegmentReady(segment) = speech_event {
                         transcription_queue
                             .try_enqueue(segment.with_timestamp_offset(session_timeline_offset_ms));

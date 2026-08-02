@@ -225,16 +225,31 @@ API key passa por JSON, SQLite ou arquivo local.
 `gemini_live.rs` implementa o mesmo contrato por sessão usado pelo Whisper local. Cada
 fonte abre seu próprio WebSocket oficial, envia primeiro `setup`, aguarda `setupComplete` e
 só então envia PCM mono signed 16-bit little-endian a 16 kHz por `realtimeInput.audio`.
-`inputAudioTranscription` é habilitado no setup. Fragmentos recebidos em
-`serverContent.inputTranscription.text` viram parciais; `serverContent.turnComplete` fecha
-o turno e produz o final acumulado. Como o protocolo não fornece id de evento, confiança,
-idioma detectado nem flag de final na transcrição de entrada, o adaptador sintetiza ids
-monotônicos e não inventa os demais valores.
+`inputAudioTranscription` é habilitado no setup e a detecção automática de atividade do
+servidor fica desabilitada. O VAD local envia `activityStart`, áudio confirmado com pre-roll
+e `activityEnd`, nesta ordem, no mesmo lane da fonte. O adapter subdivide qualquer frame em
+PCM de 40 ms (20 ms também é configuração válida) e descarrega a cauda incompleta antes de
+`activityEnd`.
+
+`serverContent.inputTranscription.text` vira parcial imediatamente. O campo pode chegar como
+snapshot revisado ou delta; o merge explícito prefere snapshots crescentes/corretivos e só
+concatena deltas com sobreposição e fronteira de palavra verificadas. Como input transcription
+não traz flag final, `activityEnd` abre um drain local de 300 ms, reiniciado por cada revisão,
+com timeout absoluto de 1500 ms. `serverContent.turnComplete` é apenas telemetria: nunca fecha
+a transcrição de entrada e um `turnComplete` tardio não duplica o final. Como o protocolo não
+fornece id de evento, confiança ou idioma detectado, o adaptador sintetiza ids monotônicos e
+não inventa os demais valores.
 
 O endpoint persistido é validado contra o endpoint WebSocket oficial, sem a API key. A key
 é acrescentada apenas em memória durante a conexão e nunca aparece em logs. O modelo padrão
 é `gemini-3.1-flash-live-preview`; o idioma é automático porque os modelos de áudio nativo
 não aceitam seleção explícita de language code.
+
+Configuração não sensível do Gemini: `audio_chunk_ms` (20/40, default 40),
+`manual_activity_end_silence_ms` (500/600/700/800, default 600),
+`transcript_drain_ms` (default 300) e `finalization_timeout_ms` (default 1500). A conexão e
+`setupComplete` são aquecidos antes de a captura começar; seus tempos são registrados
+separadamente e não pertencem à latência por fala.
 
 Referências de protocolo: [Live API](https://ai.google.dev/gemini-api/docs/live-api),
 [WebSockets](https://ai.google.dev/gemini-api/docs/live-api/get-started-websocket),

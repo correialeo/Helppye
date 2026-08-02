@@ -29,7 +29,9 @@ pub fn write_json(path: &Path, results: &[BenchmarkCaseResult]) -> Result<(), Re
 }
 
 const CSV_HEADER: &str = "fixture_id,provider,model,language,source,audio_duration_ms,\
-first_partial_ms,first_final_ms,total_ms,real_time_factor,word_error_rate,vocabulary_hits,\
+ first_partial_ms,first_final_ms,total_ms,real_time_factor,time_to_first_partial_ms,\
+ time_to_final_transcript_ms,speech_end_to_final_ms,partial_revision_count,\
+ provider_queue_wait_ms,websocket_send_latency_ms,pacing,word_error_rate,vocabulary_hits,\
 vocabulary_misses,mean_confidence,final_transcripts,partial_transcripts,\
 normalization_changes,utterances,errors,estimated_cost_usd,normalized_transcript";
 
@@ -48,6 +50,13 @@ pub fn write_csv(path: &Path, results: &[BenchmarkCaseResult]) -> Result<(), Rep
             optional(r.latencies.first_final_ms),
             r.latencies.total_ms.to_string(),
             format!("{:.3}", r.latencies.real_time_factor),
+            optional(r.latencies.time_to_first_partial_ms),
+            optional(r.latencies.time_to_final_transcript_ms),
+            optional(r.latencies.speech_end_to_final_ms),
+            r.partial_revision_count.to_string(),
+            optional(r.latencies.provider_queue_wait_ms),
+            optional(r.latencies.websocket_send_latency_ms),
+            format!("{:?}", r.pacing),
             format!("{:.3}", r.word_error_rate),
             r.vocabulary_hits.join("; "),
             r.vocabulary_misses.join("; "),
@@ -121,7 +130,13 @@ mod tests {
                 first_final_ms: Some(900),
                 total_ms: 1200,
                 real_time_factor: 0.3,
+                time_to_first_partial_ms: None,
+                time_to_final_transcript_ms: Some(900),
+                speech_end_to_final_ms: Some(300),
+                provider_queue_wait_ms: Some(0),
+                websocket_send_latency_ms: None,
             },
+            pacing: crate::benchmark::runner::BenchmarkPacing::Instant,
             expected_transcript: "usamos DDD".into(),
             raw_transcript: "usamos ddd".into(),
             normalized_transcript: "Usamos DDD, e microserviços".into(),
@@ -131,6 +146,7 @@ mod tests {
             mean_confidence: None,
             final_transcript_count: 1,
             partial_transcript_count: 0,
+            partial_revision_count: 0,
             normalization_change_count: 2,
             utterance_count: 1,
             errors: vec![],

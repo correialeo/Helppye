@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::transcription::error::TranscriptionError;
 use crate::transcription::session::{TranscriptionSession, TranscriptionSessionContext};
+use crate::transcription::settings::TranscriptionSettings;
 
 /// Identidade estável de um backend de transcrição. É o que a configuração persiste e o
 /// registry indexa — nunca o nome de exibição, que é texto de UI e pode mudar.
@@ -127,6 +128,15 @@ pub trait TranscriptionProvider: Send + Sync {
     fn id(&self) -> TranscriptionProviderId;
 
     fn capabilities(&self) -> TranscriptionCapabilities;
+
+    /// Optional streaming ingress configuration. The audio engine consumes this generic
+    /// contract; it never branches on a provider id.
+    fn streaming_audio_config(
+        &self,
+        _settings: &TranscriptionSettings,
+    ) -> Option<crate::transcription::session::StreamingAudioConfig> {
+        None
+    }
 
     /// Abre uma sessão para **uma** fonte de áudio. O runtime chama uma vez por fonte por
     /// sessão de conversa; nunca reaproveita uma sessão entre fronteiras de sessão.

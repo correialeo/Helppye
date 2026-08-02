@@ -27,4 +27,7 @@ pub mod wav;
 
 pub use fixtures::{BenchmarkFixture, FixtureError, FixtureManifest};
 pub use report::{write_csv, write_json, ReportError};
-pub use runner::{run_fixture, BenchmarkCaseResult, BenchmarkLatencies, CostModel, RunnerError};
+pub use runner::{
+    run_fixture, run_fixture_with_options, BenchmarkCaseResult, BenchmarkLatencies,
+    BenchmarkPacing, BenchmarkRunOptions, CostModel, RunnerError,
+};

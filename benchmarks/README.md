@@ -74,11 +74,16 @@ transcritor nenhum.
 nuvem sai com custo vazio — o harness não consulta tabela de preço de ninguém, e um número
 inventado seria pior que a ausência dele.
 
-O runner adapta o mesmo fixture ao contrato declarado pelo provider. Providers
-streaming recebem frames contínuos de 100 ms; providers batch recebem segmentos do
-mesmo `Segmenter` usado pela captura, incluindo o flush de fim de arquivo. Portanto o
-benchmark não força Whisper a transcrever pequenos frames artificiais e continua sem
-conter casos especiais por nome de provider.
+O runner adapta o mesmo fixture ao contrato declarado pelo provider. Providers streaming
+automáticos recebem frames contínuos de 100 ms; providers que declaram atividade manual usam
+o mesmo `Segmenter`/VAD local da captura, incluindo pre-roll, `activityStart`, áudio e
+`activityEnd`. Providers batch recebem segmentos finalizados. Portanto o benchmark continua
+sem casos especiais por nome de provider.
+
+Por padrão o envio de fixture é instantâneo. `--realtime-pacing` reproduz o áudio no ritmo
+real e torna comparáveis `time_to_first_partial_ms`, `time_to_final_transcript_ms`,
+`speech_end_to_final_ms`, `partial_revision_count`, `provider_queue_wait_ms` e
+`websocket_send_latency_ms`. Resultados sempre registram o modo de pacing usado.
 
 ## Ler o resultado
 

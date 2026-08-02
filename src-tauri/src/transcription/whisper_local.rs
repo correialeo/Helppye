@@ -278,7 +278,9 @@ mod tests {
             source,
             language: TranscriptionLanguage::default(),
             model: Some("ggml-base.bin".into()),
+            streaming_audio_config: None,
             sink,
+            provider_telemetry: Arc::new(|_| {}),
         }
     }
 
@@ -292,6 +294,8 @@ mod tests {
             started_at: AudioTimestamp(0),
             ended_at: AudioTimestamp(100),
             segment_id: None,
+            activity: crate::transcription::session::AudioActivity::None,
+            activity_observed_at: None,
         }
     }
 

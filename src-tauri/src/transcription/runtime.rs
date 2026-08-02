@@ -433,6 +433,42 @@ impl TranscriptionRuntime {
             .capabilities()
     }
 
+    pub fn streaming_audio_config(
+        &self,
+    ) -> Option<crate::transcription::session::StreamingAudioConfig> {
+        let configuration = self
+            .configuration
+            .lock()
+            .expect("transcription configuration mutex");
+        configuration
+            .provider
+            .streaming_audio_config(&configuration.settings)
+    }
+
+    /// Opens a streaming session before capture starts, keeping WebSocket connect/setup
+    /// outside utterance latency. Batch providers remain lazy.
+    pub async fn prepare_source(
+        &self,
+        source: AudioSource,
+        capture_stream_id: CaptureStreamId,
+    ) -> Result<(), TranscriptionError> {
+        if self.streaming_audio_config().is_none() {
+            return Ok(());
+        }
+        let Some(session_id) = self.active_session_id() else {
+            return Ok(());
+        };
+        let revision = self.configuration_revision();
+        let mut slot = self.sessions.get(source).lock().await;
+        if slot.is_none() {
+            *slot = Some(
+                self.open_session(session_id, source, capture_stream_id, Some(revision))
+                    .await?,
+            );
+        }
+        Ok(())
+    }
+
     pub fn set_provider(&self, provider: Arc<dyn TranscriptionProvider>) {
         self.configuration
             .lock()
@@ -726,6 +762,38 @@ impl TranscriptionRuntime {
         self.push_chunk_inner(chunk, Some(expected_revision)).await
     }
 
+    pub fn record_streaming_queue_metrics(
+        &self,
+        source: AudioSource,
+        trace_origin: Option<Instant>,
+        queue_wait_ms: u64,
+        queue_depth: usize,
+        oldest_age_ms: Option<u64>,
+        dropped_audio_chunks: u64,
+    ) {
+        let Some(session_id) = self.active_session_id() else {
+            return;
+        };
+        let trace = trace_origin.map_or_else(
+            || self.telemetry.begin_or_current(session_id, source),
+            |origin| {
+                self.telemetry
+                    .begin_or_current_at(session_id, source, origin)
+            },
+        );
+        self.telemetry.record_attributes(
+            trace,
+            TraceAttributes {
+                transcription_queue_wait_ms: Some(queue_wait_ms),
+                provider_queue_wait_ms: Some(queue_wait_ms),
+                provider_queue_depth: Some(queue_depth),
+                provider_queue_oldest_age_ms: oldest_age_ms,
+                dropped_audio_chunks: Some(dropped_audio_chunks),
+                ..TraceAttributes::default()
+            },
+        );
+    }
+
     async fn push_chunk_inner(
         &self,
         chunk: AudioChunk,
@@ -745,9 +813,37 @@ impl TranscriptionRuntime {
         // O trace da fala nasce aqui, no primeiro chunk, e é o mesmo que o motor de resposta
         // vai fechar lá na frente — é o que permite medir "fim da fala → token visível"
         // atravessando três subsistemas.
-        let trace = self.telemetry.begin_or_current(session_id, source);
-        self.telemetry.mark(trace, Milestone::FirstAudioChunk);
-        self.telemetry.mark(trace, Milestone::LastAudioChunk);
+        let trace = if matches!(
+            chunk.activity,
+            crate::transcription::session::AudioActivity::Start
+        ) {
+            chunk.activity_observed_at.map_or_else(
+                || self.telemetry.begin_or_current(session_id, source),
+                |origin| {
+                    self.telemetry
+                        .begin_or_current_at(session_id, source, origin)
+                },
+            )
+        } else {
+            self.telemetry.begin_or_current(session_id, source)
+        };
+        if !chunk.samples.is_empty() {
+            self.telemetry.mark(trace, Milestone::FirstAudioChunk);
+            self.telemetry.mark(trace, Milestone::LastAudioChunk);
+        }
+        if let Some(observed_at) = chunk.activity_observed_at {
+            match chunk.activity {
+                crate::transcription::session::AudioActivity::Start => {
+                    self.telemetry
+                        .mark_at(trace, Milestone::SpeechStartDetected, observed_at);
+                }
+                crate::transcription::session::AudioActivity::End => {
+                    self.telemetry
+                        .mark_at(trace, Milestone::SpeechEndDetected, observed_at);
+                }
+                crate::transcription::session::AudioActivity::None => {}
+            }
+        }
         if let Some(segment_id) = chunk.segment_id {
             self.telemetry.link_segment(trace, segment_id);
         }
@@ -823,7 +919,9 @@ impl TranscriptionRuntime {
             source,
             language: settings.language.clone().into(),
             model: settings.active_model(),
+            streaming_audio_config: provider.streaming_audio_config(&settings),
             sink: self.build_sink(),
+            provider_telemetry: self.build_provider_telemetry_sink(session_id, source),
         };
 
         match provider.start_session(context).await {
@@ -1075,6 +1173,18 @@ impl TranscriptionRuntime {
         })
     }
 
+    fn build_provider_telemetry_sink(
+        &self,
+        session_id: SessionId,
+        source: AudioSource,
+    ) -> crate::transcription::session::ProviderTelemetrySink {
+        let telemetry = Arc::clone(&self.telemetry);
+        Arc::new(move |event| {
+            let trace = telemetry.begin_or_current(session_id, source);
+            telemetry.record_provider_event(trace, event);
+        })
+    }
+
     /// Só para diagnósticos: qual sessão de transcrição está viva em cada fonte.
     pub fn active_transcription_sessions(&self) -> Vec<(AudioSource, TranscriptionSessionId)> {
         let gate = self.gate.lock().expect("gate mutex");
@@ -1172,6 +1282,8 @@ mod tests {
             started_at: AudioTimestamp(0),
             ended_at: AudioTimestamp(500),
             segment_id: None,
+            activity: crate::transcription::session::AudioActivity::None,
+            activity_observed_at: None,
         }
     }
 

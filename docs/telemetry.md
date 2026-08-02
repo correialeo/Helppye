@@ -47,26 +47,36 @@ truncado em `SANITIZED_PREVIEW_CHARACTERS = 160` — só aparece sob `ContentPol
 que corresponde ao "Modo de desenvolvedor" em Configurações, e a mudança de política vale só
 para traces criados dali em diante.
 
-## Os 12 marcos
+## Os 22 marcos
 
 Na ordem em que ocorrem:
 
 | # | `Milestone` | Onde é gravado |
 | --- | --- | --- |
-| 1 | `speech_started` | `transcription/runtime.rs`, ao receber o evento do provider |
-| 2 | `speech_ended` | `transcription/runtime.rs`, ao receber o evento do provider |
-| 3 | `first_audio_chunk` | `transcription/runtime.rs` |
-| 4 | `last_audio_chunk` | `transcription/runtime.rs` |
-| 5 | `first_partial_transcript` | `transcription/runtime.rs` (só se o provider tem parciais) |
-| 6 | `final_transcript` | `transcription/runtime.rs` |
-| 7 | `normalization_completed` | `transcription/runtime.rs`, depois do normalizador |
-| 8 | `utterance_finalized` | `conversation.rs` |
-| 9 | `generation_started` | `response_provider/engine.rs` |
-| 10 | `first_http_chunk` | `response_provider/engine.rs` (via `mark_at`) |
-| 11 | `first_visible_token` | `response_provider/engine.rs`, depois do `SkipDetector` (via `mark_at`) |
-| 12 | `generation_completed` | `response_provider/engine.rs` |
+| 1 | `speech_start_detected` | `transcription/runtime.rs`, instante monotônico do VAD local |
+| 2 | `speech_end_detected` | `transcription/runtime.rs`, instante monotônico do VAD local |
+| 3 | `first_audio_chunk_sent` | callback interno do provider, depois do WebSocket send |
+| 4 | `activity_start_sent` | callback interno do provider, depois do WebSocket send |
+| 5 | `last_audio_chunk_sent` | callback interno do provider; sobrescreve a cada envio |
+| 6 | `activity_end_sent` | callback interno do provider, depois do WebSocket send |
+| 7 | `first_input_transcription_received` | callback interno do provider |
+| 8 | `last_input_transcription_received` | callback interno do provider; sobrescreve por revisão |
+| 9 | `server_turn_complete_received` | callback interno do provider; apenas diagnóstico |
+| 10 | `local_final_transcript_emitted` | callback interno do provider |
+| 11 | `speech_started` | `transcription/runtime.rs`, ao receber o evento do provider |
+| 12 | `speech_ended` | `transcription/runtime.rs`, ao receber o evento do provider |
+| 13 | `first_audio_chunk` | `transcription/runtime.rs` |
+| 14 | `last_audio_chunk` | `transcription/runtime.rs` |
+| 15 | `first_partial_transcript` | `transcription/runtime.rs` (só se o provider tem parciais) |
+| 16 | `final_transcript` | `transcription/runtime.rs` |
+| 17 | `normalization_completed` | `transcription/runtime.rs`, depois do normalizador |
+| 18 | `utterance_finalized` | `conversation.rs` |
+| 19 | `generation_started` | `response_provider/engine.rs` |
+| 20 | `first_http_chunk` | `response_provider/engine.rs` (via `mark_at`) |
+| 21 | `first_visible_token` | `response_provider/engine.rs`, depois do `SkipDetector` (via `mark_at`) |
+| 22 | `generation_completed` | `response_provider/engine.rs` |
 
-`Milestone` é um **índice denso** de propósito: um trace é `[Option<Duration>; 12]`, sem
+`Milestone` é um **índice denso** de propósito: um trace é `[Option<Duration>; 22]`, sem
 alocação por marco e sem custo mensurável no caminho crítico.
 
 Regra de escrita: **primeiro-escrito-vence**, exceto `last_audio_chunk`, que sobrescreve a
@@ -77,6 +87,11 @@ cada ocorrência. Sem essa distinção, um segundo chunk moveria o marco do prim
 
 ```rust
 pub struct PipelineLatencies {
+    pub speech_start_to_first_partial_ms: Option<u64>,
+    pub speech_end_to_activity_end_ms: Option<u64>,
+    pub activity_end_to_last_partial_ms: Option<i64>,
+    pub activity_end_to_final_transcript_ms: Option<u64>,
+    pub speech_end_to_final_transcript_ms: Option<u64>,
     pub speech_ended_to_final_transcript_ms: Option<u64>,
     pub final_transcript_to_utterance_finalized_ms: Option<u64>,
     pub utterance_finalized_to_generation_started_ms: Option<u64>,
@@ -105,6 +120,9 @@ Não temporais, e nenhum deles é conteúdo:
 
 ```
 transcription_provider · transcription_model · transcription_queue_wait_ms
+provider_queue_wait_ms · provider_queue_depth · provider_queue_oldest_age_ms · dropped_audio_chunks
+audio_chunk_duration_ms · audio_chunks_sent · bytes_sent · websocket_send_latency_ms
+automatic_vad_enabled · finalization_strategy · finalization_reason · partial_revision_count
 response_provider      · response_model
 raw_text_length        · normalized_text_length · normalization_change_count
 context_turn_count     · context_character_count

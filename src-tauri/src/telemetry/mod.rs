@@ -84,6 +84,16 @@ pub async fn telemetry_set_content_policy_command(policy: ContentPolicy) -> Resu
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Milestone {
+    SpeechStartDetected,
+    SpeechEndDetected,
+    FirstAudioChunkSent,
+    ActivityStartSent,
+    LastAudioChunkSent,
+    ActivityEndSent,
+    FirstInputTranscriptionReceived,
+    LastInputTranscriptionReceived,
+    ServerTurnCompleteReceived,
+    LocalFinalTranscriptEmitted,
     SpeechStarted,
     SpeechEnded,
     FirstAudioChunk,
@@ -99,7 +109,17 @@ pub enum Milestone {
 }
 
 impl Milestone {
-    pub const ALL: [Milestone; 12] = [
+    pub const ALL: [Milestone; 22] = [
+        Milestone::SpeechStartDetected,
+        Milestone::SpeechEndDetected,
+        Milestone::FirstAudioChunkSent,
+        Milestone::ActivityStartSent,
+        Milestone::LastAudioChunkSent,
+        Milestone::ActivityEndSent,
+        Milestone::FirstInputTranscriptionReceived,
+        Milestone::LastInputTranscriptionReceived,
+        Milestone::ServerTurnCompleteReceived,
+        Milestone::LocalFinalTranscriptEmitted,
         Milestone::SpeechStarted,
         Milestone::SpeechEnded,
         Milestone::FirstAudioChunk,
@@ -116,29 +136,54 @@ impl Milestone {
 
     const fn index(self) -> usize {
         match self {
-            Milestone::SpeechStarted => 0,
-            Milestone::SpeechEnded => 1,
-            Milestone::FirstAudioChunk => 2,
-            Milestone::LastAudioChunk => 3,
-            Milestone::FirstPartialTranscript => 4,
-            Milestone::FinalTranscript => 5,
-            Milestone::NormalizationCompleted => 6,
-            Milestone::UtteranceFinalized => 7,
-            Milestone::GenerationStarted => 8,
-            Milestone::FirstHttpChunk => 9,
-            Milestone::FirstVisibleToken => 10,
-            Milestone::GenerationCompleted => 11,
+            Milestone::SpeechStartDetected => 0,
+            Milestone::SpeechEndDetected => 1,
+            Milestone::FirstAudioChunkSent => 2,
+            Milestone::ActivityStartSent => 3,
+            Milestone::LastAudioChunkSent => 4,
+            Milestone::ActivityEndSent => 5,
+            Milestone::FirstInputTranscriptionReceived => 6,
+            Milestone::LastInputTranscriptionReceived => 7,
+            Milestone::ServerTurnCompleteReceived => 8,
+            Milestone::LocalFinalTranscriptEmitted => 9,
+            Milestone::SpeechStarted => 10,
+            Milestone::SpeechEnded => 11,
+            Milestone::FirstAudioChunk => 12,
+            Milestone::LastAudioChunk => 13,
+            Milestone::FirstPartialTranscript => 14,
+            Milestone::FinalTranscript => 15,
+            Milestone::NormalizationCompleted => 16,
+            Milestone::UtteranceFinalized => 17,
+            Milestone::GenerationStarted => 18,
+            Milestone::FirstHttpChunk => 19,
+            Milestone::FirstVisibleToken => 20,
+            Milestone::GenerationCompleted => 21,
         }
     }
 
     /// Marcos "último X" são sobrescritos a cada ocorrência; todos os demais são
     /// primeiro-escrito-vence, para que um segundo chunk não mova o marco do primeiro.
     const fn overwrites(self) -> bool {
-        matches!(self, Milestone::LastAudioChunk)
+        matches!(
+            self,
+            Milestone::LastAudioChunk
+                | Milestone::LastAudioChunkSent
+                | Milestone::LastInputTranscriptionReceived
+        )
     }
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            Milestone::SpeechStartDetected => "speech_start_detected",
+            Milestone::SpeechEndDetected => "speech_end_detected",
+            Milestone::FirstAudioChunkSent => "first_audio_chunk_sent",
+            Milestone::ActivityStartSent => "activity_start_sent",
+            Milestone::LastAudioChunkSent => "last_audio_chunk_sent",
+            Milestone::ActivityEndSent => "activity_end_sent",
+            Milestone::FirstInputTranscriptionReceived => "first_input_transcription_received",
+            Milestone::LastInputTranscriptionReceived => "last_input_transcription_received",
+            Milestone::ServerTurnCompleteReceived => "server_turn_complete_received",
+            Milestone::LocalFinalTranscriptEmitted => "local_final_transcript_emitted",
             Milestone::SpeechStarted => "speech_started",
             Milestone::SpeechEnded => "speech_ended",
             Milestone::FirstAudioChunk => "first_audio_chunk",
@@ -170,6 +215,28 @@ pub enum ContentPolicy {
 /// Quantos caracteres de texto sanitizado no máximo, em modo de desenvolvedor.
 pub const SANITIZED_PREVIEW_CHARACTERS: usize = 160;
 
+/// Provider-internal observations that do not belong in `TranscriptionEvent` and therefore
+/// cannot accidentally enter normalization or the definitive conversation timeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderTelemetryEvent {
+    Configuration {
+        automatic_vad_enabled: bool,
+        finalization_strategy: String,
+    },
+    AudioChunkSent {
+        duration_ms: u64,
+        bytes: u64,
+        send_duration_ms: u64,
+    },
+    ActivityStartSent,
+    ActivityEndSent,
+    InputTranscriptionReceived,
+    ServerTurnCompleteReceived,
+    LocalFinalTranscriptEmitted {
+        finalization_reason: String,
+    },
+}
+
 impl ContentPolicy {
     /// `None` sob `Redacted`. Sob `Developer`, colapsa espaços e trunca — o objetivo é
     /// reconhecer *qual* fala é, não reconstruir a reunião a partir do log.
@@ -199,6 +266,18 @@ pub struct TraceAttributes {
     /// Tempo entre aceitação na fila e início do consumo pelo runtime. Se alto, o
     /// gargalo é backpressure/throughput antes do provider, não a inferência em si.
     pub transcription_queue_wait_ms: Option<u64>,
+    pub provider_queue_wait_ms: Option<u64>,
+    pub provider_queue_depth: Option<usize>,
+    pub provider_queue_oldest_age_ms: Option<u64>,
+    pub dropped_audio_chunks: Option<u64>,
+    pub audio_chunk_duration_ms: Option<u64>,
+    pub audio_chunks_sent: Option<u64>,
+    pub bytes_sent: Option<u64>,
+    pub websocket_send_latency_ms: Option<u64>,
+    pub automatic_vad_enabled: Option<bool>,
+    pub finalization_strategy: Option<String>,
+    pub finalization_reason: Option<String>,
+    pub partial_revision_count: Option<u64>,
     pub transcription_provider: Option<String>,
     pub transcription_model: Option<String>,
     pub response_provider: Option<String>,
@@ -226,12 +305,17 @@ pub struct PipelineTrace {
 }
 
 impl PipelineTrace {
-    pub(crate) fn new(id: TraceId, session_id: SessionId, source: AudioSource) -> Self {
+    pub(crate) fn new_at(
+        id: TraceId,
+        session_id: SessionId,
+        source: AudioSource,
+        origin: Instant,
+    ) -> Self {
         PipelineTrace {
             id,
             session_id,
             source,
-            origin: Instant::now(),
+            origin,
             marks: Default::default(),
             attributes: TraceAttributes::default(),
         }
@@ -303,6 +387,11 @@ impl PipelineTrace {
 /// `generation_started → first_visible_token`, e reportar `0` ali seria mentira.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PipelineLatencies {
+    pub speech_start_to_first_partial_ms: Option<u64>,
+    pub speech_end_to_activity_end_ms: Option<u64>,
+    pub activity_end_to_last_partial_ms: Option<i64>,
+    pub activity_end_to_final_transcript_ms: Option<u64>,
+    pub speech_end_to_final_transcript_ms: Option<u64>,
     pub speech_ended_to_final_transcript_ms: Option<u64>,
     pub final_transcript_to_utterance_finalized_ms: Option<u64>,
     pub utterance_finalized_to_generation_started_ms: Option<u64>,
@@ -313,7 +402,36 @@ pub struct PipelineLatencies {
 impl PipelineLatencies {
     pub fn from_trace(trace: &PipelineTrace) -> Self {
         let span = |from, to| trace.between(from, to).map(millis);
+        let signed_span = |from, to| {
+            let from = trace.at(from)?;
+            let to = trace.at(to)?;
+            if to >= from {
+                Some(i64::try_from((to - from).as_millis()).unwrap_or(i64::MAX))
+            } else {
+                Some(-i64::try_from((from - to).as_millis()).unwrap_or(i64::MAX))
+            }
+        };
         PipelineLatencies {
+            speech_start_to_first_partial_ms: span(
+                Milestone::SpeechStartDetected,
+                Milestone::FirstInputTranscriptionReceived,
+            ),
+            speech_end_to_activity_end_ms: span(
+                Milestone::SpeechEndDetected,
+                Milestone::ActivityEndSent,
+            ),
+            activity_end_to_last_partial_ms: signed_span(
+                Milestone::ActivityEndSent,
+                Milestone::LastInputTranscriptionReceived,
+            ),
+            activity_end_to_final_transcript_ms: span(
+                Milestone::ActivityEndSent,
+                Milestone::LocalFinalTranscriptEmitted,
+            ),
+            speech_end_to_final_transcript_ms: span(
+                Milestone::SpeechEndDetected,
+                Milestone::LocalFinalTranscriptEmitted,
+            ),
             speech_ended_to_final_transcript_ms: span(
                 Milestone::SpeechEnded,
                 Milestone::FinalTranscript,
@@ -362,10 +480,11 @@ mod tests {
     use super::*;
 
     fn trace() -> PipelineTrace {
-        PipelineTrace::new(
+        PipelineTrace::new_at(
             TraceId(1),
             SessionId::from_value(1),
             AudioSource::SystemOutput,
+            Instant::now(),
         )
     }
 

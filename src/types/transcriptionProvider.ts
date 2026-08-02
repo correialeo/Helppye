@@ -33,7 +33,14 @@ export interface TranscriptionSettings {
   model?: string | null;
   providers: {
     whisper_local: { model: string | null };
-    google_gemini: { model: string; endpoint: string };
+    google_gemini: {
+      model: string;
+      endpoint: string;
+      audio_chunk_ms: 20 | 40;
+      manual_activity_end_silence_ms: 500 | 600 | 700 | 800;
+      transcript_drain_ms: number;
+      finalization_timeout_ms: number;
+    };
     openai_realtime: { model: string | null };
     openai_compatible: { model: string | null; endpoint: string | null };
   };

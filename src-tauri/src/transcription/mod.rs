@@ -325,7 +325,9 @@ async fn validate_settings_and_connection(
             source: crate::audio::types::AudioSource::SystemOutput,
             language: settings.language.clone().into(),
             model: settings.active_model(),
+            streaming_audio_config: provider.streaming_audio_config(settings),
             sink: Arc::new(|_| {}),
+            provider_telemetry: Arc::new(|_| {}),
         };
         let mut session = provider
             .start_session(context)

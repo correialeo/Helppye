@@ -25,6 +25,7 @@ pub const QUEUE_CAPACITY: usize = 16;
 #[derive(Default)]
 struct LaneMetrics {
     enqueued_at: Mutex<VecDeque<Instant>>,
+    dropped_audio_chunks: AtomicU64,
 }
 
 enum QueueCommand {
@@ -110,17 +111,41 @@ impl TranscriptionQueue {
                         configuration_revision,
                     } => {
                         let queued_age_ms = enqueued_at.elapsed_ms();
-                        worker_metrics
-                            .enqueued_at
-                            .lock()
-                            .expect("transcription queue metrics mutex poisoned")
-                            .pop_front();
+                        let (queue_depth, oldest_age_ms) = {
+                            let mut queued = worker_metrics
+                                .enqueued_at
+                                .lock()
+                                .expect("transcription queue metrics mutex poisoned");
+                            queued.pop_front();
+                            let now = Instant::now();
+                            (
+                                queued.len(),
+                                queued.front().map(|at| {
+                                    now.saturating_duration_since(*at).as_millis() as u64
+                                }),
+                            )
+                        };
                         if queued_age_ms >= 1_000 {
                             debug!(
                                 ?source,
                                 queued_age_ms, "transcription queue processing old audio"
                             );
                         }
+                        runtime.record_streaming_queue_metrics(
+                            source,
+                            if matches!(
+                                audio.activity,
+                                crate::transcription::session::AudioActivity::Start
+                            ) {
+                                audio.activity_observed_at
+                            } else {
+                                None
+                            },
+                            queued_age_ms,
+                            queue_depth,
+                            oldest_age_ms,
+                            worker_metrics.dropped_audio_chunks.load(Ordering::Relaxed),
+                        );
                         if let Err(error) = runtime
                             .push_chunk_for_revision(audio, configuration_revision)
                             .await
@@ -150,6 +175,59 @@ impl TranscriptionQueue {
         self.runtime.provider_capabilities().streaming
     }
 
+    pub fn streaming_audio_config(
+        &self,
+    ) -> Option<crate::transcription::session::StreamingAudioConfig> {
+        self.runtime.streaming_audio_config()
+    }
+
+    pub async fn prepare_source(
+        &self,
+        source: AudioSource,
+        capture_stream_id: crate::audio::types::CaptureStreamId,
+    ) -> Result<(), crate::transcription::error::TranscriptionError> {
+        self.runtime.prepare_source(source, capture_stream_id).await
+    }
+
+    /// Boundary markers cannot be dropped: they share the source lane with audio and use
+    /// backpressure only on the forwarding task, never on the capture callback.
+    pub async fn enqueue_ordered_chunk(&self, audio: AudioChunk) {
+        if self.runtime.active_session_id().is_none() {
+            return;
+        }
+        let source = audio.source;
+        let enqueued_at = MonotonicTimestamp::now();
+        let configuration_revision = self.runtime.configuration_revision();
+        let lane = self.lane(source);
+        lane.metrics
+            .enqueued_at
+            .lock()
+            .expect("transcription queue metrics mutex poisoned")
+            .push_back(enqueued_at.as_instant());
+        if lane
+            .sender
+            .send(QueueCommand::Chunk {
+                audio,
+                enqueued_at,
+                configuration_revision,
+            })
+            .await
+            .is_err()
+        {
+            let mut timestamps = lane
+                .metrics
+                .enqueued_at
+                .lock()
+                .expect("transcription queue metrics mutex poisoned");
+            if let Some(position) = timestamps
+                .iter()
+                .position(|timestamp| *timestamp == enqueued_at.as_instant())
+            {
+                timestamps.remove(position);
+            }
+        }
+    }
+
     /// Continuous providers receive capture frames directly instead of waiting for the
     /// local VAD to finalize a segment. The same bounded/drop-newest policy still applies.
     pub fn try_enqueue_chunk(&self, audio: AudioChunk) {
@@ -174,6 +252,9 @@ impl TranscriptionQueue {
             })
             .is_err()
         {
+            lane.metrics
+                .dropped_audio_chunks
+                .fetch_add(1, Ordering::Relaxed);
             let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped % 50 == 1 {
                 warn!(
