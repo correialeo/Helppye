@@ -111,6 +111,7 @@ export function TranscriptionProviderSection() {
             const selected = localModel.status?.model_id === model.model_id;
             const installed = state === "ready";
             const downloading = state === "downloading";
+            const failureReason = state === "corrupted" || state === "failed" ? model.state.reason : null;
             const description = model.model_id === "whisper-large-v3-turbo"
               ? "Mais rápido para comparar com o Gemini Live."
               : "Equilíbrio entre tamanho e qualidade para uso local.";
@@ -126,6 +127,7 @@ export function TranscriptionProviderSection() {
                     <p className="mt-1 text-[11px] font-medium text-neutral-500">
                       {selected && installed ? "Selecionado" : installed ? "Instalado" : state === "corrupted" ? "Arquivo inválido" : state === "failed" ? "Falha no download" : "Não instalado"}
                     </p>
+                    {failureReason && <p className="mt-1 text-[11px] text-red-300/80">{failureReason}</p>}
                   </div>
                   <SecondaryButton
                     className="shrink-0 px-3 py-2 text-xs"

@@ -336,19 +336,26 @@ impl ModelManager {
         )
         .is_ok()
         {
+            self.load_provider(final_path, definition.display_name.into())
+                .await?;
             config_store::save(
                 &self.config_path,
                 &TranscriptionModelSelection::Managed {
                     model_id: definition.id.into(),
                 },
             )?;
-            self.load_provider(final_path, definition.display_name.into())
-                .await?;
             self.set_state(ModelInstallState::Ready).await;
             return Ok(());
         }
         // Um `.part` de uma tentativa anterior nunca deve ser confundido com esta.
         let _ = std::fs::remove_file(&part_path);
+        // No Windows, `rename` não substitui um arquivo final existente. Remover
+        // somente depois da verificação falhar permite repetir um download corrompido
+        // sem deixar o nome final bloquear a instalação nova.
+        if final_path.exists() {
+            std::fs::remove_file(&final_path)
+                .map_err(|e| ModelManagerError::Disk(e.to_string()))?;
+        }
 
         self.set_state(ModelInstallState::Downloading).await;
         self.emit(ModelDownloadEvent::Started {
@@ -397,17 +404,18 @@ impl ModelManager {
         std::fs::rename(&part_path, &final_path)
             .map_err(|e| ModelManagerError::Disk(e.to_string()))?;
 
-        // 9. registra a configuração.
+        // 10. carrega e valida o modelo de fato (não só o arquivo em disco).
+        self.load_provider(final_path.clone(), definition.display_name.into())
+            .await?;
+
+        // Só torna a seleção persistente depois que o provider confirmou que consegue
+        // abrir o arquivo. Um modelo incompatível não deve substituir o último válido.
         config_store::save(
             &self.config_path,
             &TranscriptionModelSelection::Managed {
                 model_id: definition.id.into(),
             },
         )?;
-
-        // 10. carrega e valida o modelo de fato (não só o arquivo em disco).
-        self.load_provider(final_path.clone(), definition.display_name.into())
-            .await?;
 
         self.set_state(ModelInstallState::Ready).await;
         self.emit(ModelDownloadEvent::Completed {
@@ -866,6 +874,23 @@ mod tests {
             manager.status_snapshot().await.unwrap().state,
             ModelInstallState::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn retry_replaces_an_invalid_final_file_before_renaming_on_windows() {
+        let tmp = TempDir::new("retry-invalid-final");
+        let (definition, bytes) = test_definition("t10b", "model.bin");
+        let downloader = Arc::new(FakeDownloader::new(vec![FakeOutcome::Success(
+            bytes.clone(),
+        )]));
+        let provider = Arc::new(FakeProvider::new(false));
+        let manager = manager_with(tmp.path(), downloader, provider);
+        let final_path = tmp.path().join("models").join(definition.filename);
+        std::fs::write(&final_path, b"corrupted old model").unwrap();
+
+        manager.download_model(definition).await.unwrap();
+
+        assert_eq!(std::fs::read(final_path).unwrap(), bytes);
     }
 
     #[tokio::test]

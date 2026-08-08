@@ -52,6 +52,7 @@ export function useModelStatus() {
       } else {
         // verifying/completed/cancelled/failed: the authoritative state lives in
         // `model_status_command`, not derived from the event stream.
+        setProgress(null);
         refresh();
       }
     });
@@ -63,18 +64,14 @@ export function useModelStatus() {
   const startDownload = useCallback(async (modelId?: string) => {
     try {
       await startModelDownload(modelId);
-      setStatus((s) => (s ? { ...s, state: { state: "downloading" } } : s));
-      if (modelId) {
-        setModels((current) =>
-          current.map((model) =>
-            model.model_id === modelId ? { ...model, state: { state: "downloading" } } : model,
-          ),
-        );
-      }
+      // The command starts a background task. Refreshing here covers the fast path
+      // where the file is already present (load/validation) while download events
+      // continue to provide the authoritative state for a real transfer.
+      refresh();
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [refresh]);
 
   const selectModel = useCallback(async (modelId: string) => {
     try {
