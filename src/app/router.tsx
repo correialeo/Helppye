@@ -4,7 +4,7 @@ import { createSessionToggleController } from "./sessionToggleController";
 import { useOnboardingStore } from "../stores/useOnboardingStore";
 import { startCapture, stopCapture } from "../services/audioService";
 import { endConversationSession, startConversationSession } from "../services/conversationService";
-import { closeSessionWindows, openSessionWindows, openSettingsWindow, restoreSessionWindows } from "../services/sessionWindowService";
+import { closeSessionWindows, onSessionEndRequest, openSessionWindows, openSettingsWindow, restoreSessionWindows } from "../services/sessionWindowService";
 import { onGlobalSessionToggle } from "../services/globalShortcutService";
 import { validateActiveTranscriptionProvider } from "../services/transcriptionProviderService";
 import { WelcomeScreen } from "../features/welcome/WelcomeScreen";
@@ -63,10 +63,12 @@ export function AppRouter() {
 
   const endSession = async () => {
     await closeSessionWindows();
-    setSessionDetached(false);
     await stopAllCapture();
     await endConversationSession().catch(() => {});
     setScreen("ready");
+    // Keep the coordinator layout until the screen is ready. Otherwise the main
+    // compact window briefly renders the full chat panel at taskbar dimensions.
+    setSessionDetached(false);
   };
 
   if (!globalToggleController.current) {
@@ -81,9 +83,15 @@ export function AppRouter() {
     const unlistenPromise = onGlobalSessionToggle(() => {
       void globalToggleController.current?.();
     });
+    const unlistenEndRequestPromise = onSessionEndRequest(() => {
+      if (useOnboardingStore.getState().screen === "session") {
+        void globalToggleController.current?.();
+      }
+    });
 
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
+      unlistenEndRequestPromise.then((unlisten) => unlisten());
     };
   }, []);
 

@@ -8,7 +8,7 @@ import { useOnboardingStore } from "../stores/useOnboardingStore";
 import { SessionScreen } from "../features/session/SessionScreen";
 import { SettingsScreen } from "../features/settings/SettingsScreen";
 import { DeveloperToolsScreen } from "../features/developer-tools/DeveloperToolsScreen";
-import { getSessionWindowRole, getWindowStartedAt, openSettingsWindow } from "../services/sessionWindowService";
+import { getSessionWindowRole, getWindowStartedAt, openSettingsWindow, requestSessionEnd } from "../services/sessionWindowService";
 
 export default function App() {
   const screen = useOnboardingStore((s) => s.screen);
@@ -64,7 +64,7 @@ export default function App() {
           startedAt={getWindowStartedAt()}
           onOpenSettings={() => void openSettingsWindow()}
           onOpenDeveloperTools={() => setSessionDiagnosticsOpen(true)}
-          onEndSession={() => window.close()}
+          onEndSession={() => void requestSessionEnd()}
         />
       </ErrorBoundary>
     );

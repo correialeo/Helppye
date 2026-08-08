@@ -1,10 +1,12 @@
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type AppWindowRole = "main" | "ai" | "chat" | "settings";
 
 const AI_WINDOW = "helppye-ai-response";
 const CHAT_WINDOW = "helppye-session-chat";
 const SETTINGS_WINDOW = "helppye-settings";
+export const SESSION_END_REQUEST_EVENT = "session://end-request";
 
 function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -106,6 +108,17 @@ export async function restoreSessionWindows(): Promise<boolean> {
 export async function closeSessionWindows(): Promise<void> {
   if (!isTauriRuntime()) return;
   await Promise.all([closeIfExists(AI_WINDOW), closeIfExists(CHAT_WINDOW)]);
+}
+
+/** Solicita que a janela principal encerre a sessão inteira. Fechar uma janela
+ * destacada individualmente deixaria captura e a outra janela vivas. */
+export async function requestSessionEnd(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  await emit(SESSION_END_REQUEST_EVENT);
+}
+
+export function onSessionEndRequest(handler: () => void): Promise<UnlistenFn> {
+  return listen(SESSION_END_REQUEST_EVENT, () => handler());
 }
 
 export async function openSettingsWindow(): Promise<boolean> {
