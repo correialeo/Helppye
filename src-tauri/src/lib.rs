@@ -293,8 +293,10 @@ pub fn run() {
             telemetry::telemetry_snapshot_command,
             telemetry::telemetry_set_content_policy_command,
             model_manager::model_status_command,
+            model_manager::managed_models_status_command,
             model_manager::start_model_download_command,
             model_manager::cancel_model_download_command,
+            model_manager::select_managed_model_command,
             model_manager::select_custom_model_command,
         ])
         .run(tauri::generate_context!())

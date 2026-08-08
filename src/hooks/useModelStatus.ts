@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   cancelModelDownload,
-  getModelStatus,
+  getManagedModelsStatus,
   onModelDownloadEvent,
+  selectManagedModel,
   startModelDownload,
 } from "../services/modelService";
 import type { ModelStatus } from "../types/model";
@@ -19,13 +20,15 @@ interface DownloadProgress {
  * `startDownload` below and CLAUDE.md's "never a silent download" rule. */
 export function useModelStatus() {
   const [status, setStatus] = useState<ModelStatus | null>(null);
+  const [models, setModels] = useState<ModelStatus[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
 
   const refresh = useCallback(() => {
-    getModelStatus()
-      .then((s) => {
-        setStatus(s);
+    getManagedModelsStatus()
+      .then((snapshot) => {
+        setStatus(snapshot.active_model);
+        setModels(snapshot.models);
         setError(null);
       })
       .catch((e) => setError(String(e)));
@@ -45,6 +48,7 @@ export function useModelStatus() {
         });
       } else if (event.type === "started") {
         setProgress({ downloaded: 0, total: event.total_bytes, bytesPerSecond: 0 });
+        refresh();
       } else {
         // verifying/completed/cancelled/failed: the authoritative state lives in
         // `model_status_command`, not derived from the event stream.
@@ -60,10 +64,26 @@ export function useModelStatus() {
     try {
       await startModelDownload(modelId);
       setStatus((s) => (s ? { ...s, state: { state: "downloading" } } : s));
+      if (modelId) {
+        setModels((current) =>
+          current.map((model) =>
+            model.model_id === modelId ? { ...model, state: { state: "downloading" } } : model,
+          ),
+        );
+      }
     } catch (e) {
       setError(String(e));
     }
   }, []);
+
+  const selectModel = useCallback(async (modelId: string) => {
+    try {
+      await selectManagedModel(modelId);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [refresh]);
 
   const cancelDownload = useCallback(async () => {
     try {
@@ -74,5 +94,5 @@ export function useModelStatus() {
     }
   }, []);
 
-  return { status, error, progress, refresh, startDownload, cancelDownload };
+  return { status, models, error, progress, refresh, startDownload, selectModel, cancelDownload };
 }

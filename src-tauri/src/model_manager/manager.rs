@@ -18,7 +18,7 @@ use crate::model_manager::config_store::{self, TranscriptionModelSelection};
 use crate::model_manager::downloader::{ModelDownloader, ProgressCallback};
 use crate::model_manager::error::ModelManagerError;
 use crate::model_manager::events::ModelDownloadEvent;
-use crate::model_manager::state::{ModelInstallState, ModelStatus};
+use crate::model_manager::state::{ManagedModelsStatus, ModelInstallState, ModelStatus};
 use crate::model_manager::verify;
 use crate::transcription::segment_transcriber::SegmentTranscriber;
 use crate::transcription::types::{InferenceDevice, ModelConfig, TranscriptionLanguage};
@@ -139,6 +139,30 @@ impl ModelManager {
         Ok(Self::status_for(DEFAULT_MODEL, state, None))
     }
 
+    /// Retorna o estado de cada modelo gerenciado sem alterar qual deles está ativo.
+    /// Apenas o modelo selecionado é carregado no provider; os demais são verificados
+    /// no disco para que a UI consiga distinguir "instalado" de "selecionado".
+    pub async fn managed_models_status(&self) -> Result<ManagedModelsStatus, ModelManagerError> {
+        let active_model = self.status_snapshot().await?;
+        let mut models = Vec::new();
+
+        for definition in crate::model_manager::catalog::MANAGED_MODELS {
+            if active_model.custom_model_path.is_none() && active_model.model_id == definition.id {
+                models.push(active_model.clone());
+                continue;
+            }
+
+            let state =
+                check_model_at_path(&self.models_dir.join(definition.filename), definition).await?;
+            models.push(Self::status_for(*definition, state, None));
+        }
+
+        Ok(ManagedModelsStatus {
+            active_model,
+            models,
+        })
+    }
+
     /// Passo 3 isolado: verifica se o modelo padrão já existe e é válido (tamanho +
     /// checksum) e, se estiver, carrega-o de fato no `TranscriptionProvider` — o
     /// arquivo em disco sobrevive a um restart do app, mas o estado em memória do
@@ -228,6 +252,29 @@ impl ModelManager {
             })?,
         };
         self.download_model(definition).await
+    }
+
+    /// Seleciona um modelo gerenciado que já está instalado, recarrega-o no provider e
+    /// persiste a escolha para que ela seja restaurada no próximo início do app.
+    pub async fn select_managed_model(&self, model_id: &str) -> Result<(), ModelManagerError> {
+        let definition = find_managed_model(model_id).ok_or_else(|| {
+            ModelManagerError::InvalidResponse(format!("unknown transcription model: {model_id}"))
+        })?;
+        let state = self.check_and_load(&definition).await?;
+        if state != ModelInstallState::Ready {
+            return Err(ModelManagerError::ManagedModelNotInstalled(format!(
+                "{} ({state:?})",
+                definition.display_name
+            )));
+        }
+
+        config_store::save(
+            &self.config_path,
+            &TranscriptionModelSelection::Managed {
+                model_id: definition.id.into(),
+            },
+        )?;
+        Ok(())
     }
 
     pub async fn cancel_download(&self) {

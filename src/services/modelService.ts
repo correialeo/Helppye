@@ -1,11 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { ModelDownloadEvent, ModelStatus } from "../types/model";
+import type { ManagedModelsStatus, ModelDownloadEvent, ModelStatus } from "../types/model";
 
 export const MODEL_DOWNLOAD_EVENT = "model-download://event";
 
 export function getModelStatus(): Promise<ModelStatus> {
   return invoke("model_status_command");
+}
+
+export function getManagedModelsStatus(): Promise<ManagedModelsStatus> {
+  return invoke("managed_models_status_command");
 }
 
 export function startModelDownload(modelId?: string): Promise<void> {
@@ -14,6 +18,10 @@ export function startModelDownload(modelId?: string): Promise<void> {
 
 export function cancelModelDownload(): Promise<void> {
   return invoke("cancel_model_download_command");
+}
+
+export function selectManagedModel(modelId: string): Promise<void> {
+  return invoke("select_managed_model_command", { modelId });
 }
 
 export function selectCustomModel(modelPath: string, modelName: string): Promise<void> {

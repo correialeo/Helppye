@@ -22,4 +22,6 @@ pub enum ModelManagerError {
     LoadFailed(String),
     #[error("selected file is not a valid model: {0}")]
     InvalidCustomModel(String),
+    #[error("managed model is not installed: {0}")]
+    ManagedModelNotInstalled(String),
 }

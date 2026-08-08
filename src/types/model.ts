@@ -22,6 +22,11 @@ export interface ModelStatus {
   language_support: "multilingual" | "english_only" | null;
 }
 
+export interface ManagedModelsStatus {
+  active_model: ModelStatus;
+  models: ModelStatus[];
+}
+
 export type ModelDownloadEvent =
   | { type: "started"; model_id: string; total_bytes: number }
   | {

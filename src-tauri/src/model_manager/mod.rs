@@ -20,7 +20,7 @@ use tauri::{AppHandle, Emitter, State};
 use downloader::ReqwestDownloader;
 use events::MODEL_DOWNLOAD_EVENT;
 use manager::ModelManager;
-use state::ModelStatus;
+use state::{ManagedModelsStatus, ModelStatus};
 
 use crate::transcription::segment_transcriber::SegmentTranscriber;
 
@@ -56,6 +56,17 @@ pub async fn model_status_command(
     state.0.status_snapshot().await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub async fn managed_models_status_command(
+    state: State<'_, ModelManagerState>,
+) -> Result<ManagedModelsStatus, String> {
+    state
+        .0
+        .managed_models_status()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Dispara o download em segundo plano e retorna imediatamente — o progresso e o
 /// resultado chegam ao frontend via eventos `MODEL_DOWNLOAD_EVENT`, nunca de forma
 /// silenciosa.
@@ -79,6 +90,18 @@ pub async fn cancel_model_download_command(
 ) -> Result<(), String> {
     state.0.cancel_download().await;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn select_managed_model_command(
+    state: State<'_, ModelManagerState>,
+    model_id: String,
+) -> Result<(), String> {
+    state
+        .0
+        .select_managed_model(&model_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Configurações → Transcrição → Avançado → Usar modelo local personalizado. Valida o

@@ -40,3 +40,12 @@ pub struct ModelStatus {
     pub custom_model_path: Option<String>,
     pub language_support: Option<ModelLanguageSupport>,
 }
+
+/// Estado dos modelos gerenciados e do último modelo selecionado. O frontend usa o
+/// `active_model` para destacar a escolha persistida e `models` para mostrar todos os
+/// arquivos instalados sem confundir "instalado" com "selecionado".
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedModelsStatus {
+    pub active_model: ModelStatus,
+    pub models: Vec<ModelStatus>,
+}
