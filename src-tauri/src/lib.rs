@@ -15,6 +15,7 @@ pub mod normalization;
 pub mod telemetry;
 pub mod transcription;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
@@ -193,6 +194,10 @@ pub fn run() {
                         .expect("Whisper local is always registered")
                 }
             };
+            let local_provider_active = Arc::new(AtomicBool::new(
+                transcription_settings.provider
+                    == transcription::provider::TranscriptionProviderId::WhisperLocal,
+            ));
 
             let runtime = Arc::new(TranscriptionRuntime::new(
                 active_transcription_provider,
@@ -223,9 +228,11 @@ pub fn run() {
                 runtime,
                 registry,
                 transcription_settings_path,
+                local_provider_active.clone(),
             ));
 
-            let model_manager_state = model_manager::build(app.handle(), transcriber)?;
+            let model_manager_state =
+                model_manager::build(app.handle(), transcriber, local_provider_active)?;
             // O arquivo do modelo sobrevive a um restart do app; o estado carregado dentro
             // do provider não. Restaurá-lo era efeito colateral de `model_status_command`,
             // invocado só pela tela de teste de áudio do onboarding — que deixa de ser

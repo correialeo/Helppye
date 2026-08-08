@@ -5,6 +5,7 @@
 //! sob o nome final: só o rename acontece depois da verificação ter passado.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,8 @@ pub struct ModelManager {
     config_path: PathBuf,
     downloader: Arc<dyn ModelDownloader>,
     provider: Arc<dyn SegmentTranscriber>,
+    local_provider_active: Arc<AtomicBool>,
+    provider_model_loaded: AtomicBool,
     on_event: EventSink,
     state: Mutex<ModelInstallState>,
     active_model_id: Mutex<Option<String>>,
@@ -43,6 +46,7 @@ pub struct ModelManager {
 }
 
 impl ModelManager {
+    #[allow(dead_code)]
     pub fn new(
         models_dir: PathBuf,
         config_path: PathBuf,
@@ -50,16 +54,40 @@ impl ModelManager {
         provider: Arc<dyn SegmentTranscriber>,
         on_event: impl Fn(ModelDownloadEvent) + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_provider_activity(
+            models_dir,
+            config_path,
+            downloader,
+            provider,
+            Arc::new(AtomicBool::new(true)),
+            on_event,
+        )
+    }
+
+    pub fn new_with_provider_activity(
+        models_dir: PathBuf,
+        config_path: PathBuf,
+        downloader: Arc<dyn ModelDownloader>,
+        provider: Arc<dyn SegmentTranscriber>,
+        local_provider_active: Arc<AtomicBool>,
+        on_event: impl Fn(ModelDownloadEvent) + Send + Sync + 'static,
+    ) -> Self {
         ModelManager {
             models_dir,
             config_path,
             downloader,
             provider,
+            local_provider_active,
+            provider_model_loaded: AtomicBool::new(false),
             on_event: Arc::new(on_event),
             state: Mutex::new(ModelInstallState::NotInstalled),
             active_model_id: Mutex::new(None),
             cancel: Mutex::new(None),
         }
+    }
+
+    fn is_local_provider_active(&self) -> bool {
+        self.local_provider_active.load(Ordering::Acquire)
     }
 
     fn emit(&self, event: ModelDownloadEvent) {
@@ -99,8 +127,17 @@ impl ModelManager {
     /// uma seleção de modelo personalizado (feita em uma sessão anterior) reporta seu
     /// próprio estado em vez do modelo padrão; caso contrário, verifica o disco.
     pub async fn status_snapshot(&self) -> Result<ModelStatus, ModelManagerError> {
+        // O provider cloud não usa o modelo local. Marcar o cache como não carregado
+        // garante que, ao voltar para Whisper, a seleção local vigente seja restaurada
+        // mesmo que ela tenha mudado enquanto o cloud estava ativo.
+        if !self.is_local_provider_active() {
+            self.provider_model_loaded.store(false, Ordering::Release);
+        }
         let current = self.state.lock().await.clone();
-        if current != ModelInstallState::NotInstalled {
+        let must_restore_local_model = self.is_local_provider_active()
+            && matches!(current, ModelInstallState::Ready)
+            && !self.provider_model_loaded.load(Ordering::Acquire);
+        if current != ModelInstallState::NotInstalled && !must_restore_local_model {
             return Ok(Self::status_for(
                 self.active_definition().await,
                 current,
@@ -111,7 +148,11 @@ impl ModelManager {
         if let Some(selection) = config_store::load(&self.config_path)? {
             match selection {
                 TranscriptionModelSelection::Custom { model_path } => {
-                    let state = self.load_persisted_custom_model(&model_path).await;
+                    let state = if self.is_local_provider_active() {
+                        self.load_persisted_custom_model(&model_path).await
+                    } else {
+                        check_custom_model_at_path(&model_path)
+                    };
                     self.set_state(state.clone()).await;
                     return Ok(ModelStatus {
                         model_id: DEFAULT_MODEL.id,
@@ -127,7 +168,17 @@ impl ModelManager {
                 TranscriptionModelSelection::Managed { model_id } => {
                     if let Some(definition) = find_managed_model(&model_id) {
                         *self.active_model_id.lock().await = Some(definition.id.into());
-                        let state = self.check_and_load(&definition).await?;
+                        let state = if self.is_local_provider_active() {
+                            self.check_and_load(&definition).await?
+                        } else {
+                            let state = check_model_at_path(
+                                &self.models_dir.join(definition.filename),
+                                &definition,
+                            )
+                            .await?;
+                            self.set_state(state.clone()).await;
+                            state
+                        };
                         return Ok(Self::status_for(definition, state, None));
                     }
                     tracing::warn!(%model_id, "unknown managed transcription model; falling back to default");
@@ -135,7 +186,17 @@ impl ModelManager {
             }
         }
 
-        let state = self.check_default_model().await?;
+        let state = if self.is_local_provider_active() {
+            self.check_default_model().await?
+        } else {
+            let state = check_model_at_path(
+                &self.models_dir.join(DEFAULT_MODEL.filename),
+                &DEFAULT_MODEL,
+            )
+            .await?;
+            self.set_state(state.clone()).await;
+            state
+        };
         Ok(Self::status_for(DEFAULT_MODEL, state, None))
     }
 
@@ -215,7 +276,9 @@ impl ModelManager {
         self.provider
             .load(config)
             .await
-            .map_err(|e| ModelManagerError::LoadFailed(e.to_string()))
+            .map_err(|e| ModelManagerError::LoadFailed(e.to_string()))?;
+        self.provider_model_loaded.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Restaura uma seleção de modelo personalizado persistida em uma sessão anterior:
@@ -260,7 +323,16 @@ impl ModelManager {
         let definition = find_managed_model(model_id).ok_or_else(|| {
             ModelManagerError::InvalidResponse(format!("unknown transcription model: {model_id}"))
         })?;
-        let state = self.check_and_load(&definition).await?;
+        let state = if self.is_local_provider_active() {
+            self.check_and_load(&definition).await?
+        } else {
+            let state =
+                check_model_at_path(&self.models_dir.join(definition.filename), &definition)
+                    .await?;
+            *self.active_model_id.lock().await = Some(definition.id.into());
+            self.set_state(state.clone()).await;
+            state
+        };
         if state != ModelInstallState::Ready {
             return Err(ModelManagerError::ManagedModelNotInstalled(format!(
                 "{} ({state:?})",
@@ -336,8 +408,10 @@ impl ModelManager {
         )
         .is_ok()
         {
-            self.load_provider(final_path, definition.display_name.into())
-                .await?;
+            if self.is_local_provider_active() {
+                self.load_provider(final_path, definition.display_name.into())
+                    .await?;
+            }
             config_store::save(
                 &self.config_path,
                 &TranscriptionModelSelection::Managed {
@@ -404,9 +478,13 @@ impl ModelManager {
         std::fs::rename(&part_path, &final_path)
             .map_err(|e| ModelManagerError::Disk(e.to_string()))?;
 
-        // 10. carrega e valida o modelo de fato (não só o arquivo em disco).
-        self.load_provider(final_path.clone(), definition.display_name.into())
-            .await?;
+        // 10. carrega e valida o modelo de fato somente quando o provider local está
+        // ativo. Baixar um modelo enquanto Gemini está selecionado não deve trocar nem
+        // bloquear o provider cloud.
+        if self.is_local_provider_active() {
+            self.load_provider(final_path.clone(), definition.display_name.into())
+                .await?;
+        }
 
         // Só torna a seleção persistente depois que o provider confirmou que consegue
         // abrir o arquivo. Um modelo incompatível não deve substituir o último válido.
@@ -514,6 +592,16 @@ async fn check_model_at_path(
         Err(e) => Ok(ModelInstallState::Corrupted {
             reason: e.to_string(),
         }),
+    }
+}
+
+fn check_custom_model_at_path(model_path: &str) -> ModelInstallState {
+    if std::path::Path::new(model_path).is_file() {
+        ModelInstallState::Ready
+    } else {
+        ModelInstallState::Corrupted {
+            reason: "arquivo do modelo personalizado não existe mais".into(),
+        }
     }
 }
 
@@ -989,6 +1077,43 @@ mod tests {
         assert_eq!(
             fresh_provider.load_calls.lock().unwrap()[0],
             custom_model_path
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_status_does_not_load_local_model_until_local_is_reactivated() {
+        let tmp = TempDir::new("cloud-provider");
+        let custom_model_path = tmp.path().join("my-custom-model.bin");
+        std::fs::write(&custom_model_path, b"local model").unwrap();
+        let downloader = Arc::new(FakeDownloader::new(vec![FakeOutcome::Http404]));
+        let provider = Arc::new(FakeProvider::new(false));
+        let local_provider_active = Arc::new(AtomicBool::new(false));
+        let manager = ModelManager::new_with_provider_activity(
+            tmp.path().join("models"),
+            tmp.path().join("transcription.json"),
+            downloader,
+            provider.clone(),
+            local_provider_active.clone(),
+            |_| {},
+        );
+        config_store::save(
+            &tmp.path().join("transcription.json"),
+            &TranscriptionModelSelection::Custom {
+                model_path: custom_model_path.display().to_string(),
+            },
+        )
+        .unwrap();
+
+        let cloud_status = manager.status_snapshot().await.unwrap();
+        assert_eq!(cloud_status.state, ModelInstallState::Ready);
+        assert!(provider.load_calls.lock().unwrap().is_empty());
+
+        local_provider_active.store(true, Ordering::Release);
+        let local_status = manager.status_snapshot().await.unwrap();
+        assert_eq!(local_status.state, ModelInstallState::Ready);
+        assert_eq!(
+            provider.load_calls.lock().unwrap().as_slice(),
+            &[custom_model_path]
         );
     }
 

@@ -39,6 +39,7 @@ pub mod whisper_provider;
 pub mod fake_provider;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -83,6 +84,7 @@ pub struct TranscriptionState {
     pub runtime: Arc<TranscriptionRuntime>,
     pub registry: TranscriptionProviderRegistry,
     settings_path: PathBuf,
+    local_provider_active: Arc<AtomicBool>,
     loaded_model_name: tokio::sync::Mutex<Option<String>>,
     /// Vocabulário vigente. Vive aqui, e não dentro do normalizador, porque o runtime guarda
     /// o normalizador atrás de `Arc<dyn TranscriptNormalizer>` — um trait object imutável,
@@ -100,6 +102,7 @@ impl TranscriptionState {
         runtime: Arc<TranscriptionRuntime>,
         registry: TranscriptionProviderRegistry,
         settings_path: PathBuf,
+        local_provider_active: Arc<AtomicBool>,
     ) -> Self {
         TranscriptionState {
             transcriber,
@@ -107,6 +110,7 @@ impl TranscriptionState {
             runtime,
             registry,
             settings_path,
+            local_provider_active,
             loaded_model_name: tokio::sync::Mutex::new(None),
             vocabulary: std::sync::Mutex::new(TranscriptionVocabulary::default()),
         }
@@ -298,6 +302,10 @@ pub async fn transcription_set_settings_command(
         .map_err(|e| e.to_string())?;
     config_store::save(&state.settings_path, &settings)?;
     state.runtime.reconfigure(provider, settings).await;
+    state.local_provider_active.store(
+        state.runtime.provider_id() == provider::TranscriptionProviderId::WhisperLocal,
+        Ordering::Release,
+    );
     Ok(())
 }
 

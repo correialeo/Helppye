@@ -48,7 +48,7 @@ export function TranscriptionProviderSection() {
 
   useEffect(() => {
     if (!settings) return;
-    if (settings.provider === "google_gemini") setSelected("google_gemini");
+    setSelected(settings.provider === "google_gemini" ? "google_gemini" : "whisper_local");
     setModel(settings.providers.google_gemini.model);
   }, [settings]);
 

@@ -13,6 +13,7 @@ pub mod paths;
 pub mod state;
 pub mod verify;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, State};
@@ -32,14 +33,16 @@ pub struct ModelManagerState(pub Arc<ModelManager>);
 pub fn build(
     app: &AppHandle,
     provider: Arc<dyn SegmentTranscriber>,
+    local_provider_active: Arc<AtomicBool>,
 ) -> Result<ModelManagerState, String> {
     let (models_dir, config_path) = paths::resolve_paths(app).map_err(|e| e.to_string())?;
     let app_handle = app.clone();
-    let manager = ModelManager::new(
+    let manager = ModelManager::new_with_provider_activity(
         models_dir,
         config_path,
         Arc::new(ReqwestDownloader::new()),
         provider,
+        local_provider_active,
         move |event| {
             if let Err(e) = app_handle.emit(MODEL_DOWNLOAD_EVENT, &event) {
                 tracing::warn!(%e, "failed to emit model download event to frontend");

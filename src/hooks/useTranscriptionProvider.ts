@@ -8,6 +8,7 @@ import {
   storeTranscriptionApiKey,
   testTranscriptionConnection,
 } from "../services/transcriptionProviderService";
+import { getManagedModelsStatus } from "../services/modelService";
 import type {
   TranscriptionConnectionState,
   TranscriptionProviderDescriptor,
@@ -56,6 +57,9 @@ export function useTranscriptionProvider() {
     };
     try {
       await setTranscriptionSettings(next);
+      // Ao iniciar com Gemini, o backend não carrega o modelo local. Ao voltar
+      // para Whisper, este refresh restaura o último modelo instalado.
+      await getManagedModelsStatus().catch(() => {});
       setSettings(next);
       setConnectionState("not_configured");
       setError(null);
