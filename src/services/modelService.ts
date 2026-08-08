@@ -8,8 +8,8 @@ export function getModelStatus(): Promise<ModelStatus> {
   return invoke("model_status_command");
 }
 
-export function startModelDownload(): Promise<void> {
-  return invoke("start_model_download_command");
+export function startModelDownload(modelId?: string): Promise<void> {
+  return invoke("start_model_download_command", { modelId });
 }
 
 export function cancelModelDownload(): Promise<void> {

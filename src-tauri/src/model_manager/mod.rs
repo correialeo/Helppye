@@ -1,4 +1,4 @@
-//! Fluxo de download guiado do modelo padrão de transcrição no primeiro uso — nunca
+//! Fluxo de download guiado de modelos de transcrição — nunca
 //! silencioso (ver `docs/local-transcription.md`). `catalog` centraliza a definição do
 //! modelo (id, nome, URL, tamanho, checksum); nenhum desses valores aparece em nenhum
 //! outro módulo.
@@ -62,10 +62,11 @@ pub async fn model_status_command(
 #[tauri::command]
 pub async fn start_model_download_command(
     state: State<'_, ModelManagerState>,
+    model_id: Option<String>,
 ) -> Result<(), String> {
     let manager = state.0.clone();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = manager.download_default_model().await {
+        if let Err(e) = manager.download_model_by_id(model_id.as_deref()).await {
             tracing::warn!(%e, "guided model download finished with an error");
         }
     });

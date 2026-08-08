@@ -56,9 +56,9 @@ export function useModelStatus() {
     };
   }, [refresh]);
 
-  const startDownload = useCallback(async () => {
+  const startDownload = useCallback(async (modelId?: string) => {
     try {
-      await startModelDownload();
+      await startModelDownload(modelId);
       setStatus((s) => (s ? { ...s, state: { state: "downloading" } } : s));
     } catch (e) {
       setError(String(e));

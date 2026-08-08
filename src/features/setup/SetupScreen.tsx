@@ -163,7 +163,7 @@ export function SetupScreen({ onBack, onComplete }: SetupScreenProps) {
                 <p className="text-xs text-white/58">{modelReady ? "Instalado e verificado." : "Necessario para transcrever sem nuvem."}</p>
               </div>
               {!modelReady && (
-                <SecondaryButton onClick={model.startDownload}>
+                <SecondaryButton onClick={() => void model.startDownload()}>
                   Preparar
                 </SecondaryButton>
               )}

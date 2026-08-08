@@ -7,6 +7,12 @@ import { ProviderOption } from "../../components/ui/ProviderOption";
 import { SecondaryButton } from "../../components/ui/SecondaryButton";
 import { TextInput } from "../../components/ui/TextInput";
 import { useTranscriptionProvider } from "../../hooks/useTranscriptionProvider";
+import { useModelStatus } from "../../hooks/useModelStatus";
+import { formatBytes, formatSeconds } from "../../utils/format";
+import {
+  WHISPER_TURBO_APPROXIMATE_SIZE_BYTES,
+  WHISPER_TURBO_MODEL_ID,
+} from "../../types/model";
 import type {
   TranscriptionConnectionState,
   TranscriptionProviderDescriptor,
@@ -39,6 +45,7 @@ export function TranscriptionProviderSection() {
     connectGemini,
     removeGeminiKey,
   } = useTranscriptionProvider();
+  const localModel = useModelStatus();
   const [selected, setSelected] = useState<"whisper_local" | "google_gemini">("whisper_local");
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
@@ -53,6 +60,12 @@ export function TranscriptionProviderSection() {
   const cloud = descriptors.filter((descriptor) => !descriptor.capabilities.local);
   const status = STATUS_COPY[connectionState];
   const busy = connectionState === "connecting";
+  const modelState = localModel.status?.state.state;
+  const modelBusy = modelState === "downloading" || modelState === "verifying" || modelState === "installing";
+  const turboActive = localModel.status?.model_id === WHISPER_TURBO_MODEL_ID && modelState === "ready";
+  const downloaded = localModel.progress?.downloaded ?? 0;
+  const total = localModel.progress?.total ?? localModel.status?.approximate_size_bytes ?? 0;
+  const downloadPercent = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
 
   return (
     <div className="flex flex-col gap-4">
@@ -73,6 +86,57 @@ export function TranscriptionProviderSection() {
             }}
           />
         ))}
+      </div>
+
+      <div className="flex flex-col gap-3 rounded-lg border border-white/10 bg-surface px-4 py-3.5">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-medium text-neutral-100">Modelo local</p>
+            <p className="mt-1 text-xs text-neutral-500">
+              {turboActive
+                ? "Whisper Large-v3 Turbo está ativo."
+                : `Modelo atual: ${localModel.status?.display_name ?? "verificando..."}`}
+            </p>
+          </div>
+          <span className="rounded-full border border-white/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
+            Offline
+          </span>
+        </div>
+        <div className="rounded-md border border-white/8 bg-black/15 px-3 py-2.5">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-neutral-200">Whisper Large-v3 Turbo</p>
+              <p className="text-xs text-neutral-500">
+                Mais rápido para comparar com o Gemini Live · {formatBytes(WHISPER_TURBO_APPROXIMATE_SIZE_BYTES)}
+              </p>
+            </div>
+            <SecondaryButton
+              className="shrink-0 px-3 py-2 text-xs"
+              onClick={() =>
+                void (modelState === "downloading"
+                  ? localModel.cancelDownload()
+                  : localModel.startDownload(WHISPER_TURBO_MODEL_ID))
+              }
+              disabled={(modelBusy && modelState !== "downloading") || turboActive}
+            >
+              {turboActive ? "Ativo" : modelState === "downloading" ? "Cancelar" : modelBusy ? "Instalando..." : "Baixar Turbo"}
+            </SecondaryButton>
+          </div>
+          {modelBusy && (
+            <div className="mt-3 flex flex-col gap-1.5">
+              <div className="h-1.5 overflow-hidden rounded-full bg-white/8" role="progressbar" aria-valuenow={downloadPercent} aria-valuemin={0} aria-valuemax={100}>
+                <div className="h-full rounded-full bg-brand-500 transition-[width] duration-200" style={{ width: `${downloadPercent}%` }} />
+              </div>
+              <p className="text-[11px] text-neutral-500">
+                {modelState === "downloading"
+                  ? `${formatBytes(downloaded)} de ${formatBytes(total)} · ${downloadPercent}%${localModel.progress && localModel.progress.bytesPerSecond > 0 ? ` · ${formatSeconds(Math.max(0, total - downloaded) / localModel.progress.bytesPerSecond)}` : ""}`
+                  : modelState === "verifying" ? "Verificando integridade..." : "Instalando..."}
+              </p>
+            </div>
+          )}
+        </div>
+        {localModel.error && <InlineNotice tone="error">{localModel.error}</InlineNotice>}
+        <p className="text-xs text-neutral-500">Depois de baixar, selecione “Whisper local” acima para usar o modelo nas sessões.</p>
       </div>
 
       <div className="flex flex-col gap-2">

@@ -33,7 +33,7 @@ impl ModelLanguageSupport {
 /// valores reais, obtidos baixando o arquivo oficial e computando o checksum localmente
 /// (nunca estimados ou copiados de um header HTTP não confiável, como `x-linked-size`
 /// ou `x-xet-hash`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelDefinition {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -59,6 +59,30 @@ pub const DEFAULT_MODEL: ModelDefinition = ModelDefinition {
     approximate_size_bytes: 147_951_465,
     language_support: ModelLanguageSupport::Multilingual,
 };
+
+/// Modelo Whisper Large-v3 Turbo, oferecido como alternativa local para comparação
+/// com providers de streaming como o Gemini Live. O `x-linked-etag` do Hugging Face
+/// é o SHA-256 do arquivo original (o `etag` do Xet é apenas o identificador da
+/// reconstrução e não serve para a verificação do conteúdo).
+pub const WHISPER_TURBO_MODEL: ModelDefinition = ModelDefinition {
+    id: "whisper-large-v3-turbo",
+    display_name: "Whisper Large-v3 Turbo",
+    filename: "ggml-large-v3-turbo.bin",
+    download_url:
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+    sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+    approximate_size_bytes: 1_624_555_275,
+    language_support: ModelLanguageSupport::Multilingual,
+};
+
+pub const MANAGED_MODELS: &[ModelDefinition] = &[DEFAULT_MODEL, WHISPER_TURBO_MODEL];
+
+pub fn find_managed_model(model_id: &str) -> Option<ModelDefinition> {
+    MANAGED_MODELS
+        .iter()
+        .copied()
+        .find(|model| model.id == model_id)
+}
 
 #[cfg(test)]
 mod tests {
@@ -101,5 +125,17 @@ mod tests {
                 "{filename}"
             );
         }
+    }
+
+    #[test]
+    fn turbo_model_is_multilingual_and_registered() {
+        assert_eq!(
+            WHISPER_TURBO_MODEL.language_support,
+            ModelLanguageSupport::Multilingual
+        );
+        assert_eq!(
+            find_managed_model(WHISPER_TURBO_MODEL.id),
+            Some(WHISPER_TURBO_MODEL)
+        );
     }
 }

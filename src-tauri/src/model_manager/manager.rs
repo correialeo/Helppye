@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::model_manager::catalog::{ModelDefinition, ModelLanguageSupport, DEFAULT_MODEL};
+use crate::model_manager::catalog::{
+    find_managed_model, ModelDefinition, ModelLanguageSupport, DEFAULT_MODEL,
+};
 use crate::model_manager::config_store::{self, TranscriptionModelSelection};
 use crate::model_manager::downloader::{ModelDownloader, ProgressCallback};
 use crate::model_manager::error::ModelManagerError;
@@ -36,6 +38,7 @@ pub struct ModelManager {
     provider: Arc<dyn SegmentTranscriber>,
     on_event: EventSink,
     state: Mutex<ModelInstallState>,
+    active_model_id: Mutex<Option<String>>,
     cancel: Mutex<Option<CancellationToken>>,
 }
 
@@ -54,6 +57,7 @@ impl ModelManager {
             provider,
             on_event: Arc::new(on_event),
             state: Mutex::new(ModelInstallState::NotInstalled),
+            active_model_id: Mutex::new(None),
             cancel: Mutex::new(None),
         }
     }
@@ -66,7 +70,30 @@ impl ModelManager {
         *self.state.lock().await = new_state;
     }
 
-    /// Snapshot combinando o estado atual com os metadados do modelo padrão. Se o
+    async fn active_definition(&self) -> ModelDefinition {
+        let model_id = self.active_model_id.lock().await;
+        model_id
+            .as_deref()
+            .and_then(find_managed_model)
+            .unwrap_or(DEFAULT_MODEL)
+    }
+
+    fn status_for(
+        definition: ModelDefinition,
+        state: ModelInstallState,
+        custom_model_path: Option<String>,
+    ) -> ModelStatus {
+        ModelStatus {
+            model_id: definition.id,
+            display_name: definition.display_name,
+            approximate_size_bytes: definition.approximate_size_bytes,
+            state,
+            custom_model_path,
+            language_support: Some(definition.language_support),
+        }
+    }
+
+    /// Snapshot combinando o estado atual com os metadados do modelo gerenciado ativo. Se o
     /// estado em memória ainda não foi determinado (`NotInstalled`, isto é, nenhum
     /// download ou verificação rodou nesta sessão), consulta a configuração persistida:
     /// uma seleção de modelo personalizado (feita em uma sessão anterior) reporta seu
@@ -74,40 +101,42 @@ impl ModelManager {
     pub async fn status_snapshot(&self) -> Result<ModelStatus, ModelManagerError> {
         let current = self.state.lock().await.clone();
         if current != ModelInstallState::NotInstalled {
-            return Ok(ModelStatus {
-                model_id: DEFAULT_MODEL.id,
-                display_name: DEFAULT_MODEL.display_name,
-                approximate_size_bytes: DEFAULT_MODEL.approximate_size_bytes,
-                state: current,
-                custom_model_path: None,
-                language_support: Some(DEFAULT_MODEL.language_support),
-            });
+            return Ok(Self::status_for(
+                self.active_definition().await,
+                current,
+                None,
+            ));
         }
 
-        if let Some(TranscriptionModelSelection::Custom { model_path }) =
-            config_store::load(&self.config_path)?
-        {
-            let state = self.load_persisted_custom_model(&model_path).await;
-            self.set_state(state.clone()).await;
-            return Ok(ModelStatus {
-                model_id: DEFAULT_MODEL.id,
-                display_name: DEFAULT_MODEL.display_name,
-                approximate_size_bytes: DEFAULT_MODEL.approximate_size_bytes,
-                language_support: Some(ModelLanguageSupport::from_model_filename(&model_path)),
-                state,
-                custom_model_path: Some(model_path),
-            });
+        if let Some(selection) = config_store::load(&self.config_path)? {
+            match selection {
+                TranscriptionModelSelection::Custom { model_path } => {
+                    let state = self.load_persisted_custom_model(&model_path).await;
+                    self.set_state(state.clone()).await;
+                    return Ok(ModelStatus {
+                        model_id: DEFAULT_MODEL.id,
+                        display_name: DEFAULT_MODEL.display_name,
+                        approximate_size_bytes: DEFAULT_MODEL.approximate_size_bytes,
+                        language_support: Some(ModelLanguageSupport::from_model_filename(
+                            &model_path,
+                        )),
+                        state,
+                        custom_model_path: Some(model_path),
+                    });
+                }
+                TranscriptionModelSelection::Managed { model_id } => {
+                    if let Some(definition) = find_managed_model(&model_id) {
+                        *self.active_model_id.lock().await = Some(definition.id.into());
+                        let state = self.check_and_load(&definition).await?;
+                        return Ok(Self::status_for(definition, state, None));
+                    }
+                    tracing::warn!(%model_id, "unknown managed transcription model; falling back to default");
+                }
+            }
         }
 
         let state = self.check_default_model().await?;
-        Ok(ModelStatus {
-            model_id: DEFAULT_MODEL.id,
-            display_name: DEFAULT_MODEL.display_name,
-            approximate_size_bytes: DEFAULT_MODEL.approximate_size_bytes,
-            state,
-            custom_model_path: None,
-            language_support: Some(DEFAULT_MODEL.language_support),
-        })
+        Ok(Self::status_for(DEFAULT_MODEL, state, None))
     }
 
     /// Passo 3 isolado: verifica se o modelo padrão já existe e é válido (tamanho +
@@ -127,6 +156,7 @@ impl ModelManager {
         &self,
         definition: &ModelDefinition,
     ) -> Result<ModelInstallState, ModelManagerError> {
+        *self.active_model_id.lock().await = Some(definition.id.into());
         self.set_state(ModelInstallState::Checking).await;
         let path = self.models_dir.join(definition.filename);
         let mut state = check_model_at_path(&path, definition).await?;
@@ -187,8 +217,17 @@ impl ModelManager {
         }
     }
 
-    pub async fn download_default_model(&self) -> Result<(), ModelManagerError> {
-        self.download_model(DEFAULT_MODEL).await
+    pub async fn download_model_by_id(
+        &self,
+        model_id: Option<&str>,
+    ) -> Result<(), ModelManagerError> {
+        let definition = match model_id {
+            None => DEFAULT_MODEL,
+            Some(id) => find_managed_model(id).ok_or_else(|| {
+                ModelManagerError::InvalidResponse(format!("unknown transcription model: {id}"))
+            })?,
+        };
+        self.download_model(definition).await
     }
 
     pub async fn cancel_download(&self) {
@@ -235,6 +274,7 @@ impl ModelManager {
         definition: &ModelDefinition,
         cancel: CancellationToken,
     ) -> Result<(), ModelManagerError> {
+        *self.active_model_id.lock().await = Some(definition.id.into());
         // 1/2. diretório já resolvido e criado na construção do manager (`paths::resolve_paths`).
         let final_path = self.models_dir.join(definition.filename);
         let part_path = self
@@ -249,6 +289,14 @@ impl ModelManager {
         )
         .is_ok()
         {
+            config_store::save(
+                &self.config_path,
+                &TranscriptionModelSelection::Managed {
+                    model_id: definition.id.into(),
+                },
+            )?;
+            self.load_provider(final_path, definition.display_name.into())
+                .await?;
             self.set_state(ModelInstallState::Ready).await;
             return Ok(());
         }

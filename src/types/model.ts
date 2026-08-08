@@ -9,6 +9,10 @@ export type ModelInstallState =
   | { state: "corrupted"; reason: string }
   | { state: "failed"; reason: string };
 
+export const WHISPER_BASE_MODEL_ID = "whisper-base-multilingual";
+export const WHISPER_TURBO_MODEL_ID = "whisper-large-v3-turbo";
+export const WHISPER_TURBO_APPROXIMATE_SIZE_BYTES = 1_624_555_275;
+
 export interface ModelStatus {
   model_id: string;
   display_name: string;
